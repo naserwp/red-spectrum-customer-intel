@@ -1,133 +1,44 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
-type Customer = {
-  _id: string;
-  name: string;
-  email: string;
-  phone: string;
-  totalPaid: number;
-  orderCount: number;
-  lastOrderDate: string;
-  lastOrderAmount: number;
-  subscriptionStatus: string;
-  activeSubscriptions: number;
-  failedPayments: number;
-  refunds: number;
-  chargebacks: number;
-  creditLimit: number;
-  tier: string;
-  score: number;
-  stars: number;
-  aiSummary: string;
-  recommendedAction: string;
-};
-
-async function fetchCustomersData() {
-  const response = await fetch("/api/customers");
-  return response.json();
-}
+type Customer = Record<string, string | number | null> & { _id: string; name: string; email: string; totalPaid: number; paidTotal: number; attemptedTotal: number; paidOrderCount: number; attemptedOrderCount: number; activeSubscriptions: number; failedPayments: number; chargebacks: number; tier: string; riskLevel: string; score: number; stars: number; aiSummaryPreview: string; paymentStatus: string; leadStatus: string; lastPaidDate: string; lastAttemptDate: string; subscriptionStatus: string; refunds: number; };
+const money = (n: number) => `$${n.toFixed(2)}`;
+const tabs = ["Overview", "Customers", "Subscriptions", "Credits", "Payments", "Upcoming Bills", "High Value", "Risk Review", "Sync Center"] as const;
 
 export default function AdminPage() {
-  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [rows, setRows] = useState<Customer[]>([]);
+  const [summary, setSummary] = useState<Record<string, unknown>>({});
+  const [tab, setTab] = useState<(typeof tabs)[number]>("Overview");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
-  const [isSyncing, setIsSyncing] = useState(false);
-  const [filters, setFilters] = useState({ min: "", max: "", stars: "", status: "", q: "" });
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
 
-  useEffect(() => {
-    fetchCustomersData()
-      .then((data) => {
-        if (data.error) {
-          setError(data.error);
-          return;
-        }
-
-        setError("");
-        setCustomers(data.customers || []);
-      })
-      .catch(() => setError("Unable to load customers."));
+  const load = useCallback(async (nextPage = 1) => {
+    const data = await fetch(`/api/customers/table?page=${nextPage}&limit=30`, { cache: "no-store" }).then((r) => r.json());
+    setRows(data.rows || []); setTotal(data.total || 0); setPage(data.page || nextPage);
   }, []);
 
-  const syncWooCommerce = async () => {
-    setIsSyncing(true);
-    setError("");
-    setMessage("");
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    load(1).catch(() => setError("Unable to load customers."));
+    fetch("/api/analytics/summary", { cache: "no-store" }).then((r)=>r.json()).then(setSummary).catch(()=>setSummary({}));
+  }, [load]);
 
-    try {
-      const response = await fetch("/api/customers/sync", { method: "POST" });
-      const data = await response.json();
+  const vipPaid = useMemo(() => rows.filter((c) => (c.paidTotal ?? 0) >= 2000).slice(0, 5), [rows]);
+  const hotLeads = useMemo(() => rows.filter((c) => (c.paidTotal ?? 0) <= 0 && (c.attemptedTotal ?? 0) > 0).slice(0, 5), [rows]);
 
-      if (!response.ok || data.error) {
-        setError(data.error || "Unable to sync WooCommerce data.");
-        return;
-      }
+  const sync = async () => { setMessage("Syncing..."); const res = await fetch('/api/customers/sync',{method:'POST'}); const d = await res.json(); if(!res.ok)return setError(d.error||'Sync failed'); setMessage(d.message||'Sync complete'); await load(1); };
 
-      setMessage(data.message || "WooCommerce sync completed.");
-      const customersData = await fetchCustomersData();
-      if (customersData.error) {
-        setError(customersData.error);
-        return;
-      }
-      setCustomers(customersData.customers || []);
-    } catch {
-      setError("Unable to sync WooCommerce data.");
-    } finally {
-      setIsSyncing(false);
-    }
-  };
-
-  const filtered = useMemo(() => customers.filter((c) => {
-    const minOk = !filters.min || c.totalPaid >= Number(filters.min);
-    const maxOk = !filters.max || c.totalPaid <= Number(filters.max);
-    const starOk = !filters.stars || c.stars === Number(filters.stars);
-    const statusOk = !filters.status || c.subscriptionStatus === filters.status;
-    const q = filters.q.toLowerCase();
-    const qOk = !q || [c.name, c.email, c.phone].some((v) => v.toLowerCase().includes(q));
-    return minOk && maxOk && starOk && statusOk && qOk;
-  }), [customers, filters]);
-
-  const exportCsv = () => {
-    const headers = ["Customer Name","Email","Phone","Total Paid","Order Count","Last Order Date","Last Order Amount","Subscription Status","Active Subscriptions","Failed Payments","Refunds","Chargebacks","Credit Limit","Tier","Score","Stars","AI Summary","Recommended Action"];
-    const rows = filtered.map((c) => [c.name,c.email,c.phone,c.totalPaid,c.orderCount,c.lastOrderDate,c.lastOrderAmount,c.subscriptionStatus,c.activeSubscriptions,c.failedPayments,c.refunds,c.chargebacks,c.creditLimit,c.tier,c.score,c.stars,c.aiSummary,c.recommendedAction]);
-    const csv = [headers, ...rows].map((r) => r.map((v) => `"${String(v).replaceAll('"','""')}"`).join(",")).join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = "red-spectrum-customers.csv"; a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  return (
-    <main className="min-h-screen bg-zinc-950 text-white p-4 md:p-8">
-      <h1 className="text-3xl font-bold text-red-500">Admin Dashboard</h1>
-      <p className="mt-2 text-zinc-300">Customer intelligence overview and export.</p>
-      {error && <p className="mt-4 rounded bg-red-900/60 p-3">{error}</p>}
-      {message && <p className="mt-4 rounded bg-emerald-900/60 p-3">{message}</p>}
-
-      <div className="mt-6 grid gap-3 md:grid-cols-5">
-        {['min','max','q'].map(()=>null)}
-        <input placeholder="Min amount" className="rounded bg-zinc-800 p-2" value={filters.min} onChange={(e)=>setFilters({...filters,min:e.target.value})}/>
-        <input placeholder="Max amount" className="rounded bg-zinc-800 p-2" value={filters.max} onChange={(e)=>setFilters({...filters,max:e.target.value})}/>
-        <input placeholder="Search name/email/phone" className="rounded bg-zinc-800 p-2 md:col-span-2" value={filters.q} onChange={(e)=>setFilters({...filters,q:e.target.value})}/>
-        <select className="rounded bg-zinc-800 p-2" value={filters.stars} onChange={(e)=>setFilters({...filters,stars:e.target.value})}><option value="">All stars</option><option value="5">5</option><option value="4">4</option><option value="3">3</option><option value="2">2</option><option value="1">1</option></select>
-        <select className="rounded bg-zinc-800 p-2" value={filters.status} onChange={(e)=>setFilters({...filters,status:e.target.value})}><option value="">All subscription status</option><option value="active">active</option><option value="inactive">inactive</option><option value="canceled">canceled</option><option value="past_due">past_due</option><option value="unknown">unknown</option></select>
-      </div>
-
-      <div className="mt-4 flex flex-wrap gap-3">
-        <button onClick={syncWooCommerce} disabled={isSyncing} className="rounded bg-red-600 px-4 py-2 font-semibold hover:bg-red-500 disabled:cursor-not-allowed disabled:bg-zinc-700">{isSyncing ? "Syncing..." : "Sync WooCommerce Data"}</button>
-        <button onClick={exportCsv} className="rounded bg-zinc-800 px-4 py-2 font-semibold hover:bg-zinc-700">Export CSV</button>
-      </div>
-
-      <div className="mt-6 overflow-x-auto rounded border border-zinc-700">
-        <table className="min-w-full text-sm">
-          <thead className="bg-black text-red-400"><tr>{["Customer Name","Email","Phone","Total Paid","Order Count","Last Order Date","Last Order Amount","Subscription Status","Active Subscriptions","Failed Payments","Refunds","Chargebacks","Credit Limit","Tier","Score","Stars","AI Summary","Recommended Action"].map((h)=><th key={h} className="px-3 py-2 text-left">{h}</th>)}</tr></thead>
-          <tbody>{filtered.map((c)=><tr key={c._id} className="border-t border-zinc-800 align-top"><td className="px-3 py-2">{c.name}</td><td className="px-3 py-2">{c.email}</td><td className="px-3 py-2">{c.phone}</td><td className="px-3 py-2">${c.totalPaid.toFixed(2)}</td><td className="px-3 py-2">{c.orderCount}</td><td className="px-3 py-2">{new Date(c.lastOrderDate).toLocaleDateString()}</td><td className="px-3 py-2">${c.lastOrderAmount.toFixed(2)}</td><td className="px-3 py-2">{c.subscriptionStatus}</td><td className="px-3 py-2">{c.activeSubscriptions}</td><td className="px-3 py-2">{c.failedPayments}</td><td className="px-3 py-2">{c.refunds}</td><td className="px-3 py-2">{c.chargebacks}</td><td className="px-3 py-2">${c.creditLimit.toFixed(2)}</td><td className="px-3 py-2">{c.tier}</td><td className="px-3 py-2">{c.score}</td><td className="px-3 py-2">{"★".repeat(c.stars)}</td><td className="px-3 py-2">{c.aiSummary}</td><td className="px-3 py-2">{c.recommendedAction}</td></tr>)}</tbody>
-        </table>
-      </div>
-
-      <p className="mt-6 text-xs text-zinc-400">TODO: Integrate WooCommerce, Stripe, Authorize.net, NMI, Gmail API, and WordPress email logs.</p>
-    </main>
-  );
+  return <main className="min-h-screen bg-gradient-to-b from-zinc-950 via-black to-zinc-900 p-4 text-zinc-100 md:p-8"><div className="mx-auto max-w-7xl space-y-4">
+    <header className="flex flex-wrap items-center justify-between gap-3"><div><h1 className="text-3xl font-bold text-red-400">Red Spectrum Admin</h1><p className="text-zinc-400">Stabilized payment-aware customer intelligence.</p></div><button onClick={sync} className="rounded bg-red-600 px-4 py-2 font-semibold hover:bg-red-500">Sync WooCommerce</button></header>
+    <nav className="flex gap-2 overflow-x-auto rounded-xl border border-zinc-800 bg-zinc-900/80 p-2">{tabs.map((t)=><button key={t} onClick={()=>setTab(t)} className={`rounded px-3 py-2 text-sm ${tab===t?"bg-red-600":"bg-zinc-800"}`}>{t}</button>)}</nav>
+    {error && <p className="rounded border border-red-800 bg-red-900/40 p-3">{error}</p>}{message && <p className="rounded border border-emerald-800 bg-emerald-900/30 p-3">{message}</p>}
+    <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{[["Total Customers", Number(summary.customerCount ?? 0)],["Total Revenue", money(Number(summary.totalRevenue ?? 0))],["Average Order Value", money(Number(summary.totalRevenue ?? 0) / Math.max(1, Number(summary.customerCount ?? 1)))],["High Value Customers", rows.filter((c)=>(c.paidTotal??0)>=2000).length],["Risk Customers", rows.filter((c)=>(c.failedPayments??0)>1 || (c.chargebacks??0)>0).length],["Failed Payments", Number(summary.failedPayments ?? 0)],["Refunds", rows.reduce((a,c)=>a+Number(c.refunds ?? 0),0)],["Chargebacks", rows.reduce((a,c)=>a+Number(c.chargebacks ?? 0),0)]].map(([k,v])=><div key={String(k)} className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4"><p className="text-xs uppercase text-zinc-400">{k}</p><p className="mt-2 text-2xl font-semibold">{String(v)}</p></div>)}</section>
+    <section className="grid gap-3 md:grid-cols-2"><div className="rounded-xl border border-amber-600/40 bg-amber-900/10 p-4"><h3 className="font-semibold text-amber-200">VIP Paid Customers</h3>{vipPaid.map((c)=><p key={c._id} className="mt-1 text-sm">{c.name} · {money(Number(c.paidTotal ?? 0))}</p>)}</div><div className="rounded-xl border border-rose-600/40 bg-rose-900/10 p-4"><h3 className="font-semibold text-rose-200">Hot Checkout Leads</h3>{hotLeads.map((c)=><p key={c._id} className="mt-1 text-sm">{c.name} · attempted {money(Number(c.attemptedTotal ?? 0))}</p>)}</div></section>
+    <div className="overflow-x-auto rounded-xl border border-zinc-800"><table className="min-w-full text-xs"><thead className="bg-zinc-950"><tr>{["Customer","Actual Paid","Attempted Amount","Paid Orders","Checkout Attempts","Last Paid","Last Attempt","Payment Status","Lead Status","Tier","Risk","AI Preview","Actions"].map((h)=><th key={h} className="px-3 py-2 text-left">{h}</th>)}</tr></thead><tbody>{rows.map((c)=><tr key={c._id} className="border-t border-zinc-800"><td className="px-3 py-2"><p className="font-semibold">{c.name}</p><p className="text-zinc-400">{c.email}</p></td><td className="px-3 py-2">{money(Number(c.paidTotal ?? 0))}</td><td className="px-3 py-2">{money(Number(c.attemptedTotal ?? 0))}</td><td className="px-3 py-2">{Number(c.paidOrderCount ?? 0)}</td><td className="px-3 py-2">{Number(c.attemptedOrderCount ?? 0)}</td><td className="px-3 py-2">{String(c.lastPaidDate || "-")}</td><td className="px-3 py-2">{String(c.lastAttemptDate || "-")}</td><td className="px-3 py-2">{String(c.paymentStatus || "-")}</td><td className="px-3 py-2">{String(c.leadStatus || "-")}</td><td className="px-3 py-2">{c.tier}</td><td className="px-3 py-2">{c.riskLevel}</td><td className="max-w-[260px] truncate px-3 py-2">{c.aiSummaryPreview}</td><td className="px-3 py-2"><div className="flex gap-2"><Link href={`/admin/customers/${c._id}`} className="rounded bg-zinc-700 px-2 py-1">View</Link><a href={`/api/customers/${c._id}/pdf`} target="_blank" className="rounded bg-red-700 px-2 py-1">PDF</a></div></td></tr>)}</tbody></table></div>
+    <div className="flex items-center justify-between"><p className="text-sm text-zinc-400">Page {page}. Total: {total}</p><div className="flex gap-2"><button disabled={page<=1} onClick={()=>load(page-1)} className="rounded bg-zinc-800 px-3 py-1 disabled:opacity-50">Prev</button><button onClick={()=>load(page+1)} className="rounded bg-zinc-800 px-3 py-1">Next</button></div></div>
+  </div></main>;
 }
