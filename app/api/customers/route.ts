@@ -8,27 +8,18 @@ type LeanCustomer = CustomerScoreInput & Record<string, unknown>;
 
 function enrichCustomers<T extends CustomerScoreInput>(customers: T[]) {
   return customers.map((customer) => {
-    const scoreInput: CustomerScoreInput = {
-      totalPaid: customer.totalPaid,
-      subscriptionStatus: customer.subscriptionStatus,
-      lastOrderDate: customer.lastOrderDate,
-      refunds: customer.refunds,
-      chargebacks: customer.chargebacks,
-      failedPayments: customer.failedPayments,
-    };
-    const score = calculateCustomerScore(scoreInput);
+    const score = calculateCustomerScore(customer);
     return { ...customer, score, stars: scoreToStars(score) };
   });
 }
 
 export async function GET() {
   const fallbackCustomers = () => NextResponse.json({ customers: enrichCustomers(demoCustomers) });
-
   const connection = await connectToDatabase();
   if (!connection) return fallbackCustomers();
 
   try {
-    const customers = await Customer.find({}).lean<LeanCustomer[]>();
+    const customers = await Customer.find({}).sort({ totalPaid: -1 }).lean<LeanCustomer[]>();
     return NextResponse.json({ customers: enrichCustomers(customers) });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown customer query error.";

@@ -16,16 +16,14 @@ export type CustomerAiInput = CustomerScoreInput & {
 
 export type CustomerAiSummary = {
   aiSummary: string;
+  aiSummaryPreview: string;
+  riskExplanation: string;
   recommendedAction: string;
 };
 
 type OpenAIResponse = {
   output_text?: string;
-  output?: Array<{
-    content?: Array<{
-      text?: string;
-    }>;
-  }>;
+  output?: Array<{ content?: Array<{ text?: string }> }>;
 };
 
 function getOpenAiApiKey() {
@@ -37,48 +35,47 @@ function isBuildPhase() {
 }
 
 function buildRuleBasedSummary(customer: CustomerAiInput): CustomerAiSummary {
-  const orderLabel = customer.orderCount === 1 ? "order" : "orders";
-  const riskNote =
+  const riskExplanation =
     customer.chargebacks > 0
-      ? "Chargeback history makes this account high risk."
-      : customer.refunds > 0
-        ? "Refund history should be reviewed before outreach."
-        : "Payment history is currently clean.";
+      ? "Chargeback history indicates elevated payment dispute risk."
+      : customer.failedPayments > 1
+        ? "Multiple failed payments indicate billing friction and churn risk."
+        : customer.refunds > 0
+          ? "Refund activity suggests possible product fit or satisfaction concerns."
+          : "Payment and refund patterns are stable with low detected risk.";
+
+  const aiSummary = `${customer.name} (${customer.tier}) has ${customer.orderCount} orders, total paid $${customer.totalPaid.toFixed(2)}, and a score of ${customer.score}. ${riskExplanation}`;
 
   return {
-    aiSummary: `${customer.name} is a ${customer.tier} customer with ${customer.orderCount} ${orderLabel}, $${customer.totalPaid.toFixed(2)} total paid, and a score of ${customer.score}. ${riskNote}`,
+    aiSummary,
+    aiSummaryPreview: aiSummary.slice(0, 110) + (aiSummary.length > 110 ? "…" : ""),
+    riskExplanation,
     recommendedAction:
       customer.score >= 80
-        ? "Prioritize VIP retention and offer a high-value upgrade."
+        ? "Prioritize VIP retention with proactive outreach and premium upsell."
         : customer.score >= 50
-          ? "Send a targeted retention offer based on recent purchase history."
-          : "Review payment risk and use a conservative win-back offer.",
+          ? "Run a targeted retention sequence tied to recent purchase behavior."
+          : "Place on manual payment-risk review and use conservative win-back incentives.",
   };
 }
 
 function extractText(response: OpenAIResponse) {
   if (response.output_text) return response.output_text;
-
-  return response.output
-    ?.flatMap((item) => item.content ?? [])
-    .map((content) => content.text)
-    .filter(Boolean)
-    .join("\n");
+  return response.output?.flatMap((item) => item.content ?? []).map((c) => c.text).filter(Boolean).join("\n");
 }
 
 function parseSummary(text: string | undefined) {
   if (!text) return null;
-
   try {
     const jsonStart = text.indexOf("{");
     const jsonEnd = text.lastIndexOf("}");
     if (jsonStart === -1 || jsonEnd === -1) return null;
-
     const parsed = JSON.parse(text.slice(jsonStart, jsonEnd + 1)) as Partial<CustomerAiSummary>;
-    if (!parsed.aiSummary || !parsed.recommendedAction) return null;
-
+    if (!parsed.aiSummary || !parsed.recommendedAction || !parsed.riskExplanation) return null;
     return {
       aiSummary: parsed.aiSummary,
+      aiSummaryPreview: parsed.aiSummaryPreview ?? `${parsed.aiSummary.slice(0, 110)}${parsed.aiSummary.length > 110 ? "…" : ""}`,
+      riskExplanation: parsed.riskExplanation,
       recommendedAction: parsed.recommendedAction,
     };
   } catch {
@@ -88,6 +85,10 @@ function parseSummary(text: string | undefined) {
 
 export async function generateCustomerAiSummary(customer: CustomerAiInput): Promise<CustomerAiSummary> {
   const fallback = buildRuleBasedSummary(customer);
+  if (isBuildPhase()) {
+    console.warn("[openai] Build phase detected. Using rule-based fallback.");
+    return fallback;
+  }
 
   if (isBuildPhase()) {
     console.warn("[openai] Build phase detected. Skipping OpenAI call and using rule-based fallback.");
@@ -110,30 +111,22 @@ export async function generateCustomerAiSummary(customer: CustomerAiInput): Prom
       body: JSON.stringify({
         model: OPENAI_MODEL,
         input: [
-          {
-            role: "system",
-            content:
-              "You write concise internal customer intelligence notes. Return only JSON with aiSummary and recommendedAction strings.",
-          },
-          {
-            role: "user",
-            content: JSON.stringify(customer),
-          },
+          { role: "system", content: "Return JSON only: aiSummary, aiSummaryPreview, riskExplanation, recommendedAction." },
+          { role: "user", content: JSON.stringify(customer) },
         ],
-        max_output_tokens: 220,
+        max_output_tokens: 280,
       }),
     });
 
     if (!response.ok) {
-      console.warn(`[openai] Summary request failed: ${response.status} ${response.statusText}. Using fallback.`);
+      console.warn(`[openai] OpenAI request failed (${response.status} ${response.statusText}). Using rule-based fallback.`);
       return fallback;
     }
-
     const data = (await response.json()) as OpenAIResponse;
     return parseSummary(extractText(data)) ?? fallback;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown OpenAI request error.";
-    console.warn(`[openai] Summary request failed. Using fallback. ${message}`);
+    console.warn(`[openai] OpenAI request threw error. Using rule-based fallback. ${message}`);
     return fallback;
   }
 }
