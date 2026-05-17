@@ -90,16 +90,24 @@ export async function generateCustomerAiSummary(customer: CustomerAiInput): Prom
     return fallback;
   }
 
+  if (isBuildPhase()) {
+    console.warn("[openai] Build phase detected. Skipping OpenAI call and using rule-based fallback.");
+    return fallback;
+  }
+
   const apiKey = getOpenAiApiKey();
   if (!apiKey) {
-    console.warn("[openai] OPENAI_API_KEY is missing. Using rule-based fallback.");
+    console.warn("[openai] OPENAI_API_KEY is missing. Using rule-based customer summary fallback.");
     return fallback;
   }
 
   try {
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({
         model: OPENAI_MODEL,
         input: [
