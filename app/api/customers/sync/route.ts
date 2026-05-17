@@ -4,6 +4,8 @@ import { connectToDatabase } from "@/lib/mongodb";
 import { generateCustomerAiSummary } from "@/lib/openai";
 import { fetchWooCommerceOrders, isWooCommerceConfigured, type WooCommerceCustomer, type WooCommerceOrder } from "@/lib/woocommerce";
 import { Customer } from "@/models/Customer";
+import { Subscription } from "@/models/Subscription";
+import { buildSourcePlaceholders, mapWooOrdersToSubscriptions } from "@/lib/subscriptions";
 
 type SyncedCustomer = CustomerScoreInput & {
   _id: string;
@@ -133,9 +135,37 @@ export async function POST() {
   if (!orders) return NextResponse.json({ error: "Unable to fetch WooCommerce orders.", customers: [], saved: false }, { status: 502 });
 
   const customers = await transformOrdersToCustomers(orders);
+  const wooSubscriptions = mapWooOrdersToSubscriptions(orders);
+  const sourcePlaceholders = buildSourcePlaceholders(todayIso);
+  const allSubscriptions = [
+    ...wooSubscriptions,
+    ...sourcePlaceholders.stripe,
+    ...sourcePlaceholders.authorize_net,
+    ...sourcePlaceholders.nmi,
+    ...sourcePlaceholders.manual,
+  ];
   const connection = await connectToDatabase();
   if (!connection) return NextResponse.json({ message: "WooCommerce data transformed. MongoDB is unavailable, so customers were not saved.", customers, saved: false });
 
   await saveCustomers(customers);
-  return NextResponse.json({ message: `Synced ${customers.length} WooCommerce customer${customers.length === 1 ? "" : "s"}.`, customers, saved: true });
+  await Promise.all(allSubscriptions.map((sub) => Subscription.findOneAndUpdate(
+    { source: sub.source, subscriptionId: sub.subscriptionId },
+    { $set: sub },
+    { upsert: true, new: true }
+  )));
+
+  return NextResponse.json({
+    message: `Synced ${customers.length} WooCommerce customer${customers.length === 1 ? "" : "s"}.`,
+    customers,
+    subscriptionsSynced: allSubscriptions.length,
+    subscriptionSources: {
+      woocommerce: wooSubscriptions.length,
+      stripe: sourcePlaceholders.stripe.length,
+      authorize_net: sourcePlaceholders.authorize_net.length,
+      nmi: sourcePlaceholders.nmi.length,
+      manual: sourcePlaceholders.manual.length,
+    },
+    saved: true,
+    readOnlySync: true,
+  });
 }
