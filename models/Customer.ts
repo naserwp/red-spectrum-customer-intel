@@ -9,11 +9,19 @@ export interface CustomerDocument {
   email: string;
   phone: string;
   totalPaid: number;
+  paidTotal: number;
+  attemptedTotal: number;
   orderCount: number;
+  paidOrderCount: number;
+  attemptedOrderCount: number;
   firstOrderDate: string;
   lastOrderDate: string;
   lastOrderAmount: number;
   averageOrderValue: number;
+  leadStatus: string;
+  paymentStatus: string;
+  lastAttemptDate: string;
+  lastPaidDate: string;
   subscriptionStatus: SubscriptionStatus;
   activeSubscriptions: number;
   failedPayments: number;
@@ -38,11 +46,19 @@ const customerSchema = new Schema<CustomerDocument>(
     email: { type: String, required: true, unique: true },
     phone: { type: String, required: true },
     totalPaid: { type: Number, required: true },
+    paidTotal: { type: Number, required: true, default: 0 },
+    attemptedTotal: { type: Number, required: true, default: 0 },
     orderCount: { type: Number, required: true },
+    paidOrderCount: { type: Number, required: true, default: 0 },
+    attemptedOrderCount: { type: Number, required: true, default: 0 },
     firstOrderDate: { type: String, default: new Date(0).toISOString() },
     lastOrderDate: { type: String, required: true },
     lastOrderAmount: { type: Number, required: true },
     averageOrderValue: { type: Number, required: true },
+    leadStatus: { type: String, required: true, default: "cold" },
+    paymentStatus: { type: String, required: true, default: "unpaid" },
+    lastAttemptDate: { type: String, default: "" },
+    lastPaidDate: { type: String, default: "" },
     subscriptionStatus: { type: String, enum: ["active", "inactive", "canceled", "past_due", "unknown"], required: true },
     activeSubscriptions: { type: Number, required: true },
     failedPayments: { type: Number, required: true },
