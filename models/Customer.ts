@@ -1,7 +1,7 @@
 import mongoose, { Schema } from "mongoose";
 import { calculateCustomerScore, scoreToStars } from "@/lib/customerScore";
 
-export type SubscriptionStatus = "active" | "inactive" | "canceled" | "past_due";
+export type SubscriptionStatus = "active" | "inactive" | "canceled" | "past_due" | "unknown";
 
 export interface CustomerDocument {
   name: string;
@@ -33,7 +33,7 @@ const customerSchema = new Schema<CustomerDocument>(
     lastOrderAmount: { type: Number, required: true },
     subscriptionStatus: {
       type: String,
-      enum: ["active", "inactive", "canceled", "past_due"],
+      enum: ["active", "inactive", "canceled", "past_due", "unknown"],
       required: true,
     },
     activeSubscriptions: { type: Number, required: true },

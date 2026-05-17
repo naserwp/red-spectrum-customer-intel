@@ -1,6 +1,6 @@
 export type CustomerScoreInput = {
   totalPaid: number;
-  subscriptionStatus: "active" | "inactive" | "canceled" | "past_due";
+  subscriptionStatus: "active" | "inactive" | "canceled" | "past_due" | "unknown";
   lastOrderDate: string;
   refunds: number;
   chargebacks: number;

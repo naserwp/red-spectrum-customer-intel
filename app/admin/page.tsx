@@ -24,17 +24,59 @@ type Customer = {
   recommendedAction: string;
 };
 
+async function fetchCustomersData() {
+  const response = await fetch("/api/customers");
+  return response.json();
+}
+
 export default function AdminPage() {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [isSyncing, setIsSyncing] = useState(false);
   const [filters, setFilters] = useState({ min: "", max: "", stars: "", status: "", q: "" });
 
   useEffect(() => {
-    fetch("/api/customers")
-      .then((r) => r.json())
-      .then((data) => data.error ? setError(data.error) : setCustomers(data.customers || []))
+    fetchCustomersData()
+      .then((data) => {
+        if (data.error) {
+          setError(data.error);
+          return;
+        }
+
+        setError("");
+        setCustomers(data.customers || []);
+      })
       .catch(() => setError("Unable to load customers."));
   }, []);
+
+  const syncWooCommerce = async () => {
+    setIsSyncing(true);
+    setError("");
+    setMessage("");
+
+    try {
+      const response = await fetch("/api/customers/sync", { method: "POST" });
+      const data = await response.json();
+
+      if (!response.ok || data.error) {
+        setError(data.error || "Unable to sync WooCommerce data.");
+        return;
+      }
+
+      setMessage(data.message || "WooCommerce sync completed.");
+      const customersData = await fetchCustomersData();
+      if (customersData.error) {
+        setError(customersData.error);
+        return;
+      }
+      setCustomers(customersData.customers || []);
+    } catch {
+      setError("Unable to sync WooCommerce data.");
+    } finally {
+      setIsSyncing(false);
+    }
+  };
 
   const filtered = useMemo(() => customers.filter((c) => {
     const minOk = !filters.min || c.totalPaid >= Number(filters.min);
@@ -62,6 +104,7 @@ export default function AdminPage() {
       <h1 className="text-3xl font-bold text-red-500">Admin Dashboard</h1>
       <p className="mt-2 text-zinc-300">Customer intelligence overview and export.</p>
       {error && <p className="mt-4 rounded bg-red-900/60 p-3">{error}</p>}
+      {message && <p className="mt-4 rounded bg-emerald-900/60 p-3">{message}</p>}
 
       <div className="mt-6 grid gap-3 md:grid-cols-5">
         {['min','max','q'].map(()=>null)}
@@ -69,10 +112,13 @@ export default function AdminPage() {
         <input placeholder="Max amount" className="rounded bg-zinc-800 p-2" value={filters.max} onChange={(e)=>setFilters({...filters,max:e.target.value})}/>
         <input placeholder="Search name/email/phone" className="rounded bg-zinc-800 p-2 md:col-span-2" value={filters.q} onChange={(e)=>setFilters({...filters,q:e.target.value})}/>
         <select className="rounded bg-zinc-800 p-2" value={filters.stars} onChange={(e)=>setFilters({...filters,stars:e.target.value})}><option value="">All stars</option><option value="5">5</option><option value="4">4</option><option value="3">3</option><option value="2">2</option><option value="1">1</option></select>
-        <select className="rounded bg-zinc-800 p-2" value={filters.status} onChange={(e)=>setFilters({...filters,status:e.target.value})}><option value="">All subscription status</option><option value="active">active</option><option value="inactive">inactive</option><option value="canceled">canceled</option><option value="past_due">past_due</option></select>
+        <select className="rounded bg-zinc-800 p-2" value={filters.status} onChange={(e)=>setFilters({...filters,status:e.target.value})}><option value="">All subscription status</option><option value="active">active</option><option value="inactive">inactive</option><option value="canceled">canceled</option><option value="past_due">past_due</option><option value="unknown">unknown</option></select>
       </div>
 
-      <button onClick={exportCsv} className="mt-4 rounded bg-red-600 px-4 py-2 font-semibold hover:bg-red-500">Export CSV</button>
+      <div className="mt-4 flex flex-wrap gap-3">
+        <button onClick={syncWooCommerce} disabled={isSyncing} className="rounded bg-red-600 px-4 py-2 font-semibold hover:bg-red-500 disabled:cursor-not-allowed disabled:bg-zinc-700">{isSyncing ? "Syncing..." : "Sync WooCommerce Data"}</button>
+        <button onClick={exportCsv} className="rounded bg-zinc-800 px-4 py-2 font-semibold hover:bg-zinc-700">Export CSV</button>
+      </div>
 
       <div className="mt-6 overflow-x-auto rounded border border-zinc-700">
         <table className="min-w-full text-sm">

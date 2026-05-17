@@ -12,6 +12,7 @@ declare global {
 }
 
 const cached: MongooseCache = global.mongooseCache ?? { conn: null, promise: null };
+let warnedMissingUri = false;
 
 if (!global.mongooseCache) {
   global.mongooseCache = cached;
@@ -19,7 +20,11 @@ if (!global.mongooseCache) {
 
 export async function connectToDatabase() {
   if (!MONGODB_URI) {
-    throw new Error("MONGODB_URI is missing. Add it to .env.local to use database features.");
+    if (!warnedMissingUri) {
+      console.warn("[mongodb] MONGODB_URI is missing. Serving demo customer data instead.");
+      warnedMissingUri = true;
+    }
+    return null;
   }
 
   if (cached.conn) return cached.conn;
@@ -28,6 +33,13 @@ export async function connectToDatabase() {
     cached.promise = mongoose.connect(MONGODB_URI);
   }
 
-  cached.conn = await cached.promise;
-  return cached.conn;
+  try {
+    cached.conn = await cached.promise;
+    return cached.conn;
+  } catch (error) {
+    cached.promise = null;
+    const message = error instanceof Error ? error.message : "Unknown MongoDB connection error.";
+    console.warn(`[mongodb] Connection failed. Serving demo customer data instead. ${message}`);
+    return null;
+  }
 }
