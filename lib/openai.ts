@@ -1,7 +1,6 @@
 import "server-only";
 import type { CustomerScoreInput } from "@/lib/customerScore";
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
 export type CustomerAiInput = CustomerScoreInput & {
@@ -28,6 +27,14 @@ type OpenAIResponse = {
     }>;
   }>;
 };
+
+function getOpenAiApiKey() {
+  return process.env.OPENAI_API_KEY?.trim() ?? "";
+}
+
+function isBuildPhase() {
+  return process.env.NEXT_PHASE === "phase-production-build";
+}
 
 function buildRuleBasedSummary(customer: CustomerAiInput): CustomerAiSummary {
   const orderLabel = customer.orderCount === 1 ? "order" : "orders";
@@ -82,7 +89,13 @@ function parseSummary(text: string | undefined) {
 export async function generateCustomerAiSummary(customer: CustomerAiInput): Promise<CustomerAiSummary> {
   const fallback = buildRuleBasedSummary(customer);
 
-  if (!OPENAI_API_KEY) {
+  if (isBuildPhase()) {
+    console.warn("[openai] Build phase detected. Skipping OpenAI call and using rule-based fallback.");
+    return fallback;
+  }
+
+  const apiKey = getOpenAiApiKey();
+  if (!apiKey) {
     console.warn("[openai] OPENAI_API_KEY is missing. Using rule-based customer summary fallback.");
     return fallback;
   }
@@ -91,7 +104,7 @@ export async function generateCustomerAiSummary(customer: CustomerAiInput): Prom
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
