@@ -46,7 +46,10 @@ function getSubscriptionStatus(order: WooCommerceOrder): CustomerScoreInput["sub
 }
 
 const getTier = (totalPaid: number) => totalPaid >= 2500 ? "Platinum" : totalPaid >= 999 ? "Gold" : totalPaid >= 200 ? "Silver" : "Bronze";
-const getRiskLevel = (c: Pick<CustomerScoreInput, "chargebacks" | "failedPayments" | "refunds">, score: number) => (c.chargebacks > 0 || c.failedPayments > 2 || score < 45) ? "high" : (c.refunds > 1 || c.failedPayments > 0 || score < 70) ? "medium" : "low";
+const getRiskLevel = (
+  c: Pick<CustomerScoreInput, "chargebacks" | "failedPayments" | "refunds">,
+  score: number
+): "low" | "medium" | "high" => (c.chargebacks > 0 || c.failedPayments > 2 || score < 45) ? "high" : (c.refunds > 1 || c.failedPayments > 0 || score < 70) ? "medium" : "low";
 
 function estimateCreditLimit(totalPaid: number, orderCount: number, failedPayments: number, refunds: number, score: number) {
   const velocityFactor = Math.max(1, Math.min(3, orderCount / 4));

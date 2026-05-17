@@ -85,10 +85,16 @@ function parseSummary(text: string | undefined) {
 
 export async function generateCustomerAiSummary(customer: CustomerAiInput): Promise<CustomerAiSummary> {
   const fallback = buildRuleBasedSummary(customer);
-  if (isBuildPhase()) return fallback;
+  if (isBuildPhase()) {
+    console.warn("[openai] Build phase detected. Using rule-based fallback.");
+    return fallback;
+  }
 
   const apiKey = getOpenAiApiKey();
-  if (!apiKey) return fallback;
+  if (!apiKey) {
+    console.warn("[openai] OPENAI_API_KEY is missing. Using rule-based fallback.");
+    return fallback;
+  }
 
   try {
     const response = await fetch("https://api.openai.com/v1/responses", {
@@ -104,10 +110,15 @@ export async function generateCustomerAiSummary(customer: CustomerAiInput): Prom
       }),
     });
 
-    if (!response.ok) return fallback;
+    if (!response.ok) {
+      console.warn(`[openai] OpenAI request failed (${response.status} ${response.statusText}). Using rule-based fallback.`);
+      return fallback;
+    }
     const data = (await response.json()) as OpenAIResponse;
     return parseSummary(extractText(data)) ?? fallback;
-  } catch {
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown OpenAI request error.";
+    console.warn(`[openai] OpenAI request threw error. Using rule-based fallback. ${message}`);
     return fallback;
   }
 }
