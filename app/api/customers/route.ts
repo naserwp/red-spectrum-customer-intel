@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Customer } from "@/models/Customer";
-import { calculateCustomerScore, scoreToStars } from "@/lib/customerScore";
+import { calculateCustomerScore, scoreToStars, type CustomerScoreInput } from "@/lib/customerScore";
 
 export async function GET() {
   try {
@@ -9,7 +9,15 @@ export async function GET() {
     const customers = await Customer.find({}).lean();
 
     const enriched = customers.map((customer) => {
-      const score = calculateCustomerScore(customer);
+      const scoreInput: CustomerScoreInput = {
+        totalPaid: customer.totalPaid,
+        subscriptionStatus: customer.subscriptionStatus,
+        lastOrderDate: customer.lastOrderDate,
+        refunds: customer.refunds,
+        chargebacks: customer.chargebacks,
+        failedPayments: customer.failedPayments,
+      };
+      const score = calculateCustomerScore(scoreInput);
       return { ...customer, score, stars: scoreToStars(score) };
     });
 
