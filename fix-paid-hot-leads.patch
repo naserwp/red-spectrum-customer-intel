@@ -1,0 +1,747 @@
+diff --git a/app/admin/page.tsx b/app/admin/page.tsx
+index 77532eb..e49e340 100644
+--- a/app/admin/page.tsx
++++ b/app/admin/page.tsx
+@@ -5,30 +5,195 @@ import autoTable from "jspdf-autotable";
+ import Link from "next/link";
+ import { useCallback, useEffect, useMemo, useState } from "react";
+ 
+-type Customer = Record<string, string | number | null> & { _id: string; name: string; email: string; phone: string; totalPaid: number; activeSubscriptions: number; failedPayments: number; chargebacks: number; estimatedCreditLimit: number; tier: string; riskLevel: string; score: number; stars: number; aiSummaryPreview: string; aiSummary: string; subscriptionStatus: string; orderCount: number; averageOrderValue: number; firstOrderDate: string; lastOrderDate: string; refunds: number; riskExplanation: string; recommendedAction: string; };
++type Customer = {
++  _id: string;
++  name: string;
++  email: string;
++  phone: string;
++  totalPaid: number;
++  paidTotal?: number;
++  attemptedTotal?: number;
++  paidOrderCount?: number;
++  attemptedOrderCount?: number;
++  leadStatus?: string;
++  paymentStatus?: string;
++  lastPaidDate?: string;
++  lastAttemptDate?: string;
++  activeSubscriptions: number;
++  failedPayments: number;
++  chargebacks: number;
++  estimatedCreditLimit: number;
++  tier: string;
++  riskLevel: string;
++  score: number;
++  stars: number;
++  aiSummaryPreview: string;
++  aiSummary: string;
++  subscriptionStatus: string;
++  orderCount: number;
++  averageOrderValue: number;
++  firstOrderDate: string;
++  lastOrderDate: string;
++  refunds: number;
++  riskExplanation: string;
++  recommendedAction: string;
++};
++
++type Subscription = {
++  _id?: string;
++  subscriptionId: string;
++  source: string;
++  customerEmail: string;
++  customerName: string;
++  status: string;
++  amount: number;
++  monthlyRecurringRevenue?: number;
++  billingInterval?: string;
++  nextBillingDate?: string;
++  lastBillingDate?: string;
++  failedPaymentCount?: number;
++  lastPaymentStatus?: string;
++};
+ 
+ const money = (n: number) => `$${n.toFixed(2)}`;
+ const tabs = ["Overview", "Customers", "Subscriptions", "Upcoming Bills", "High Value", "Risk Review", "Sync Center"] as const;
+ 
++const paidAmount = (c: Customer) => Number(c.paidTotal ?? c.totalPaid ?? 0);
++const attemptedAmount = (c: Customer) => Number(c.attemptedTotal ?? 0);
++const displayDate = (value?: string) => {
++  if (!value) return "-";
++  const date = new Date(value);
++  return Number.isNaN(date.getTime()) ? "-" : date.toLocaleDateString();
++};
++const displayStatus = (value?: string) => value ? value.replaceAll("_", " ") : "-";
++const monthSpan = (start?: string, end?: string) => {
++  if (!start) return 0;
++  const startDate = new Date(start);
++  const endDate = end ? new Date(end) : new Date();
++  if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) return 0;
++  return Math.max(0, (endDate.getFullYear() - startDate.getFullYear()) * 12 + endDate.getMonth() - startDate.getMonth() + 1);
++};
++
+ function getCustomerCategory(c: Customer) {
+-  if (c.totalPaid >= 2000 || c.estimatedCreditLimit >= 10000 || c.activeSubscriptions >= 2) return "vip";
+-  if (c.totalPaid >= 1000 || c.estimatedCreditLimit >= 5000) return "gold";
+-  if (c.totalPaid >= 500) return "silver";
+-  if (c.failedPayments > 1 || c.chargebacks > 0) return "risk";
+-  return "bronze";
++  const paid = paidAmount(c);
++  const attempted = attemptedAmount(c);
++  if (paid >= 2000) return "vip_paid";
++  if (paid > 0) return "paying";
++  if (attempted >= 2000) return "very_hot_lead";
++  if (attempted > 0) return "hot_lead";
++  return "cold_lead";
+ }
+ 
++const categoryLabel: Record<string, string> = {
++  vip_paid: "VIP Paid Customer",
++  paying: "Paying Customer",
++  very_hot_lead: "Very Hot Lead",
++  hot_lead: "Hot Lead",
++  cold_lead: "Cold Lead",
++};
++
+ const badgeClass: Record<string, string> = {
+-  vip: "bg-amber-500/20 text-amber-200 border-amber-500/50",
+-  gold: "bg-yellow-500/20 text-yellow-200 border-yellow-500/50",
+-  silver: "bg-slate-400/20 text-slate-200 border-slate-400/50",
+-  bronze: "bg-orange-700/20 text-orange-200 border-orange-700/50",
+-  risk: "bg-red-600/20 text-red-200 border-red-600/50",
++  vip_paid: "bg-amber-500/20 text-amber-200 border-amber-500/50",
++  paying: "bg-emerald-500/20 text-emerald-200 border-emerald-500/50",
++  very_hot_lead: "bg-red-600/20 text-red-200 border-red-600/50",
++  hot_lead: "bg-orange-600/20 text-orange-200 border-orange-600/50",
++  cold_lead: "bg-zinc-700/30 text-zinc-200 border-zinc-600/60",
+ };
+ 
++function MetricGrid({ summary }: { summary: Record<string, unknown> }) {
++  return <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{[
++    ["Total Subscriptions", Number(summary.totalSubscriptions ?? 0)],
++    ["Active Subscriptions", Number(summary.activeSubscriptions ?? 0)],
++    ["MRR", money(Number(summary.monthlyRecurringRevenue ?? 0))],
++    ["Upcoming 30d", Number(summary.upcomingBills30d ?? 0)],
++    ["Failed Payments", Number(summary.failedPayments ?? 0)],
++    ["Paid Revenue", money(Number(summary.paidRevenue ?? summary.totalRevenue ?? 0))],
++    ["Attempted Pipeline", money(Number(summary.attemptedRevenue ?? 0))],
++    ["Est. Upcoming Revenue", money(Number(summary.estimatedUpcomingRevenue30d ?? 0))],
++  ].map(([k, v]) => <div key={String(k)} className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4"><p className="text-xs uppercase text-zinc-400">{k}</p><p className="mt-2 text-2xl font-semibold">{String(v)}</p></div>)}</section>;
++}
++
++function ValueIndex({ customers, limit }: { customers: Customer[]; limit?: number }) {
++  const rows = [...customers].sort((a, b) => paidAmount(b) - paidAmount(a) || attemptedAmount(b) - attemptedAmount(a)).slice(0, limit ?? customers.length);
++  return <div className="overflow-x-auto rounded-xl border border-zinc-800">
++    <table className="min-w-[1100px] text-xs">
++      <thead className="bg-zinc-950"><tr>{["Rank", "Customer", "Lifetime Value", "Start", "Paid Months", "Tenure", "Last Paid", "Attempted", "Category", "Action"].map((h) => <th key={h} className="px-3 py-2 text-left">{h}</th>)}</tr></thead>
++      <tbody>{rows.map((c, index) => {
++        const cat = getCustomerCategory(c);
++        return <tr key={c._id} className="border-t border-zinc-800">
++          <td className="px-3 py-2 font-semibold">#{index + 1}</td>
++          <td className="px-3 py-2"><p className="font-semibold">{c.name}</p><p className="text-zinc-400">{c.email}</p></td>
++          <td className="px-3 py-2 font-semibold">{money(paidAmount(c))}</td>
++          <td className="px-3 py-2">{displayDate(c.firstOrderDate)}</td>
++          <td className="px-3 py-2">{c.paidOrderCount ?? 0}</td>
++          <td className="px-3 py-2">{monthSpan(c.firstOrderDate)} mo</td>
++          <td className="px-3 py-2">{displayDate(c.lastPaidDate || c.lastOrderDate)}</td>
++          <td className="px-3 py-2">{money(attemptedAmount(c))}</td>
++          <td className="px-3 py-2"><span className={`inline-flex rounded border px-2 py-1 ${badgeClass[cat]}`}>{categoryLabel[cat]}</span></td>
++          <td className="px-3 py-2"><Link className="rounded bg-zinc-700 px-2 py-1" href={`/admin/customers/${c._id}`}>View</Link></td>
++        </tr>;
++      })}</tbody>
++    </table>
++  </div>;
++}
++
++function CustomerTable({ customers, exportCustomerPdf }: { customers: Customer[]; exportCustomerPdf: (c: Customer) => void }) {
++  return <div className="overflow-x-auto rounded-xl border border-zinc-800">
++    <table className="min-w-[1700px] table-fixed text-xs">
++      <thead className="bg-zinc-950"><tr>{["Customer", "Category", "Tier", "Actual Paid", "Attempted Amount", "Paid Orders", "Attempted Orders", "Start", "Tenure", "Payment Status", "Lead Status", "Last Paid", "Last Attempt", "Risk", "Score", "Preview", "Actions"].map((h) => <th key={h} className="px-3 py-2 text-left">{h}</th>)}</tr></thead>
++      <tbody>{customers.map((c) => {
++        const cat = getCustomerCategory(c);
++        return <tr key={c._id} className={`border-t border-zinc-800 ${cat === "vip_paid" ? "bg-amber-500/5" : cat.includes("hot") ? "bg-orange-500/5" : ""}`}>
++          <td className="w-52 px-3 py-2"><p className="truncate font-semibold">{c.name}</p><p className="truncate text-zinc-400">{c.email}</p></td>
++          <td className="px-3 py-2"><span className={`inline-flex rounded border px-2 py-1 ${badgeClass[cat]}`}>{categoryLabel[cat]}</span></td>
++          <td className="px-3 py-2">{paidAmount(c) > 0 ? c.tier : "Lead"}</td>
++          <td className="px-3 py-2">{money(paidAmount(c))}</td>
++          <td className="px-3 py-2">{money(attemptedAmount(c))}</td>
++          <td className="px-3 py-2">{c.paidOrderCount ?? 0}</td>
++          <td className="px-3 py-2">{c.attemptedOrderCount ?? 0}</td>
++          <td className="px-3 py-2">{displayDate(c.firstOrderDate)}</td>
++          <td className="px-3 py-2">{monthSpan(c.firstOrderDate)} mo</td>
++          <td className="px-3 py-2">{displayStatus(c.paymentStatus)}</td>
++          <td className="px-3 py-2">{displayStatus(c.leadStatus)}</td>
++          <td className="px-3 py-2">{displayDate(c.lastPaidDate)}</td>
++          <td className="px-3 py-2">{displayDate(c.lastAttemptDate)}</td>
++          <td className="px-3 py-2">{c.riskLevel}</td>
++          <td className="px-3 py-2">{c.score}/{c.stars} stars</td>
++          <td className="truncate px-3 py-2">{c.aiSummaryPreview}</td>
++          <td className="px-3 py-2"><div className="flex gap-2"><Link className="rounded bg-zinc-700 px-2 py-1" href={`/admin/customers/${c._id}`}>View</Link><button onClick={() => exportCustomerPdf(c)} className="rounded bg-red-700 px-2 py-1">PDF</button></div></td>
++        </tr>;
++      })}</tbody>
++    </table>
++  </div>;
++}
++
++function SubscriptionTable({ rows }: { rows: Subscription[] }) {
++  return <div className="overflow-x-auto rounded-xl border border-zinc-800">
++    <table className="min-w-[1100px] text-xs">
++      <thead className="bg-zinc-950"><tr>{["Customer", "Source", "Status", "Amount", "MRR", "Interval", "Next Bill", "Last Bill", "Failed", "Last Payment"].map((h) => <th key={h} className="px-3 py-2 text-left">{h}</th>)}</tr></thead>
++      <tbody>{rows.map((s) => <tr key={s._id ?? s.subscriptionId} className="border-t border-zinc-800">
++        <td className="px-3 py-2"><p className="font-semibold">{s.customerName || "-"}</p><p className="text-zinc-400">{s.customerEmail}</p></td>
++        <td className="px-3 py-2">{s.source}</td>
++        <td className="px-3 py-2">{displayStatus(s.status)}</td>
++        <td className="px-3 py-2">{money(Number(s.amount ?? 0))}</td>
++        <td className="px-3 py-2">{money(Number(s.monthlyRecurringRevenue ?? 0))}</td>
++        <td className="px-3 py-2">{s.billingInterval ?? "-"}</td>
++        <td className="px-3 py-2">{displayDate(s.nextBillingDate)}</td>
++        <td className="px-3 py-2">{displayDate(s.lastBillingDate)}</td>
++        <td className="px-3 py-2">{s.failedPaymentCount ?? 0}</td>
++        <td className="px-3 py-2">{displayStatus(s.lastPaymentStatus)}</td>
++      </tr>)}</tbody>
++    </table>
++  </div>;
++}
++
+ export default function AdminPage() {
+   const [customers, setCustomers] = useState<Customer[]>([]);
+   const [summary, setSummary] = useState<Record<string, unknown>>({});
++  const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
++  const [upcomingBills, setUpcomingBills] = useState<Subscription[]>([]);
++  const [riskRows, setRiskRows] = useState<Customer[]>([]);
++  const [upcomingMeta, setUpcomingMeta] = useState<Record<string, unknown>>({});
+   const [error, setError] = useState("");
+   const [message, setMessage] = useState("");
+   const [tab, setTab] = useState<(typeof tabs)[number]>("Overview");
+@@ -36,55 +201,132 @@ export default function AdminPage() {
+   const [total, setTotal] = useState(0);
+ 
+   const loadCustomers = useCallback(async (nextPage = page) => {
+-    const data = await fetch(`/api/customers/table?page=${nextPage}&limit=25`, { cache: "no-store" }).then((r) => r.json());
+-    setCustomers(data.rows || []); setTotal(data.total || 0); setPage(data.page || nextPage);
++    const data = await fetch(`/api/customers/table?page=${nextPage}&limit=100`, { cache: "no-store" }).then((r) => r.json());
++    setCustomers(data.rows || []);
++    setTotal(data.total || 0);
++    setPage(data.page || nextPage);
+   }, [page]);
+ 
++  const loadDashboardData = useCallback(async () => {
++    const [summaryData, subscriptionData, upcomingData, riskData] = await Promise.all([
++      fetch("/api/analytics/summary", { cache: "no-store" }).then((r) => r.json()),
++      fetch("/api/subscriptions?limit=100", { cache: "no-store" }).then((r) => r.json()),
++      fetch("/api/upcoming-bills", { cache: "no-store" }).then((r) => r.json()),
++      fetch("/api/risk-customers", { cache: "no-store" }).then((r) => r.json()),
++    ]);
++    setSummary(summaryData || {});
++    setSubscriptions(subscriptionData.rows || []);
++    setUpcomingBills(upcomingData.rows || []);
++    setUpcomingMeta(upcomingData || {});
++    setRiskRows(riskData.rows || []);
++  }, []);
++
+   useEffect(() => {
+     // eslint-disable-next-line react-hooks/set-state-in-effect
+     loadCustomers(1).catch(() => setError("Unable to load customers."));
+-    fetch("/api/analytics/summary", { cache: "no-store" }).then((r) => r.json()).then(setSummary).catch(() => setSummary({}));
+-  }, [loadCustomers]);
++    loadDashboardData().catch(() => setError("Unable to load dashboard data."));
++  }, [loadCustomers, loadDashboardData]);
+ 
+   const syncWooCommerce = async () => {
++    setError("");
+     setMessage("Sync in progress...");
+     const res = await fetch("/api/customers/sync", { method: "POST" });
+     const d = await res.json();
+     if (!res.ok) return setError(d.error || "Sync failed");
+     setMessage(d.message || "Sync completed");
+     await loadCustomers(1);
+-    const s = await fetch("/api/analytics/summary", { cache: "no-store" }).then((r) => r.json());
+-    setSummary(s);
++    await loadDashboardData();
+   };
+ 
+   const exportCustomerPdf = (c: Customer) => {
+     const doc = new jsPDF();
+     doc.text(`Customer - ${c.name}`, 14, 16);
+-    autoTable(doc, { startY: 24, head: [["Metric", "Value"]], body: [["Email", c.email], ["Total Paid", money(c.totalPaid)], ["Active Subscriptions", String(c.activeSubscriptions)], ["Tier", c.tier], ["Risk", c.riskLevel], ["AI", c.aiSummary]] });
++    autoTable(doc, {
++      startY: 24,
++      head: [["Metric", "Value"]],
++      body: [
++        ["Email", c.email],
++        ["Customer Lifetime Value", money(paidAmount(c))],
++        ["Attempted Amount", money(attemptedAmount(c))],
++        ["Start Date", displayDate(c.firstOrderDate)],
++        ["Paid Months", String(c.paidOrderCount ?? 0)],
++        ["Tenure", `${monthSpan(c.firstOrderDate)} months`],
++        ["Payment Status", displayStatus(c.paymentStatus)],
++        ["Lead Status", displayStatus(c.leadStatus)],
++        ["Tier", paidAmount(c) > 0 ? c.tier : "Lead"],
++        ["Risk", c.riskLevel],
++        ["AI", c.aiSummary],
++      ],
++    });
+     doc.save(`customer-${c.email}.pdf`);
+   };
+ 
+-  const vipWatch = useMemo(() => [...customers].sort((a, b) => b.totalPaid - a.totalPaid).slice(0, 5), [customers]);
++  const vipPaidCustomers = useMemo(
++    () => customers.filter((c) => paidAmount(c) >= 2000).sort((a, b) => paidAmount(b) - paidAmount(a)).slice(0, 5),
++    [customers]
++  );
++  const hotCheckoutLeads = useMemo(
++    () => customers.filter((c) => paidAmount(c) === 0 && attemptedAmount(c) > 0).sort((a, b) => attemptedAmount(b) - attemptedAmount(a)).slice(0, 5),
++    [customers]
++  );
++  const lowValueCustomers = useMemo(
++    () => customers.filter((c) => paidAmount(c) > 0).sort((a, b) => paidAmount(a) - paidAmount(b)).slice(0, 10),
++    [customers]
++  );
+ 
+   return <main className="min-h-screen bg-gradient-to-b from-zinc-950 to-black p-4 text-zinc-100 md:p-8">
+     <div className="mx-auto max-w-7xl space-y-4">
+       <header className="flex flex-wrap items-center justify-between gap-3"><div><h1 className="text-3xl font-bold text-red-400">Red Spectrum Intelligence</h1><p className="text-zinc-400">Multi-source subscriptions, risk review, and recurring revenue analytics.</p></div><button onClick={syncWooCommerce} className="rounded bg-red-600 px-4 py-2 font-semibold hover:bg-red-500">Sync Center</button></header>
+-      <nav className="sticky top-0 z-10 flex gap-2 overflow-auto rounded-xl border border-zinc-800 bg-zinc-900/80 p-2 backdrop-blur">{tabs.map((t)=><button key={t} onClick={()=>setTab(t)} className={`rounded px-3 py-2 text-sm ${tab===t?"bg-red-600 text-white":"bg-zinc-800 text-zinc-300"}`}>{t}</button>)}</nav>
++      <nav className="sticky top-0 z-10 flex gap-2 overflow-auto rounded-xl border border-zinc-800 bg-zinc-900/80 p-2 backdrop-blur">{tabs.map((t) => <button key={t} onClick={() => setTab(t)} className={`rounded px-3 py-2 text-sm ${tab === t ? "bg-red-600 text-white" : "bg-zinc-800 text-zinc-300"}`}>{t}</button>)}</nav>
+       {error && <p className="rounded border border-red-800 bg-red-950/50 p-3">{error}</p>}
+       {message && <p className="rounded border border-emerald-800 bg-emerald-950/50 p-3">{message}</p>}
+-      <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{[
+-        ["Total Subscriptions", Number(summary.totalSubscriptions ?? 0)],
+-        ["Active Subscriptions", Number(summary.activeSubscriptions ?? 0)],
+-        ["MRR", money(Number(summary.monthlyRecurringRevenue ?? 0))],
+-        ["Upcoming 30d", Number(summary.upcomingBills30d ?? 0)],
+-        ["Failed Payments", Number(summary.failedPayments ?? 0)],
+-        ["Est. Upcoming Revenue", money(Number(summary.estimatedUpcomingRevenue30d ?? 0))],
+-      ].map(([k,v])=><div key={String(k)} className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4"><p className="text-xs uppercase text-zinc-400">{k}</p><p className="mt-2 text-2xl font-semibold">{String(v)}</p></div>)}</section>
+-
+-      <section className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4"><h2 className="mb-3 text-lg font-semibold text-amber-200">VIP Watchlist</h2><div className="grid gap-2 md:grid-cols-5">{vipWatch.map((c)=><div key={c._id} className="rounded border border-amber-500/30 bg-amber-500/10 p-2 text-sm"><p className="font-semibold">{c.name}</p><p>{money(c.totalPaid)}</p><p>{c.activeSubscriptions} active subs</p></div>)}</div></section>
+-
+-      <div className="overflow-auto rounded-xl border border-zinc-800"><table className="min-w-full text-xs"><thead className="bg-zinc-950"><tr>{["Customer","Category","Tier","Paid","Active Subs","Risk","Score","Preview","Actions"].map((h)=><th key={h} className="px-3 py-2 text-left">{h}</th>)}</tr></thead><tbody>{customers.map((c)=>{const cat=getCustomerCategory(c);return <tr key={c._id} className={`border-t border-zinc-800 ${cat==="vip"?"bg-amber-500/5":cat==="risk"?"bg-red-500/5":""}`}><td className="px-3 py-2"><p className="font-semibold">{c.name}</p><p className="text-zinc-400">{c.email}</p></td><td className="px-3 py-2"><span className={`rounded border px-2 py-1 uppercase ${badgeClass[cat]}`}>{cat}</span></td><td className="px-3 py-2">{c.tier}</td><td className="px-3 py-2">{money(c.totalPaid)}</td><td className="px-3 py-2">{c.activeSubscriptions}</td><td className="px-3 py-2">{c.riskLevel}</td><td className="px-3 py-2">{c.score}/{c.stars}★</td><td className="max-w-[240px] truncate px-3 py-2">{c.aiSummaryPreview}</td><td className="px-3 py-2"><div className="flex gap-2"><Link className="rounded bg-zinc-700 px-2 py-1" href={`/admin/customers/${c._id}`}>View</Link><button onClick={()=>exportCustomerPdf(c)} className="rounded bg-red-700 px-2 py-1">PDF</button></div></td></tr>;})}</tbody></table></div>
+-      <div className="flex items-center justify-between"><p className="text-sm text-zinc-400">Showing page {page}. Total rows: {total}</p><div className="flex gap-2"><button disabled={page<=1} onClick={()=>loadCustomers(page-1)} className="rounded bg-zinc-800 px-3 py-1 disabled:opacity-50">Prev</button><button onClick={()=>loadCustomers(page+1)} className="rounded bg-zinc-800 px-3 py-1">Next</button></div></div>
++
++      {tab === "Overview" && <>
++        <MetricGrid summary={summary} />
++        <section className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4"><h2 className="mb-3 text-lg font-semibold text-amber-200">VIP Paid Customers</h2><div className="grid gap-2 md:grid-cols-5">{vipPaidCustomers.map((c) => <div key={c._id} className="rounded border border-amber-500/30 bg-amber-500/10 p-2 text-sm"><p className="font-semibold">{c.name}</p><p>{money(paidAmount(c))}</p><p>{c.paidOrderCount ?? 0} paid months/orders</p></div>)}</div>{vipPaidCustomers.length === 0 && <p className="text-sm text-zinc-400">No high-value paid customers on this page.</p>}</section>
++        <section className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4"><h2 className="mb-3 text-lg font-semibold text-orange-200">Hot Checkout Leads</h2><div className="grid gap-2 md:grid-cols-5">{hotCheckoutLeads.map((c) => <div key={c._id} className="rounded border border-orange-500/30 bg-orange-500/10 p-2 text-sm"><p className="font-semibold">{c.name}</p><p>{money(attemptedAmount(c))} attempted</p><p>{displayStatus(c.leadStatus)}</p></div>)}</div>{hotCheckoutLeads.length === 0 && <p className="text-sm text-zinc-400">No unpaid checkout leads on this page.</p>}</section>
++        <section className="space-y-3"><h2 className="text-lg font-semibold text-zinc-100">Customer Value Index</h2><ValueIndex customers={customers} limit={10} /></section>
++      </>}
++
++      {tab === "Customers" && <>
++        <MetricGrid summary={summary} />
++        <CustomerTable customers={customers} exportCustomerPdf={exportCustomerPdf} />
++        <div className="flex items-center justify-between"><p className="text-sm text-zinc-400">Showing page {page}. Total rows: {total}</p><div className="flex gap-2"><button disabled={page <= 1} onClick={() => loadCustomers(page - 1)} className="rounded bg-zinc-800 px-3 py-1 disabled:opacity-50">Prev</button><button disabled={page * 100 >= total} onClick={() => loadCustomers(page + 1)} className="rounded bg-zinc-800 px-3 py-1 disabled:opacity-50">Next</button></div></div>
++      </>}
++
++      {tab === "Subscriptions" && <>
++        <MetricGrid summary={summary} />
++        <SubscriptionTable rows={subscriptions} />
++      </>}
++
++      {tab === "Upcoming Bills" && <>
++        <section className="grid gap-3 sm:grid-cols-3">{[
++          ["Upcoming Bills", Number(upcomingMeta.rows ? upcomingBills.length : summary.upcomingBills30d ?? 0)],
++          ["High Risk Upcoming", Number(upcomingMeta.highRiskCount ?? 0)],
++          ["Estimated Upcoming", money(Number(upcomingMeta.estimatedUpcomingRevenue ?? summary.estimatedUpcomingRevenue30d ?? 0))],
++        ].map(([k, v]) => <div key={String(k)} className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4"><p className="text-xs uppercase text-zinc-400">{k}</p><p className="mt-2 text-2xl font-semibold">{String(v)}</p></div>)}</section>
++        <SubscriptionTable rows={upcomingBills} />
++      </>}
++
++      {tab === "High Value" && <>
++        <section className="space-y-3"><h2 className="text-lg font-semibold text-amber-200">High To Low Customer Value</h2><ValueIndex customers={customers} /></section>
++        <section className="space-y-3"><h2 className="text-lg font-semibold text-zinc-200">Low Value Paid Customers</h2><ValueIndex customers={lowValueCustomers} /></section>
++      </>}
++
++      {tab === "Risk Review" && <>
++        <section className="grid gap-3 sm:grid-cols-3">{[
++          ["Risk Customers", riskRows.length],
++          ["Failed Payments", Number(summary.failedPayments ?? 0)],
++          ["Attempted Pipeline", money(Number(summary.attemptedRevenue ?? 0))],
++        ].map(([k, v]) => <div key={String(k)} className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4"><p className="text-xs uppercase text-zinc-400">{k}</p><p className="mt-2 text-2xl font-semibold">{String(v)}</p></div>)}</section>
++        <CustomerTable customers={riskRows.length ? riskRows : customers.filter((c) => c.riskLevel === "high" || c.failedPayments > 0 || c.chargebacks > 0)} exportCustomerPdf={exportCustomerPdf} />
++      </>}
++
++      {tab === "Sync Center" && <section className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4">
++        <h2 className="mb-3 text-lg font-semibold text-red-300">Sync Center</h2>
++        <p className="mb-4 text-sm text-zinc-400">WooCommerce sync recalculates actual paid revenue, attempted checkout pipeline, customer tier, lead status, payment status, and rule-based summaries.</p>
++        <button onClick={syncWooCommerce} className="rounded bg-red-600 px-4 py-2 font-semibold hover:bg-red-500">Run WooCommerce Sync</button>
++      </section>}
+     </div>
+   </main>;
+ }
+diff --git a/app/api/analytics/summary/route.ts b/app/api/analytics/summary/route.ts
+index 3fb78d2..f8f1b5f 100644
+--- a/app/api/analytics/summary/route.ts
++++ b/app/api/analytics/summary/route.ts
+@@ -12,21 +12,24 @@ export async function GET() {
+   const activeSubs = subs.filter((s) => s.status === "active");
+   const failedSubs = subs.filter((s) => (s.failedPaymentCount ?? 0) > 0 || s.lastPaymentStatus === "failed");
+   const pendingSubs = subs.filter((s) => s.status === "pending" || s.status === "past_due");
++  const upcomingActiveSubs30d = activeSubs.filter((s) => dueIn(s.nextBillingDate ?? "", 30));
+   const mrr = activeSubs.reduce((a, s) => a + (s.monthlyRecurringRevenue ?? s.amount ?? 0), 0);
+   const sourceBreakdown = ["woocommerce","stripe","authorize_net","nmi","manual"].reduce<Record<string, number>>((acc, source) => {
+     acc[source] = subs.filter((s) => s.source === source).reduce((a, s) => a + (s.amount ?? 0), 0); return acc;
+   }, {});
+   return NextResponse.json({
+     customerCount: customers.length,
+-    totalRevenue: customers.reduce((a, c) => a + (c.totalPaid ?? 0), 0),
++    totalRevenue: customers.reduce((a, c) => a + (c.paidTotal ?? c.totalPaid ?? 0), 0),
++    paidRevenue: customers.reduce((a, c) => a + (c.paidTotal ?? c.totalPaid ?? 0), 0),
++    attemptedRevenue: customers.reduce((a, c) => a + (c.attemptedTotal ?? 0), 0),
+     totalSubscriptions: subs.length,
+     activeSubscriptions: activeSubs.length,
+     inactiveSubscriptions: subs.filter((s) => s.status === "inactive" || s.status === "canceled").length,
+     pendingSubscriptions: pendingSubs.length,
+     failedPayments: failedSubs.length,
+     upcomingBills7d: subs.filter((s) => dueIn(s.nextBillingDate ?? "", 7)).length,
+-    upcomingBills30d: subs.filter((s) => dueIn(s.nextBillingDate ?? "", 30)).length,
+-    estimatedUpcomingRevenue30d: subs.filter((s) => dueIn(s.nextBillingDate ?? "", 30)).reduce((a, s) => a + (s.amount ?? 0), 0),
++    upcomingBills30d: upcomingActiveSubs30d.length,
++    estimatedUpcomingRevenue30d: upcomingActiveSubs30d.reduce((a, s) => a + (s.amount ?? 0), 0),
+     monthlyRecurringRevenue: mrr,
+     sourceBreakdown,
+   });
+diff --git a/app/api/customers/route.ts b/app/api/customers/route.ts
+index 6894907..978124a 100644
+--- a/app/api/customers/route.ts
++++ b/app/api/customers/route.ts
+@@ -19,7 +19,7 @@ export async function GET() {
+   if (!connection) return fallbackCustomers();
+ 
+   try {
+-    const customers = await Customer.find({}).sort({ totalPaid: -1 }).lean<LeanCustomer[]>();
++    const customers = await Customer.find({}).sort({ paidTotal: -1, attemptedTotal: -1 }).lean<LeanCustomer[]>();
+     return NextResponse.json({ customers: enrichCustomers(customers) });
+   } catch (error) {
+     const message = error instanceof Error ? error.message : "Unknown customer query error.";
+diff --git a/app/api/customers/sync/route.ts b/app/api/customers/sync/route.ts
+index a19979e..e8105fb 100644
+--- a/app/api/customers/sync/route.ts
++++ b/app/api/customers/sync/route.ts
+@@ -1,25 +1,31 @@
+ import { NextResponse } from "next/server";
+ import { calculateCustomerScore, scoreToStars, type CustomerScoreInput } from "@/lib/customerScore";
+ import { connectToDatabase } from "@/lib/mongodb";
+-import { generateCustomerAiSummary } from "@/lib/openai";
+ import { fetchWooCommerceOrders, isWooCommerceConfigured, type WooCommerceCustomer, type WooCommerceOrder } from "@/lib/woocommerce";
+ import { Customer } from "@/models/Customer";
+ import { Subscription } from "@/models/Subscription";
+ import { buildSourcePlaceholders, mapWooOrdersToSubscriptions } from "@/lib/subscriptions";
+ 
+ type SyncedCustomer = CustomerScoreInput & {
+-  _id: string;
+   name: string;
+   email: string;
+   phone: string;
++  paidTotal: number;
++  attemptedTotal: number;
+   orderCount: number;
++  paidOrderCount: number;
++  attemptedOrderCount: number;
+   firstOrderDate: string;
++  lastPaidDate: string;
++  lastAttemptDate: string;
+   lastOrderAmount: number;
+   averageOrderValue: number;
+   activeSubscriptions: number;
+   estimatedCreditLimit: number;
+   actualCreditLimit: number | null;
+   tier: string;
++  leadStatus: string;
++  paymentStatus: string;
+   riskLevel: "low" | "medium" | "high";
+   tags: string[];
+   notes: string;
+@@ -32,14 +38,18 @@ type SyncedCustomer = CustomerScoreInput & {
+   stars: number;
+ };
+ 
+-type CustomerAccumulator = Omit<SyncedCustomer, "_id" | "score" | "stars" | "tier" | "aiSummary" | "aiSummaryPreview" | "riskExplanation" | "recommendedAction" | "averageOrderValue" | "estimatedCreditLimit" | "riskLevel" | "lastSyncedAt">;
++type CustomerAccumulator = Omit<SyncedCustomer, "score" | "stars" | "tier" | "leadStatus" | "paymentStatus" | "aiSummary" | "aiSummaryPreview" | "riskExplanation" | "recommendedAction" | "averageOrderValue" | "estimatedCreditLimit" | "riskLevel" | "lastSyncedAt">;
++type RuleSummaryCustomer = Omit<SyncedCustomer, "aiSummary" | "aiSummaryPreview" | "riskExplanation" | "recommendedAction">;
+ 
+ const subscriptionStatuses: CustomerScoreInput["subscriptionStatus"][] = ["active", "inactive", "canceled", "past_due", "unknown"];
+ const todayIso = new Date().toISOString();
++const paidOrderStatuses = new Set(["completed", "processing", "paid"]);
+ 
+ const parseMoney = (value: string | undefined) => Number.isFinite(Number(value ?? 0)) ? Number(value ?? 0) : 0;
+ const getOrderEmail = (order: WooCommerceOrder) => order.billing?.email?.trim().toLowerCase() ?? "";
+ const getOrderName = (order: WooCommerceOrder) => `${order.billing?.first_name?.trim() ?? ""} ${order.billing?.last_name?.trim() ?? ""}`.trim() || order.billing?.email || "WooCommerce Customer";
++const getOrderStatus = (order: WooCommerceOrder) => (order.status ?? "").trim().toLowerCase();
++const isPaidOrder = (order: WooCommerceOrder) => paidOrderStatuses.has(getOrderStatus(order));
+ 
+ function getSubscriptionStatus(order: WooCommerceOrder): CustomerScoreInput["subscriptionStatus"] {
+   const metaValue = order.meta_data?.find((meta) => meta.key?.toLowerCase().includes("subscription_status"))?.value?.toString().toLowerCase();
+@@ -47,7 +57,9 @@ function getSubscriptionStatus(order: WooCommerceOrder): CustomerScoreInput["sub
+   return "unknown";
+ }
+ 
+-const getTier = (totalPaid: number) => totalPaid >= 2500 ? "Platinum" : totalPaid >= 999 ? "Gold" : totalPaid >= 200 ? "Silver" : "Bronze";
++const getTier = (paidTotal: number, attemptedTotal: number) => paidTotal > 0 ? paidTotal >= 2500 ? "Platinum" : paidTotal >= 999 ? "Gold" : paidTotal >= 200 ? "Silver" : "Bronze" : attemptedTotal > 0 ? "Lead" : "Cold Lead";
++const getLeadStatus = (paidTotal: number, attemptedTotal: number) => paidTotal > 0 ? "customer" : attemptedTotal >= 2000 ? "very_hot_lead" : attemptedTotal > 0 ? "hot_lead" : "cold_lead";
++const getPaymentStatus = (paidTotal: number, attemptedTotal: number) => paidTotal > 0 ? "paid" : attemptedTotal > 0 ? "attempted_unpaid" : "unpaid";
+ const getRiskLevel = (
+   c: Pick<CustomerScoreInput, "chargebacks" | "failedPayments" | "refunds">,
+   score: number
+@@ -68,6 +80,47 @@ function getActualCreditLimitFromMeta(source: WooCommerceOrder | WooCommerceCust
+   return Number.isFinite(parsed) ? parsed : null;
+ }
+ 
++function buildRuleBasedSummary(customer: RuleSummaryCustomer) {
++  const aiSummary =
++    customer.paidTotal > 0
++      ? `${customer.name} is a paid customer with ${customer.paidOrderCount} paid orders totaling $${customer.paidTotal.toFixed(2)}.`
++      : customer.attemptedTotal > 0
++        ? "This is a hot lead who attempted checkout but has not completed payment."
++        : `${customer.name} has not completed payment yet.`;
++  const riskExplanation =
++    customer.chargebacks > 0
++      ? "Chargeback history indicates elevated payment dispute risk."
++      : customer.failedPayments > 1
++        ? "Multiple failed or pending payments indicate checkout friction."
++        : customer.refunds > 0
++          ? "Refund activity is present and should be reviewed."
++          : "Payment and refund patterns do not show elevated risk.";
++
++  return {
++    aiSummary,
++    aiSummaryPreview: aiSummary.slice(0, 110) + (aiSummary.length > 110 ? "..." : ""),
++    riskExplanation,
++    recommendedAction:
++      customer.paidTotal > 0
++        ? customer.paidTotal >= 2000
++          ? "Prioritize retention and account review for this high-value paid customer."
++          : "Continue normal paid customer follow-up."
++        : customer.attemptedTotal > 0
++          ? "Follow up on the incomplete checkout and resolve payment friction."
++          : "Keep in low-priority nurture until payment intent appears.",
++  };
++}
++
++function toSafeCustomerData(customer: SyncedCustomer) {
++  const safeCustomerData = { ...customer } as Record<string, unknown>;
++  delete safeCustomerData._id;
++  delete safeCustomerData.id;
++  delete safeCustomerData.customerId;
++  delete safeCustomerData.wooCustomerId;
++  delete safeCustomerData.externalId;
++  return safeCustomerData;
++}
++
+ async function transformOrdersToCustomers(orders: WooCommerceOrder[]) {
+   const grouped = new Map<string, CustomerAccumulator>();
+ 
+@@ -76,25 +129,37 @@ async function transformOrdersToCustomers(orders: WooCommerceOrder[]) {
+     if (!email) continue;
+ 
+     const total = parseMoney(order.total);
++    const paidAmount = isPaidOrder(order) ? total : 0;
++    const attemptedAmount = isPaidOrder(order) ? 0 : total;
+     const orderDate = order.date_created ?? todayIso;
+     const existing = grouped.get(email);
+     const isLatest = !existing || new Date(orderDate).getTime() >= new Date(existing.lastOrderDate).getTime();
++    const isLatestPaid = paidAmount > 0 && (!existing?.lastPaidDate || new Date(orderDate).getTime() >= new Date(existing.lastPaidDate).getTime());
++    const isLatestAttempt = attemptedAmount > 0 && (!existing?.lastAttemptDate || new Date(orderDate).getTime() >= new Date(existing.lastAttemptDate).getTime());
+     const subscriptionStatus = getSubscriptionStatus(order);
+     const actualFromMeta = getActualCreditLimitFromMeta(order);
++    const failedPayment = ["failed", "payment_pending", "crypto_pending"].includes(getOrderStatus(order)) ? 1 : 0;
++    const refunded = order.refunds?.length ?? (getOrderStatus(order) === "refunded" ? 1 : 0);
+ 
+     grouped.set(email, {
+       name: isLatest || !existing ? getOrderName(order) : existing.name,
+       email,
+       phone: isLatest || !existing ? order.billing?.phone ?? "" : existing.phone,
+-      totalPaid: (existing?.totalPaid ?? 0) + total,
++      paidTotal: (existing?.paidTotal ?? 0) + paidAmount,
++      attemptedTotal: (existing?.attemptedTotal ?? 0) + attemptedAmount,
++      totalPaid: (existing?.paidTotal ?? 0) + paidAmount,
+       orderCount: (existing?.orderCount ?? 0) + 1,
++      paidOrderCount: (existing?.paidOrderCount ?? 0) + (paidAmount > 0 ? 1 : 0),
++      attemptedOrderCount: (existing?.attemptedOrderCount ?? 0) + (attemptedAmount > 0 ? 1 : 0),
+       firstOrderDate: !existing ? orderDate : new Date(orderDate) < new Date(existing.firstOrderDate) ? orderDate : existing.firstOrderDate,
+       lastOrderDate: isLatest || !existing ? orderDate : existing.lastOrderDate,
++      lastPaidDate: isLatestPaid ? orderDate : existing?.lastPaidDate ?? "",
++      lastAttemptDate: isLatestAttempt ? orderDate : existing?.lastAttemptDate ?? "",
+       lastOrderAmount: isLatest || !existing ? total : existing.lastOrderAmount,
+       subscriptionStatus: subscriptionStatus !== "unknown" ? subscriptionStatus : existing?.subscriptionStatus ?? "unknown",
+       activeSubscriptions: subscriptionStatus === "active" ? Math.max(existing?.activeSubscriptions ?? 0, 1) : existing?.activeSubscriptions ?? 0,
+-      failedPayments: (existing?.failedPayments ?? 0) + (order.status === "failed" ? 1 : 0),
+-      refunds: (existing?.refunds ?? 0) + (order.refunds?.length ?? (order.status === "refunded" ? 1 : 0)),
++      failedPayments: (existing?.failedPayments ?? 0) + failedPayment,
++      refunds: (existing?.refunds ?? 0) + refunded,
+       chargebacks: existing?.chargebacks ?? 0,
+       actualCreditLimit: actualFromMeta ?? existing?.actualCreditLimit ?? null,
+       notes: existing?.notes ?? "",
+@@ -104,26 +169,32 @@ async function transformOrdersToCustomers(orders: WooCommerceOrder[]) {
+ 
+   return Promise.all(Array.from(grouped.values()).map(async (customer) => {
+     const score = calculateCustomerScore(customer);
+-    const averageOrderValue = customer.orderCount > 0 ? customer.totalPaid / customer.orderCount : 0;
+-    const estimatedCreditLimit = estimateCreditLimit(customer.totalPaid, customer.orderCount, customer.failedPayments, customer.refunds, score);
++    const averageOrderValue = customer.paidOrderCount > 0 ? customer.paidTotal / customer.paidOrderCount : 0;
++    const estimatedCreditLimit = customer.paidTotal > 0 ? estimateCreditLimit(customer.paidTotal, customer.paidOrderCount, customer.failedPayments, customer.refunds, score) : 0;
+     const baseCustomer = {
+       ...customer,
+-      _id: `wc-${customer.email}`,
++      totalPaid: customer.paidTotal,
+       averageOrderValue,
+       estimatedCreditLimit,
+-      tier: getTier(customer.totalPaid),
++      tier: getTier(customer.paidTotal, customer.attemptedTotal),
++      leadStatus: getLeadStatus(customer.paidTotal, customer.attemptedTotal),
++      paymentStatus: getPaymentStatus(customer.paidTotal, customer.attemptedTotal),
+       riskLevel: getRiskLevel(customer, score),
+       lastSyncedAt: todayIso,
+       score,
+       stars: scoreToStars(score),
+     };
+-    const aiSummary = await generateCustomerAiSummary(baseCustomer);
++    const aiSummary = buildRuleBasedSummary(baseCustomer);
+     return { ...baseCustomer, ...aiSummary };
+   }));
+ }
+ 
+ async function saveCustomers(customers: SyncedCustomer[]) {
+-  await Promise.all(customers.map((customer) => Customer.findOneAndUpdate({ email: customer.email }, { $set: customer }, { upsert: true, new: true })));
++  await Promise.all(customers.map((customer) => Customer.findOneAndUpdate(
++    { email: customer.email },
++    { $set: toSafeCustomerData(customer) },
++    { upsert: true, new: true, setDefaultsOnInsert: true }
++  )));
+ }
+ 
+ export async function POST() {
+diff --git a/app/api/customers/table/route.ts b/app/api/customers/table/route.ts
+index 3c9ae8e..d4c9db9 100644
+--- a/app/api/customers/table/route.ts
++++ b/app/api/customers/table/route.ts
+@@ -14,7 +14,7 @@ export async function GET(request: Request) {
+   if (q) query.$or = [{ name: { $regex: q, $options: "i" } }, { email: { $regex: q, $options: "i" } }, { phone: { $regex: q, $options: "i" } }];
+   const [total, rows] = await Promise.all([
+     Customer.countDocuments(query),
+-    Customer.find(query).sort({ totalPaid: -1 }).skip((page - 1) * limit).limit(limit).lean(),
++    Customer.find(query).sort({ paidTotal: -1, attemptedTotal: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+   ]);
+   return NextResponse.json({ page, limit, total, rows });
+ }
+diff --git a/app/api/high-value-customers/route.ts b/app/api/high-value-customers/route.ts
+index c9c371d..1ed4e38 100644
+--- a/app/api/high-value-customers/route.ts
++++ b/app/api/high-value-customers/route.ts
+@@ -4,6 +4,6 @@ import { Customer } from "@/models/Customer";
+ 
+ export async function GET() {
+   await connectToDatabase();
+-  const rows = await Customer.find({ $or: [{ totalPaid: { $gte: 2000 } }, { activeSubscriptions: { $gte: 2 } }, { estimatedCreditLimit: { $gte: 10000 } }] }).sort({ totalPaid: -1 }).limit(50).lean();
++  const rows = await Customer.find({ paidTotal: { $gte: 2000 } }).sort({ paidTotal: -1 }).limit(50).lean();
+   return NextResponse.json({ rows });
+ }
+diff --git a/app/api/upcoming-bills/route.ts b/app/api/upcoming-bills/route.ts
+index 7361cc5..a05e9bd 100644
+--- a/app/api/upcoming-bills/route.ts
++++ b/app/api/upcoming-bills/route.ts
+@@ -6,7 +6,7 @@ export async function GET() {
+   await connectToDatabase();
+   const now = new Date();
+   const next30 = new Date(now.getTime() + 30 * 86400000);
+-  const rows = await Subscription.find({ nextBillingDate: { $gte: now.toISOString(), $lte: next30.toISOString() } }).sort({ nextBillingDate: 1 }).lean();
++  const rows = await Subscription.find({ status: "active", nextBillingDate: { $gte: now.toISOString(), $lte: next30.toISOString() } }).sort({ nextBillingDate: 1 }).lean();
+   const highRisk = rows.filter((r) => (r.failedPaymentCount ?? 0) > 0 || r.status === "pending" || r.status === "past_due");
+   return NextResponse.json({ rows, highRiskCount: highRisk.length, estimatedUpcomingRevenue: rows.reduce((a, r) => a + (r.amount ?? 0), 0) });
+ }
+diff --git a/app/layout.tsx b/app/layout.tsx
+index b3819bd..f0cee7b 100644
+--- a/app/layout.tsx
++++ b/app/layout.tsx
+@@ -16,8 +16,8 @@ export default function RootLayout({
+   children: React.ReactNode;
+ }>) {
+   return (
+-    <html lang="en" className="h-full antialiased">
+-      <body className="min-h-full flex flex-col">{children}</body>
++    <html lang="en" className="h-full antialiased" suppressHydrationWarning>
++      <body className="min-h-full flex flex-col" suppressHydrationWarning>{children}</body>
+     </html>
+   );
+ }
+diff --git a/models/Customer.ts b/models/Customer.ts
+index a69e2b3..618f315 100644
+--- a/models/Customer.ts
++++ b/models/Customer.ts
+@@ -9,9 +9,15 @@ export interface CustomerDocument {
+   email: string;
+   phone: string;
+   totalPaid: number;
++  paidTotal: number;
++  attemptedTotal: number;
+   orderCount: number;
++  paidOrderCount: number;
++  attemptedOrderCount: number;
+   firstOrderDate: string;
+   lastOrderDate: string;
++  lastPaidDate: string;
++  lastAttemptDate: string;
+   lastOrderAmount: number;
+   averageOrderValue: number;
+   subscriptionStatus: SubscriptionStatus;
+@@ -22,6 +28,8 @@ export interface CustomerDocument {
+   estimatedCreditLimit: number;
+   actualCreditLimit: number | null;
+   tier: string;
++  leadStatus: string;
++  paymentStatus: string;
+   riskLevel: RiskLevel;
+   tags: string[];
+   notes: string;
+@@ -30,6 +38,8 @@ export interface CustomerDocument {
+   aiSummaryPreview: string;
+   riskExplanation: string;
+   recommendedAction: string;
++  score: number;
++  stars: number;
+ }
+ 
+ const customerSchema = new Schema<CustomerDocument>(
+@@ -38,9 +48,15 @@ const customerSchema = new Schema<CustomerDocument>(
+     email: { type: String, required: true, unique: true },
+     phone: { type: String, required: true },
+     totalPaid: { type: Number, required: true },
++    paidTotal: { type: Number, required: true, default: 0 },
++    attemptedTotal: { type: Number, required: true, default: 0 },
+     orderCount: { type: Number, required: true },
++    paidOrderCount: { type: Number, required: true, default: 0 },
++    attemptedOrderCount: { type: Number, required: true, default: 0 },
+     firstOrderDate: { type: String, default: new Date(0).toISOString() },
+     lastOrderDate: { type: String, required: true },
++    lastPaidDate: { type: String, default: "" },
++    lastAttemptDate: { type: String, default: "" },
+     lastOrderAmount: { type: Number, required: true },
+     averageOrderValue: { type: Number, required: true },
+     subscriptionStatus: { type: String, enum: ["active", "inactive", "canceled", "past_due", "unknown"], required: true },
+@@ -51,6 +67,8 @@ const customerSchema = new Schema<CustomerDocument>(
+     estimatedCreditLimit: { type: Number, required: true },
+     actualCreditLimit: { type: Number, default: null },
+     tier: { type: String, required: true },
++    leadStatus: { type: String, required: true, default: "cold_lead" },
++    paymentStatus: { type: String, required: true, default: "unpaid" },
+     riskLevel: { type: String, enum: ["low", "medium", "high"], required: true, default: "low" },
+     tags: { type: [String], default: [] },
+     notes: { type: String, default: "" },
+@@ -59,15 +77,17 @@ const customerSchema = new Schema<CustomerDocument>(
+     aiSummaryPreview: { type: String, required: true },
+     riskExplanation: { type: String, required: true },
+     recommendedAction: { type: String, required: true },
++    score: { type: Number, required: true, default: 0 },
++    stars: { type: Number, required: true, default: 1 },
+   },
+   { timestamps: true }
+ );
+ 
+-customerSchema.virtual("score").get(function () {
+-  return calculateCustomerScore(this as unknown as CustomerDocument);
+-});
+-customerSchema.virtual("stars").get(function () {
+-  return scoreToStars(calculateCustomerScore(this as unknown as CustomerDocument));
++customerSchema.pre("validate", function () {
++  if (this.paidTotal === undefined || this.paidTotal === null) this.paidTotal = this.totalPaid ?? 0;
++  if (this.totalPaid === undefined || this.totalPaid === null) this.totalPaid = this.paidTotal ?? 0;
++  if (!this.score) this.score = calculateCustomerScore(this as unknown as CustomerDocument);
++  if (!this.stars) this.stars = scoreToStars(this.score);
+ });
+ 
+ export const Customer = mongoose.models.Customer || mongoose.model<CustomerDocument>("Customer", customerSchema);

@@ -14,7 +14,7 @@ export async function GET(request: Request) {
   if (q) query.$or = [{ name: { $regex: q, $options: "i" } }, { email: { $regex: q, $options: "i" } }, { phone: { $regex: q, $options: "i" } }];
   const [total, rows] = await Promise.all([
     Customer.countDocuments(query),
-    Customer.find(query).sort({ totalPaid: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    Customer.find(query).sort({ paidTotal: -1, attemptedTotal: -1 }).skip((page - 1) * limit).limit(limit).lean(),
   ]);
   return NextResponse.json({ page, limit, total, rows });
 }

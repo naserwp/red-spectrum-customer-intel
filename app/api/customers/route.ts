@@ -19,7 +19,7 @@ export async function GET() {
   if (!connection) return fallbackCustomers();
 
   try {
-    const customers = await Customer.find({}).sort({ totalPaid: -1 }).lean<LeanCustomer[]>();
+    const customers = await Customer.find({}).sort({ paidTotal: -1, attemptedTotal: -1 }).lean<LeanCustomer[]>();
     return NextResponse.json({ customers: enrichCustomers(customers) });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown customer query error.";
