@@ -24,7 +24,40 @@ type SalesMetric = {
   refunds: number; chargebacks: number; newPaidCustomers: number; newLeads: number; averageOrderValue: number;
 };
 
-const tabs = ["Overview", "Customers", "Subscriptions", "Upcoming Bills", "High Value", "Hot Leads", "Risk Review", "5-Year Sales", "Sync Center"] as const;
+type GatewayProvider = "all" | "authorize_net" | "nmi" | "stripe" | "crypto" | "woocommerce" | "unknown";
+type GatewayStatus = "all" | "paid" | "attempted" | "failed" | "refunded" | "verified" | "not_verified";
+type GatewayInterval = "lifetime" | "year" | "month" | "week" | "day";
+type GatewayRange = "lifetime" | "year" | "month" | "last30" | "custom";
+
+type GatewaySummaryMetric = {
+  totalPaidRevenue: number; totalAttemptedPipeline: number; totalFailedAmount: number; totalRefundedAmount: number;
+  totalOrders: number; paidOrders: number; attemptedOrders: number; failedOrders: number; verifiedRevenue: number;
+  unverifiedPaidRevenue: number; manualReviewRevenue: number; providersCount: number;
+};
+
+type GatewayProviderMetric = {
+  provider: string; paidRevenue: number; attemptedPipeline: number; failedAmount: number; refundedAmount: number;
+  totalOrders: number; paidOrders: number; attemptedOrders: number; failedOrders: number; verifiedRevenue: number;
+  unverifiedPaidRevenue: number; manualReviewRevenue: number; matchedOrders: number; unmatchedOrders: number; lastTransactionDate: string;
+};
+
+type GatewayTimelineMetric = {
+  period: string; provider: string; paidRevenue: number; attemptedPipeline: number; failedAmount: number; refundedAmount: number;
+  paidOrders: number; attemptedOrders: number; failedOrders: number; verifiedRevenue: number; unverifiedPaidRevenue: number;
+};
+
+type GatewayCustomerMetric = {
+  provider: string; customerName: string; email: string; paidRevenue: number; attemptedPipeline: number; orderCount: number; lastOrderDate: string;
+};
+
+type GatewayAnalytics = {
+  summary: GatewaySummaryMetric;
+  byProvider: GatewayProviderMetric[];
+  timeline: GatewayTimelineMetric[];
+  topCustomersByGateway: GatewayCustomerMetric[];
+};
+
+const tabs = ["Overview", "Customers", "Subscriptions", "Upcoming Bills", "High Value", "Hot Leads", "Risk Review", "Gateway Analytics", "5-Year Sales", "Sync Center"] as const;
 const pageSizes = [25, 50, 100] as const;
 const highValueThreshold = 2000;
 const money = (n: number) => `$${n.toFixed(2)}`;
@@ -37,12 +70,38 @@ const displayDate = (value?: string) => {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "-" : date.toLocaleDateString();
 };
+const dateInput = (date: Date) => date.toISOString().slice(0, 10);
 const monthSpan = (start?: string) => {
   const startDate = start ? new Date(start) : null;
   if (!startDate || Number.isNaN(startDate.getTime())) return 0;
   const now = new Date();
   return Math.max(0, (now.getFullYear() - startDate.getFullYear()) * 12 + now.getMonth() - startDate.getMonth() + 1);
 };
+
+const gatewayProviderLabel: Record<string, string> = {
+  all: "All",
+  authorize_net: "Authorize.net",
+  nmi: "NMI/Cliq",
+  stripe: "Stripe",
+  crypto: "Crypto",
+  woocommerce: "WooCommerce/Manual",
+  unknown: "Unknown",
+};
+
+const gatewayStatusLabel: Record<string, string> = {
+  all: "All",
+  paid: "Paid",
+  attempted: "Attempted",
+  failed: "Failed",
+  refunded: "Refunded",
+  verified: "Verified",
+  not_verified: "Not Verified",
+};
+
+function csvCell(value: string | number) {
+  const text = String(value ?? "");
+  return /[",\n]/.test(text) ? `"${text.replaceAll("\"", "\"\"")}"` : text;
+}
 
 function getCustomerCategory(c: Customer) {
   if (paidAmount(c) >= highValueThreshold) return "vip_paid";
@@ -198,6 +257,183 @@ function SalesHistoryTable({ rows }: { rows: SalesMetric[] }) {
   </div>;
 }
 
+function exportGatewayCsv(data: GatewayAnalytics | null) {
+  if (!data) return;
+  const rows: Array<Array<string | number>> = [
+    ["Section", "Provider", "Period", "Customer", "Email", "Paid Revenue", "Attempted Pipeline", "Verified Revenue", "Unverified Paid", "Failed Amount", "Paid Orders", "Attempted Orders", "Matched Orders", "Unmatched Orders", "Last Transaction"],
+    ...data.byProvider.map((row) => [
+      "Gateway Summary",
+      gatewayProviderLabel[row.provider] ?? row.provider,
+      "",
+      "",
+      "",
+      row.paidRevenue,
+      row.attemptedPipeline,
+      row.verifiedRevenue,
+      row.unverifiedPaidRevenue,
+      row.failedAmount,
+      row.paidOrders,
+      row.attemptedOrders,
+      row.matchedOrders,
+      row.unmatchedOrders,
+      row.lastTransactionDate,
+    ]),
+    ...data.timeline.map((row) => [
+      "Timeline",
+      gatewayProviderLabel[row.provider] ?? row.provider,
+      row.period,
+      "",
+      "",
+      row.paidRevenue,
+      row.attemptedPipeline,
+      row.verifiedRevenue,
+      row.unverifiedPaidRevenue,
+      row.failedAmount,
+      row.paidOrders,
+      row.attemptedOrders,
+      "",
+      "",
+      "",
+    ]),
+  ];
+  const csv = rows.map((row) => row.map(csvCell).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `gateway-analytics-${dateInput(new Date())}.csv`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+function GatewayAnalyticsView({
+  data,
+  range,
+  setRange,
+  from,
+  setFrom,
+  to,
+  setTo,
+  interval,
+  setInterval,
+  provider,
+  setProvider,
+  status,
+  setStatus,
+  reload,
+}: {
+  data: GatewayAnalytics | null;
+  range: GatewayRange;
+  setRange: (value: GatewayRange) => void;
+  from: string;
+  setFrom: (value: string) => void;
+  to: string;
+  setTo: (value: string) => void;
+  interval: GatewayInterval;
+  setInterval: (value: GatewayInterval) => void;
+  provider: GatewayProvider;
+  setProvider: (value: GatewayProvider) => void;
+  status: GatewayStatus;
+  setStatus: (value: GatewayStatus) => void;
+  reload: () => void;
+}) {
+  const summary = data?.summary;
+  const rangeButtons: Array<[GatewayRange, string]> = [["lifetime", "Lifetime"], ["year", "This Year"], ["month", "This Month"], ["last30", "Last 30 Days"], ["custom", "Custom"]];
+  const providerOptions: GatewayProvider[] = ["all", "authorize_net", "nmi", "stripe", "crypto", "woocommerce", "unknown"];
+  const statusOptions: GatewayStatus[] = ["all", "paid", "attempted", "failed", "refunded", "verified", "not_verified"];
+  const intervalOptions: GatewayInterval[] = ["lifetime", "year", "month", "week", "day"];
+
+  return <section className="space-y-4">
+    <div className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4">
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="flex flex-wrap gap-2">
+          {rangeButtons.map(([value, label]) => <button key={value} onClick={() => setRange(value)} className={`rounded px-3 py-2 text-sm font-semibold ${range === value ? "bg-red-600 text-white" : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"}`}>{label}</button>)}
+        </div>
+        <label className="text-xs uppercase text-zinc-400">From<input type="date" value={from} onChange={(event) => { setRange("custom"); setFrom(event.target.value); }} className="mt-1 block rounded bg-zinc-950 px-3 py-2 text-sm text-zinc-100 ring-1 ring-zinc-800" /></label>
+        <label className="text-xs uppercase text-zinc-400">To<input type="date" value={to} onChange={(event) => { setRange("custom"); setTo(event.target.value); }} className="mt-1 block rounded bg-zinc-950 px-3 py-2 text-sm text-zinc-100 ring-1 ring-zinc-800" /></label>
+        <label className="text-xs uppercase text-zinc-400">Provider<select value={provider} onChange={(event) => setProvider(event.target.value as GatewayProvider)} className="mt-1 block rounded bg-zinc-950 px-3 py-2 text-sm text-zinc-100 ring-1 ring-zinc-800">{providerOptions.map((value) => <option key={value} value={value}>{gatewayProviderLabel[value]}</option>)}</select></label>
+        <label className="text-xs uppercase text-zinc-400">Status<select value={status} onChange={(event) => setStatus(event.target.value as GatewayStatus)} className="mt-1 block rounded bg-zinc-950 px-3 py-2 text-sm text-zinc-100 ring-1 ring-zinc-800">{statusOptions.map((value) => <option key={value} value={value}>{gatewayStatusLabel[value]}</option>)}</select></label>
+        <label className="text-xs uppercase text-zinc-400">Interval<select value={interval} onChange={(event) => setInterval(event.target.value as GatewayInterval)} className="mt-1 block rounded bg-zinc-950 px-3 py-2 text-sm text-zinc-100 ring-1 ring-zinc-800">{intervalOptions.map((value) => <option key={value} value={value}>{displayStatus(value)}</option>)}</select></label>
+        <button onClick={reload} className="rounded bg-zinc-700 px-4 py-2 text-sm font-semibold hover:bg-zinc-600">Refresh</button>
+        <button onClick={() => exportGatewayCsv(data)} disabled={!data} className="rounded bg-emerald-700 px-4 py-2 text-sm font-semibold hover:bg-emerald-600 disabled:opacity-50">Export CSV</button>
+      </div>
+    </div>
+
+    <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <Card label={range === "lifetime" ? "Lifetime Paid Revenue" : "Paid Revenue"} value={money(Number(summary?.totalPaidRevenue ?? 0))} helper="completed/processing/paid only" />
+      <Card label="Attempted Pipeline" value={money(Number(summary?.totalAttemptedPipeline ?? 0))} helper="unpaid/failed/on-hold checkout attempts" />
+      <Card label="Verified Revenue" value={money(Number(summary?.verifiedRevenue ?? 0))} helper="matched gateway transactions" />
+      <Card label="Unverified Paid Revenue" value={money(Number(summary?.unverifiedPaidRevenue ?? 0))} helper="WooCommerce paid, not gateway verified yet" />
+      <Card label="Failed Payments" value={money(Number(summary?.totalFailedAmount ?? 0))} helper={`${Number(summary?.failedOrders ?? 0)} failed orders`} />
+      <Card label="Manual Review Amount" value={money(Number(summary?.manualReviewRevenue ?? 0))} helper="low/not_found confidence or unknown provider" />
+      <Card label="Total Orders" value={Number(summary?.totalOrders ?? 0)} helper={`${Number(summary?.providersCount ?? 0)} active providers`} />
+      <Card label="Paid Orders" value={Number(summary?.paidOrders ?? 0)} helper={`${Number(summary?.attemptedOrders ?? 0)} attempted orders`} />
+    </section>
+
+    <section className="space-y-2">
+      <h2 className="text-xl font-semibold text-zinc-100">Gateway Summary</h2>
+      <div className="overflow-x-auto rounded-xl border border-zinc-800">
+        <table className="min-w-[1400px] text-sm">
+          <thead className="sticky top-0 bg-zinc-950"><tr>{["Gateway", "Paid Revenue", "Attempted Pipeline", "Verified Revenue", "Unverified Paid", "Failed Amount", "Paid Orders", "Attempted Orders", "Matched Orders", "Unmatched Orders", "Last Transaction"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
+          <tbody>{(data?.byProvider ?? []).map((row) => <tr key={row.provider} className="border-t border-zinc-800">
+            <td className="px-3 py-3 font-semibold">{gatewayProviderLabel[row.provider] ?? row.provider}</td>
+            <td className="px-3 py-3">{money(row.paidRevenue)}</td>
+            <td className="px-3 py-3">{money(row.attemptedPipeline)}</td>
+            <td className="px-3 py-3">{money(row.verifiedRevenue)}</td>
+            <td className="px-3 py-3">{money(row.unverifiedPaidRevenue)}</td>
+            <td className="px-3 py-3">{money(row.failedAmount)}</td>
+            <td className="px-3 py-3">{row.paidOrders}</td>
+            <td className="px-3 py-3">{row.attemptedOrders}</td>
+            <td className="px-3 py-3">{row.matchedOrders}</td>
+            <td className="px-3 py-3">{row.unmatchedOrders}</td>
+            <td className="px-3 py-3">{displayDate(row.lastTransactionDate)}</td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+    </section>
+
+    <section className="space-y-2">
+      <h2 className="text-xl font-semibold text-zinc-100">Monthly / Weekly Timeline</h2>
+      <div className="overflow-x-auto rounded-xl border border-zinc-800">
+        <table className="min-w-[1200px] text-sm">
+          <thead className="sticky top-0 bg-zinc-950"><tr>{["Period", "Gateway", "Paid Revenue", "Attempted Pipeline", "Failed Amount", "Verified Revenue", "Paid Orders", "Attempted Orders"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
+          <tbody>{(data?.timeline ?? []).map((row) => <tr key={`${row.period}-${row.provider}`} className="border-t border-zinc-800">
+            <td className="px-3 py-3 font-semibold">{row.period}</td>
+            <td className="px-3 py-3">{gatewayProviderLabel[row.provider] ?? row.provider}</td>
+            <td className="px-3 py-3">{money(row.paidRevenue)}</td>
+            <td className="px-3 py-3">{money(row.attemptedPipeline)}</td>
+            <td className="px-3 py-3">{money(row.failedAmount)}</td>
+            <td className="px-3 py-3">{money(row.verifiedRevenue)}</td>
+            <td className="px-3 py-3">{row.paidOrders}</td>
+            <td className="px-3 py-3">{row.attemptedOrders}</td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+    </section>
+
+    <section className="space-y-2">
+      <h2 className="text-xl font-semibold text-zinc-100">Top Customers by Gateway</h2>
+      <div className="overflow-x-auto rounded-xl border border-zinc-800">
+        <table className="min-w-[1100px] text-sm">
+          <thead className="sticky top-0 bg-zinc-950"><tr>{["Gateway", "Customer", "Email", "Paid Revenue", "Attempted Pipeline", "Orders", "Last Order Date", "View Customer"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
+          <tbody>{(data?.topCustomersByGateway ?? []).map((row) => <tr key={`${row.provider}-${row.email}`} className="border-t border-zinc-800">
+            <td className="px-3 py-3">{gatewayProviderLabel[row.provider] ?? row.provider}</td>
+            <td className="px-3 py-3 font-semibold">{row.customerName}</td>
+            <td className="px-3 py-3 text-zinc-400">{row.email}</td>
+            <td className="px-3 py-3">{money(row.paidRevenue)}</td>
+            <td className="px-3 py-3">{money(row.attemptedPipeline)}</td>
+            <td className="px-3 py-3">{row.orderCount}</td>
+            <td className="px-3 py-3">{displayDate(row.lastOrderDate)}</td>
+            <td className="px-3 py-3"><Link className="rounded bg-zinc-700 px-2 py-1" href={`/admin/customers/${encodeURIComponent(row.email)}`}>View</Link></td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+    </section>
+  </section>;
+}
+
 export default function AdminPage() {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [summary, setSummary] = useState<Record<string, unknown>>({});
@@ -206,6 +442,13 @@ export default function AdminPage() {
   const [upcomingBills, setUpcomingBills] = useState<Subscription[]>([]);
   const [riskRows, setRiskRows] = useState<Customer[]>([]);
   const [salesHistory, setSalesHistory] = useState<SalesMetric[]>([]);
+  const [gatewayAnalytics, setGatewayAnalytics] = useState<GatewayAnalytics | null>(null);
+  const [gatewayRange, setGatewayRange] = useState<GatewayRange>("lifetime");
+  const [gatewayFrom, setGatewayFrom] = useState("2019-01-01");
+  const [gatewayTo, setGatewayTo] = useState(dateInput(new Date()));
+  const [gatewayInterval, setGatewayInterval] = useState<GatewayInterval>("month");
+  const [gatewayProvider, setGatewayProvider] = useState<GatewayProvider>("all");
+  const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>("all");
   const [upcomingMeta, setUpcomingMeta] = useState<Record<string, unknown>>({});
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -242,11 +485,56 @@ export default function AdminPage() {
     setSalesHistory(salesData.yearly || []);
   }, []);
 
+  const applyGatewayRange = useCallback((range: GatewayRange) => {
+    const now = new Date();
+    setGatewayRange(range);
+    if (range === "lifetime") {
+      setGatewayFrom("2019-01-01");
+      setGatewayTo(dateInput(now));
+      setGatewayInterval("month");
+      return;
+    }
+    if (range === "year") {
+      setGatewayFrom(`${now.getFullYear()}-01-01`);
+      setGatewayTo(dateInput(now));
+      setGatewayInterval("month");
+      return;
+    }
+    if (range === "month") {
+      setGatewayFrom(dateInput(new Date(now.getFullYear(), now.getMonth(), 1)));
+      setGatewayTo(dateInput(now));
+      setGatewayInterval("day");
+      return;
+    }
+    if (range === "last30") {
+      setGatewayFrom(dateInput(new Date(now.getTime() - 30 * 86400000)));
+      setGatewayTo(dateInput(now));
+      setGatewayInterval("day");
+    }
+  }, []);
+
+  const loadGatewayData = useCallback(async () => {
+    const params = new URLSearchParams({
+      from: gatewayFrom || "2019-01-01",
+      to: gatewayTo || dateInput(new Date()),
+      interval: gatewayInterval,
+      provider: gatewayProvider,
+      status: gatewayStatus,
+    });
+    const data = await fetch(`/api/analytics/gateways?${params.toString()}`, { cache: "no-store" }).then((r) => r.json());
+    setGatewayAnalytics(data);
+  }, [gatewayFrom, gatewayTo, gatewayInterval, gatewayProvider, gatewayStatus]);
+
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     loadCustomers(1).catch(() => setError("Unable to load customers."));
     loadDashboardData().catch(() => setError("Unable to load dashboard data."));
   }, [loadCustomers, loadDashboardData]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadGatewayData().catch(() => setError("Unable to load gateway analytics."));
+  }, [loadGatewayData]);
 
   const syncWooCommerce = async () => {
     setError("");
@@ -345,6 +633,8 @@ export default function AdminPage() {
       {tab === "Hot Leads" && <><Card label="Hot Checkout Leads" value={hotLeadRows.length} helper="paidTotal = 0 and attemptedTotal > 0" /><CustomerTable rows={hotLeadPage.rows} exportCustomerPdf={exportCustomerPdf} /><Pager {...hotLeadPage} /></>}
 
       {tab === "Risk Review" && <><section className="grid gap-3 sm:grid-cols-4"><Card label="Risk Customers" value={riskDisplayRows.length} /><Card label="Failed Payments Total" value={Number(summary.failedPaymentsTotal ?? 0)} /><Card label="Failed Payments Last 30D" value={Number(summary.failedPaymentsLast30Days ?? 0)} /><Card label="Failed Checkout Attempts This Month" value={Number(summary.failedCheckoutAttemptsThisMonth ?? 0)} /></section><CustomerTable rows={riskPage.rows} exportCustomerPdf={exportCustomerPdf} /><Pager {...riskPage} /></>}
+
+      {tab === "Gateway Analytics" && <GatewayAnalyticsView data={gatewayAnalytics} range={gatewayRange} setRange={applyGatewayRange} from={gatewayFrom} setFrom={setGatewayFrom} to={gatewayTo} setTo={setGatewayTo} interval={gatewayInterval} setInterval={setGatewayInterval} provider={gatewayProvider} setProvider={setGatewayProvider} status={gatewayStatus} setStatus={setGatewayStatus} reload={loadGatewayData} />}
 
       {tab === "5-Year Sales" && <><section className="grid gap-3 sm:grid-cols-3"><Card label="Paid Revenue This Month" value={money(Number(summary.paidRevenueThisMonth ?? 0))} /><Card label="Attempted Pipeline This Month" value={money(Number(summary.attemptedPipelineThisMonth ?? 0))} /><Card label="Checkout Attempts This Month" value={Number(summary.checkoutAttemptsThisMonth ?? 0)} /></section><SalesHistoryTable rows={salesPage.rows} /><Pager {...salesPage} /></>}
 
