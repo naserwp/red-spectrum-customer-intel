@@ -33,6 +33,7 @@ export interface GatewayVerification {
   transactionStatus: string;
   amount: number;
   transactionDate: string;
+  customerVaultId: string;
   paymentProfileId: string;
   customerProfileId: string;
   last4: string;
@@ -186,6 +187,7 @@ const gatewayVerificationSchema = new Schema<GatewayVerification>(
     transactionStatus: { type: String, default: "" },
     amount: { type: Number, default: 0 },
     transactionDate: { type: String, default: "" },
+    customerVaultId: { type: String, default: "" },
     paymentProfileId: { type: String, default: "" },
     customerProfileId: { type: String, default: "" },
     last4: { type: String, default: "" },

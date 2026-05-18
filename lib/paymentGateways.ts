@@ -16,6 +16,7 @@ type NmiTransaction = {
   lastName: string;
   company: string;
   address1: string;
+  customerVaultId: string;
   paymentProfileId: string;
   last4: string;
   cardType: string;
@@ -54,6 +55,17 @@ type AuthorizeNetCandidateResult = {
   error?: string;
 };
 
+type MatchableTransaction = {
+  amount: number;
+  transactionDate: string;
+  email: string;
+  phone: string;
+  firstName: string;
+  lastName: string;
+  company: string;
+  address1: string;
+};
+
 const NMI_REQUEST_TIMEOUT_MS = 12000;
 const NMI_MATCH_WINDOW_DAYS = 3;
 const AUTHORIZE_REQUEST_TIMEOUT_MS = 12000;
@@ -84,8 +96,21 @@ function authorizeNetConfigured() {
 }
 
 function inferProvider(order: Pick<CustomerOrderHistoryItem, "paymentMethod" | "paymentMethodTitle">) {
-  const value = `${order.paymentMethod} ${order.paymentMethodTitle}`.toLowerCase();
+  const method = (order.paymentMethod ?? "").toLowerCase();
+  const title = (order.paymentMethodTitle ?? "").toLowerCase();
+  const value = `${method} ${title}`;
+  const nmiLike =
+    method.includes("nmi") ||
+    method.includes("cliq") ||
+    method.includes("gateway") ||
+    title.includes("quick pay") ||
+    title.includes("gateway") ||
+    value.includes("nmi") ||
+    value.includes("cliq") ||
+    value.includes("quick pay") ||
+    value.includes("gateway");
   if (value.includes("stripe")) return "stripe";
+  if (nmiLike) return "nmi";
   if (
     value.includes("authorize_net") ||
     value.includes("authorize.net") ||
@@ -121,6 +146,7 @@ function baseVerification(
     transactionStatus: "not_verified",
     amount: order.total,
     transactionDate: order.paidDate || order.attemptedDate || order.dateCreated,
+    customerVaultId: "",
     paymentProfileId: "",
     customerProfileId: "",
     last4: "",
@@ -180,6 +206,8 @@ function parseNmiTransactions(responseText: string) {
 
   return blocks.map((block) => {
     const ccNumber = xmlField(block, ["cc_number", "card_number", "ccnumber"]);
+    const customerVaultId = xmlField(block, ["customer_vault_id", "customer_vault_record_id", "customer_vault_customer_id"]);
+    const paymentProfileId = xmlField(block, ["payment_profile_id", "customer_payment_profile_id", "customer_id"]);
     return {
       transactionId: xmlField(block, ["transaction_id", "transactionid", "transaction-id"]),
       status: xmlField(block, ["condition", "transaction_status", "response_text", "responsetext", "response"]),
@@ -191,7 +219,8 @@ function parseNmiTransactions(responseText: string) {
       lastName: xmlField(block, ["last_name", "lastname", "billing_last_name"]),
       company: xmlField(block, ["company", "billing_company"]),
       address1: xmlField(block, ["address_1", "address1", "billing_address1", "address"]),
-      paymentProfileId: xmlField(block, ["customer_vault_id", "payment_profile_id", "customer_vault_record_id", "customer_id"]),
+      customerVaultId,
+      paymentProfileId: paymentProfileId || customerVaultId,
       last4: safeLast4(xmlField(block, ["last4", "cc_last4", "card_last4"]) || ccNumber),
       cardType: xmlField(block, ["cc_type", "card_type", "payment_type"]),
     } satisfies NmiTransaction;
@@ -498,7 +527,7 @@ function transactionInWindow(transactionDate: string, start: Date, end: Date) {
   return parsed.getTime() >= start.getTime() && parsed.getTime() <= end.getTime();
 }
 
-function candidateScore(transaction: NmiTransaction, order: CustomerOrderHistoryItem, start: Date, end: Date) {
+function candidateScore(transaction: MatchableTransaction, order: CustomerOrderHistoryItem, start: Date, end: Date) {
   if (!amountMatches(transaction.amount, order.total) || !transactionInWindow(transaction.transactionDate, start, end)) return null;
 
   const orderEmail = normalized(order.billingEmail);
@@ -547,6 +576,7 @@ function verificationFromNmiTransaction(
     transactionStatus: transaction.status || "found",
     amount: transaction.amount,
     transactionDate: transaction.transactionDate,
+    customerVaultId: transaction.customerVaultId,
     paymentProfileId: transaction.paymentProfileId,
     last4: transaction.last4,
     cardType: transaction.cardType,
@@ -573,7 +603,7 @@ async function verifyNmiOrder(order: CustomerOrderHistoryItem): Promise<GatewayV
     if (match) {
       return verificationFromNmiTransaction(order, match, {
         confidence: "exact",
-        matchedBy: "transaction_id",
+        matchedBy: "transactionId",
         candidatesCount: result.transactions.length,
         rawSummary: `NMI Query API checked transaction_id and found ${result.transactions.length} candidate(s).`,
       });
@@ -592,10 +622,16 @@ async function verifyNmiOrder(order: CustomerOrderHistoryItem): Promise<GatewayV
 
   const window = orderDateWindow(order);
   const result = await queryNmi({ start_date: window.startQuery, end_date: window.endQuery });
+  const orderTime = new Date(order.paidDate || order.attemptedDate || order.dateCreated).getTime();
+  const dateDistance = (transaction: NmiTransaction) => {
+    const transactionTime = new Date(transaction.transactionDate).getTime();
+    if (!Number.isFinite(orderTime) || !Number.isFinite(transactionTime)) return Number.MAX_SAFE_INTEGER;
+    return Math.abs(transactionTime - orderTime);
+  };
   const scored = result.transactions
     .map((transaction) => ({ transaction, score: candidateScore(transaction, order, window.start, window.end) }))
     .filter((candidate): candidate is { transaction: NmiTransaction; score: NonNullable<ReturnType<typeof candidateScore>> } => Boolean(candidate.score))
-    .sort((a, b) => b.score.rank - a.score.rank);
+    .sort((a, b) => b.score.rank - a.score.rank || dateDistance(a.transaction) - dateDistance(b.transaction));
   const best = scored[0];
 
   if (best) {

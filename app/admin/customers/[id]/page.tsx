@@ -23,6 +23,7 @@ type GatewayVerification = {
   transactionStatus: string;
   amount: number;
   transactionDate: string;
+  customerVaultId?: string;
   paymentProfileId: string;
   customerProfileId?: string;
   last4?: string;
@@ -507,10 +508,11 @@ export default function CustomerDetailPage() {
           <div><p className="text-xs uppercase text-zinc-400">WooCommerce Status</p><p className="font-semibold">{displayStatus(latestRelevantOrder?.status || customer.lastAttemptStatus)}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">WooCommerce Method</p><p className="font-semibold">{latestRelevantOrder?.paymentMethodTitle || latestRelevantOrder?.paymentMethod || customer.lastAttemptPaymentMethod || "-"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Gateway Provider</p><p className="font-semibold">{verification?.provider || "-"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Gateway Status</p><p className="font-semibold">{verification?.matched ? "Payment verified" : verification?.transactionStatus || "Not verified"}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Gateway Status</p><p className="font-semibold">{verification?.transactionStatus || (verification?.matched ? "verified" : "Not verified")}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Confidence</p><p className="font-semibold">{verification?.confidence || "not_found"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Matched By</p><p className="font-semibold">{verification?.matchedBy || "-"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Transaction ID</p><p className="font-semibold">{verification?.transactionId || "-"}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Customer Vault ID</p><p className="font-semibold">{verification?.customerVaultId || "-"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Last 4</p><p className="font-semibold">{verification?.last4 || "-"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Card Type</p><p className="font-semibold">{verification?.cardType || "-"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Last Checked</p><p className="font-semibold">{displayDateTime(verification?.lastCheckedAt)}</p></div>

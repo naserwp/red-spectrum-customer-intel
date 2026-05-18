@@ -18,6 +18,7 @@ type DebugGatewayVerification = {
   transactionStatus?: string;
   amount?: number;
   transactionDate?: string;
+  customerVaultId?: string;
   paymentProfileId?: string;
   customerProfileId?: string;
   last4?: string;
@@ -68,6 +69,9 @@ type DebugCustomer = {
   authorizeMatchedOrders?: number;
   authorizeUnmatchedOrders?: number;
   authorizeLastCheckedAt?: string;
+  nmiMatchedOrders?: number;
+  nmiUnmatchedOrders?: number;
+  nmiLastCheckedAt?: string;
 };
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number) {
@@ -91,6 +95,7 @@ function gatewaySummary(verification?: DebugGatewayVerification) {
     transactionStatus: verification.transactionStatus ?? "",
     amount: Number(verification.amount ?? 0),
     transactionDate: verification.transactionDate ?? "",
+    customerVaultId: verification.customerVaultId ?? "",
     paymentProfileId: verification.paymentProfileId ?? "",
     customerProfileId: verification.customerProfileId ?? "",
     last4: verification.last4 ?? "",
@@ -184,6 +189,71 @@ const debugProjection = {
               input: "$orders",
               as: "order",
               cond: { $eq: ["$$order.gatewayVerification.provider", "authorize_net"] },
+            },
+          },
+          initialValue: "",
+          in: {
+            $cond: [
+              { $gt: [{ $ifNull: ["$$this.gatewayVerification.lastCheckedAt", ""] }, "$$value"] },
+              { $ifNull: ["$$this.gatewayVerification.lastCheckedAt", ""] },
+              "$$value",
+            ],
+          },
+        },
+      },
+      "",
+    ],
+  },
+  nmiMatchedOrders: {
+    $cond: [
+      { $isArray: "$orders" },
+      {
+        $size: {
+          $filter: {
+            input: "$orders",
+            as: "order",
+            cond: {
+              $and: [
+                { $in: ["$$order.gatewayVerification.provider", ["nmi", "cliq"]] },
+                { $eq: ["$$order.gatewayVerification.matched", true] },
+              ],
+            },
+          },
+        },
+      },
+      0,
+    ],
+  },
+  nmiUnmatchedOrders: {
+    $cond: [
+      { $isArray: "$orders" },
+      {
+        $size: {
+          $filter: {
+            input: "$orders",
+            as: "order",
+            cond: {
+              $and: [
+                { $in: ["$$order.gatewayVerification.provider", ["nmi", "cliq"]] },
+                { $ne: ["$$order.gatewayVerification.matched", true] },
+              ],
+            },
+          },
+        },
+      },
+      0,
+    ],
+  },
+  nmiLastCheckedAt: {
+    $cond: [
+      { $isArray: "$orders" },
+      {
+        $reduce: {
+          input: {
+            $filter: {
+              input: "$orders",
+              as: "order",
+              cond: { $in: ["$$order.gatewayVerification.provider", ["nmi", "cliq"]] },
             },
           },
           initialValue: "",
@@ -317,6 +387,10 @@ export async function GET(request: Request) {
     authorizeLastCheckedAt: customer.authorizeLastCheckedAt ?? "",
     authorizeMatchedOrders: customer.authorizeMatchedOrders ?? 0,
     authorizeUnmatchedOrders: customer.authorizeUnmatchedOrders ?? 0,
+    nmiConfigured: Boolean(process.env.NMI_SECURITY_KEY),
+    nmiLastCheckedAt: customer.nmiLastCheckedAt ?? "",
+    nmiMatchedOrders: customer.nmiMatchedOrders ?? 0,
+    nmiUnmatchedOrders: customer.nmiUnmatchedOrders ?? 0,
     productJourneyCount,
     productJourney,
     gatewayVerification: gatewaySummary(customer.gatewayVerification),

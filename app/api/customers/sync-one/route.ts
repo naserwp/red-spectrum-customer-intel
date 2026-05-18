@@ -43,13 +43,19 @@ function getOrderTotal(order: WooCommerceOrder, lineItems = getLineItems(order))
   return lineItems.reduce((sum, item) => sum + item.total, 0);
 }
 
-function isAuthorizeNetOrder(order: Pick<CustomerOrderHistoryItem, "paymentMethod" | "paymentMethodTitle">) {
-  const value = `${order.paymentMethod} ${order.paymentMethodTitle}`.toLowerCase();
-  return value.includes("authorize_net") ||
-    value.includes("authorize.net") ||
-    value.includes("authorize") ||
-    value.includes("cim") ||
-    value.includes("credit card payment");
+function isNmiCliqOrder(order: Pick<CustomerOrderHistoryItem, "paymentMethod" | "paymentMethodTitle">) {
+  const method = (order.paymentMethod ?? "").toLowerCase();
+  const title = (order.paymentMethodTitle ?? "").toLowerCase();
+  const value = `${method} ${title}`;
+  return method.includes("nmi") ||
+    method.includes("cliq") ||
+    method.includes("gateway") ||
+    title.includes("quick pay") ||
+    title.includes("gateway") ||
+    value.includes("nmi") ||
+    value.includes("cliq") ||
+    value.includes("quick pay") ||
+    value.includes("gateway");
 }
 
 async function buildOrderHistoryItem(order: WooCommerceOrder, verifyGateways: boolean): Promise<CustomerOrderHistoryItem> {
@@ -101,6 +107,7 @@ async function buildOrderHistoryItem(order: WooCommerceOrder, verifyGateways: bo
       transactionStatus: "",
       amount: getOrderTotal(order, lineItems),
       transactionDate: paid ? order.date_paid ?? orderDate : orderDate,
+      customerVaultId: "",
       paymentProfileId: "",
       customerProfileId: "",
       last4: "",
@@ -112,7 +119,7 @@ async function buildOrderHistoryItem(order: WooCommerceOrder, verifyGateways: bo
       notes: "",
     },
   };
-  item.gatewayVerification = await verifyOrderPayment(item, { verifyGateways: verifyGateways && isAuthorizeNetOrder(item) });
+  item.gatewayVerification = await verifyOrderPayment(item, { verifyGateways: verifyGateways && isNmiCliqOrder(item) });
   return item;
 }
 
@@ -321,6 +328,7 @@ async function buildCustomerFromOrders(email: string, orders: WooCommerceOrder[]
       transactionStatus: "",
       amount: 0,
       transactionDate: "",
+      customerVaultId: "",
       paymentProfileId: "",
       customerProfileId: "",
       last4: "",
@@ -405,18 +413,18 @@ export async function POST(request: Request) {
     warning: [warning, result.warning].filter(Boolean).join(" "),
     ordersWithZeroTotal,
     ordersRecoveredFromLineItems,
-    gatewayVerificationChecked: verifyGateways ? authorizeOrders.length : 0,
+    gatewayVerificationChecked: verifyGateways ? nmiOrders.length : 0,
     gatewayVerificationConfigured: hasConfiguredGateway(),
     gatewayConfiguration: getGatewayConfigurationSummary(),
     verifyGateways,
-    authorizeVerificationRequested: verifyGateways,
+    authorizeVerificationRequested: false,
     authorizeVerificationConfigured: getGatewayConfigurationSummary().authorizeNet,
-    authorizeOrdersChecked: verifyGateways ? authorizeOrders.length : 0,
+    authorizeOrdersChecked: 0,
     authorizeMatchedOrders,
     authorizeUnmatchedOrders,
-    nmiVerificationRequested: false,
+    nmiVerificationRequested: verifyGateways,
     nmiVerificationConfigured: getGatewayConfigurationSummary().nmi,
-    nmiOrdersChecked: 0,
+    nmiOrdersChecked: verifyGateways ? nmiOrders.length : 0,
     nmiMatchedOrders,
     nmiUnmatchedOrders,
   });
