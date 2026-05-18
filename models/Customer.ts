@@ -105,6 +105,7 @@ export interface CustomerProductJourneyItem {
 export interface CustomerDocument {
   name: string;
   email: string;
+  normalizedEmail: string;
   phone: string;
   totalPaid: number;
   paidTotal: number;
@@ -163,16 +164,27 @@ export interface CustomerDocument {
   nextAction: string;
   gatewayVerification: GatewayVerification;
   sourceCoverage: CustomerSourceCoverage;
+  externalCustomerKey: string;
 }
 
 export interface CustomerSourceCoverage {
   deepWooSearch: boolean;
+  ordersStored: number;
   ordersStoredCount: number;
   matchReasonCounts: Record<string, number>;
   statusCounts: Record<string, number>;
   paymentMethodCounts: Record<string, number>;
+  syncStatus: "success" | "success_with_warnings" | "success_no_orders" | "failed" | "partial_timeout" | "";
+  lastDeepSyncAt: string;
+  lastAttemptedDeepSyncAt: string;
+  lastDeepSyncStatus: "success" | "success_with_warnings" | "success_no_orders" | "failed" | "partial_timeout" | "";
   lastSyncedAt: string;
+  warningSummary: string;
   warnings: string[];
+  aggregationKey: string;
+  aggregationKeyType: "email" | "phone" | "customerId" | "company" | "";
+  lastBackfillImportAt: string;
+  lastCustomerRebuildAt: string;
 }
 
 const customerOrderLineItemSchema = new Schema<CustomerOrderLineItem>(
@@ -279,12 +291,22 @@ const customerOrderHistorySchema = new Schema<CustomerOrderHistoryItem>(
 const customerSourceCoverageSchema = new Schema<CustomerSourceCoverage>(
   {
     deepWooSearch: { type: Boolean, default: false },
+    ordersStored: { type: Number, default: 0 },
     ordersStoredCount: { type: Number, default: 0 },
     matchReasonCounts: { type: Schema.Types.Mixed, default: () => ({}) },
     statusCounts: { type: Schema.Types.Mixed, default: () => ({}) },
     paymentMethodCounts: { type: Schema.Types.Mixed, default: () => ({}) },
+    syncStatus: { type: String, enum: ["success", "success_with_warnings", "success_no_orders", "failed", "partial_timeout", ""], default: "" },
+    lastDeepSyncAt: { type: String, default: "" },
+    lastAttemptedDeepSyncAt: { type: String, default: "" },
+    lastDeepSyncStatus: { type: String, enum: ["success", "success_with_warnings", "success_no_orders", "failed", "partial_timeout", ""], default: "" },
     lastSyncedAt: { type: String, default: "" },
+    warningSummary: { type: String, default: "" },
     warnings: { type: [String], default: [] },
+    aggregationKey: { type: String, default: "" },
+    aggregationKeyType: { type: String, enum: ["email", "phone", "customerId", "company", ""], default: "" },
+    lastBackfillImportAt: { type: String, default: "" },
+    lastCustomerRebuildAt: { type: String, default: "" },
   },
   { _id: false }
 );
@@ -308,6 +330,7 @@ const customerSchema = new Schema<CustomerDocument>(
   {
     name: { type: String, required: true },
     email: { type: String, required: true, unique: true },
+    normalizedEmail: { type: String, default: "" },
     phone: { type: String, required: true },
     totalPaid: { type: Number, required: true },
     paidTotal: { type: Number, required: true, default: 0 },
@@ -366,15 +389,19 @@ const customerSchema = new Schema<CustomerDocument>(
     nextAction: { type: String, default: "Manual review" },
     gatewayVerification: { type: gatewayVerificationSchema, default: () => ({}) },
     sourceCoverage: { type: customerSourceCoverageSchema, default: () => ({}) },
+    externalCustomerKey: { type: String, default: "", index: true },
   },
   { timestamps: true }
 );
 
 customerSchema.pre("validate", function () {
+  this.normalizedEmail = this.email?.trim().toLowerCase() ?? "";
   if (this.paidTotal === undefined || this.paidTotal === null) this.paidTotal = this.totalPaid ?? 0;
   if (this.totalPaid === undefined || this.totalPaid === null) this.totalPaid = this.paidTotal ?? 0;
   if (!this.score) this.score = calculateCustomerScore(this as unknown as CustomerDocument);
   if (!this.stars) this.stars = scoreToStars(this.score);
 });
+
+customerSchema.index({ normalizedEmail: 1 });
 
 export const Customer = mongoose.models.Customer || mongoose.model<CustomerDocument>("Customer", customerSchema);

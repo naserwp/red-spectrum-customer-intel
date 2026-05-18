@@ -87,12 +87,26 @@ type OrderHistoryItem = {
 
 type SourceCoverage = {
   deepWooSearch?: boolean;
+  ordersStored?: number;
   ordersStoredCount?: number;
   matchReasonCounts?: Record<string, number>;
   statusCounts?: Record<string, number>;
   paymentMethodCounts?: Record<string, number>;
+  aggregationKey?: string;
+  aggregationKeyType?: string;
+  lastBackfillImportAt?: string;
+  lastCustomerRebuildAt?: string;
+  warningSummary?: string;
   lastSyncedAt?: string;
   warnings?: string[];
+};
+
+type SourceCompare = {
+  customerOrdersCount: number;
+  wooCommerceOrderRecordsCount: number;
+  mismatch: boolean;
+  missingOrderNumbers: string[];
+  recommendation: string;
 };
 
 type CustomerDetail = {
@@ -275,6 +289,7 @@ export default function CustomerDetailPage() {
   const [tags, setTags] = useState("");
   const [message, setMessage] = useState("");
   const [subscriptions, setSubscriptions] = useState<Array<Record<string, string | number>>>([]);
+  const [sourceCompare, setSourceCompare] = useState<SourceCompare | null>(null);
 
   useEffect(() => {
     fetch(`/api/customers/${params.id}`).then((r) => r.json()).then((d) => {
@@ -283,6 +298,11 @@ export default function CustomerDetailPage() {
       setNotes(nextCustomer?.notes ?? "");
       setTags((nextCustomer?.tags ?? []).join(", "));
       const email = String(nextCustomer?.email ?? "").toLowerCase();
+      if (email && !email.endsWith("@woocommerce.local")) {
+        fetch(`/api/customers/compare-source?email=${encodeURIComponent(email)}`).then((r3) => r3.json()).then((compare) => {
+          if (!compare.error) setSourceCompare(compare);
+        }).catch(() => setSourceCompare(null));
+      }
       fetch("/api/subscriptions?kind=all-real-data&limit=100").then((r2) => r2.json()).then((subs) => {
         setSubscriptions((subs.rows ?? []).filter((row: Record<string, string | number>) => String(row.customerEmail ?? "").toLowerCase() === email));
       });
@@ -441,12 +461,14 @@ export default function CustomerDetailPage() {
         <h2 className="text-xl font-semibold text-emerald-300">Data Source Coverage</h2>
         <div className="mt-3 grid gap-3 md:grid-cols-4">
           <div><p className="text-xs uppercase text-zinc-400">Orders Stored</p><p className="font-semibold">{customer.sourceCoverage?.ordersStoredCount ?? orders.length}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Match Methods Used</p><p className="font-semibold">{Object.keys(customer.sourceCoverage?.matchReasonCounts ?? {}).join(", ") || "-"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Deep Woo Sync</p><p className="font-semibold">{customer.sourceCoverage?.deepWooSearch ? "Yes" : "No"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Last Synced</p><p className="font-semibold">{displayDateTime(customer.sourceCoverage?.lastSyncedAt || customer.lastSyncedAt)}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Aggregation Key</p><p className="font-semibold">{customer.sourceCoverage?.aggregationKeyType || Object.keys(customer.sourceCoverage?.matchReasonCounts ?? {})[0] || "-"}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Last Backfill Import</p><p className="font-semibold">{displayDateTime(customer.sourceCoverage?.lastBackfillImportAt)}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Last Customer Rebuild</p><p className="font-semibold">{displayDateTime(customer.sourceCoverage?.lastCustomerRebuildAt || customer.sourceCoverage?.lastSyncedAt || customer.lastSyncedAt)}</p></div>
         </div>
-        {customer.sourceCoverage?.warnings?.length ? <p className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100">{customer.sourceCoverage.warnings.join(" ")}</p> : null}
-        {!customer.sourceCoverage?.deepWooSearch && <p className="mt-3 text-sm text-zinc-400">Suggested action: run deep WooCommerce sync if WooCommerce admin shows more orders than this timeline.</p>}
+        {sourceCompare && <p className={`mt-3 rounded border p-3 text-sm ${sourceCompare.mismatch ? "border-amber-500/30 bg-amber-500/10 text-amber-100" : "border-emerald-500/30 bg-emerald-500/10 text-emerald-100"}`}>
+          Stored customer orders: {sourceCompare.customerOrdersCount}. WooCommerceOrder records: {sourceCompare.wooCommerceOrderRecordsCount}. {sourceCompare.mismatch ? `${sourceCompare.missingOrderNumbers.length} missing orders. ${sourceCompare.recommendation}.` : "Order counts match stored WooCommerce records."}
+        </p>}
+        {(customer.sourceCoverage?.warningSummary || customer.sourceCoverage?.warnings?.length) ? <p className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100">{customer.sourceCoverage.warningSummary || customer.sourceCoverage.warnings?.join(" ")}</p> : null}
       </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">

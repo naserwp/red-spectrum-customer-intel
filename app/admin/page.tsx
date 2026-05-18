@@ -3,6 +3,7 @@
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 type Customer = {
@@ -55,6 +56,20 @@ type GatewayAnalytics = {
   byProvider: GatewayProviderMetric[];
   timeline: GatewayTimelineMetric[];
   topCustomersByGateway: GatewayCustomerMetric[];
+};
+
+type SyncRunResult = {
+  jobId?: string;
+  dryRun?: boolean;
+  pagesFetched?: number;
+  ordersFetched?: number;
+  ordersUpserted?: number;
+  customersRebuilt?: number;
+  dryRunCustomersMatched?: number;
+  customersSkippedSmallerHistory?: number;
+  warnings?: string[];
+  failedRequests?: Array<{ status: string; page: number; message: string }>;
+  message?: string;
 };
 
 const tabs = ["Overview", "Customers", "Subscriptions", "Upcoming Bills", "High Value", "Hot Leads", "Risk Review", "Gateway Analytics", "5-Year Sales", "Sync Center"] as const;
@@ -146,7 +161,7 @@ function usePagedRows<T>(rows: T[], size: number) {
 }
 
 function Card({ label, value, helper }: { label: string; value: string | number; helper?: string }) {
-  return <div className="rounded-xl border border-zinc-800 bg-zinc-900/80 p-4 shadow-lg shadow-black/20">
+  return <div className="rounded-xl border border-zinc-800 bg-zinc-900/85 p-4 shadow-lg shadow-black/20 ring-1 ring-red-950/10">
     <p className="text-[11px] font-semibold uppercase tracking-wide text-zinc-400">{label}</p>
     <p className="mt-2 text-2xl font-bold text-white md:text-3xl">{value}</p>
     {helper && <p className="mt-1 text-xs text-zinc-500">{helper}</p>}
@@ -435,6 +450,7 @@ function GatewayAnalyticsView({
 }
 
 export default function AdminPage() {
+  const router = useRouter();
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [summary, setSummary] = useState<Record<string, unknown>>({});
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
@@ -452,6 +468,7 @@ export default function AdminPage() {
   const [upcomingMeta, setUpcomingMeta] = useState<Record<string, unknown>>({});
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const [syncResult, setSyncResult] = useState<SyncRunResult | null>(null);
   const [tab, setTab] = useState<(typeof tabs)[number]>("Overview");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState<(typeof pageSizes)[number]>(25);
@@ -548,6 +565,54 @@ export default function AdminPage() {
     await loadDashboardData();
   };
 
+  const logout = async () => {
+    await fetch("/api/auth/logout", { method: "POST" });
+    router.replace("/login");
+  };
+
+  const runOrderBackfill = async (dryRun: boolean) => {
+    setError("");
+    setMessage(dryRun ? "Dry run backfill in progress..." : "WooCommerce order backfill in progress...");
+    const res = await fetch("/api/woocommerce/backfill-orders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        from: "2019-01-01",
+        to: dateInput(new Date()),
+        perPage: 100,
+        maxPages: 500,
+        dryRun,
+      }),
+    });
+    const data = await res.json();
+    setSyncResult(data);
+    if (!res.ok) return setError(data.error || "Backfill failed");
+    setMessage(`${dryRun ? "Dry run backfill" : "Order backfill"} completed. Orders fetched: ${data.ordersFetched ?? 0}. Orders imported: ${data.ordersUpserted ?? 0}.`);
+    await loadDashboardData();
+  };
+
+  const runCustomerRebuild = async (dryRun: boolean) => {
+    setError("");
+    setMessage(dryRun ? "Dry run rebuild in progress..." : "Customer rebuild in progress...");
+    const res = await fetch("/api/customers/rebuild-from-orders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        from: "2019-01-01",
+        to: dateInput(new Date()),
+        limit: 1000,
+        offset: 0,
+        dryRun,
+      }),
+    });
+    const data = await res.json();
+    setSyncResult(data);
+    if (!res.ok) return setError(data.error || "Customer rebuild failed");
+    setMessage(data.message || "Customer rebuild completed.");
+    await loadCustomers(1);
+    await loadDashboardData();
+  };
+
   const exportCustomerPdf = (c: Customer) => {
     const doc = new jsPDF();
     doc.text(`Customer - ${c.name}`, 14, 16);
@@ -586,11 +651,23 @@ export default function AdminPage() {
   const upcomingPage = usePagedRows(upcomingBills, pageSize);
   const salesPage = usePagedRows(salesHistory, pageSize);
 
-  return <main className="min-h-screen bg-gradient-to-b from-zinc-950 to-black p-4 text-base text-zinc-100 md:p-8">
+  return <main className="min-h-screen bg-[radial-gradient(circle_at_top,#22070b_0,#09090b_34%,#000_100%)] p-4 text-base text-zinc-100 md:p-8">
     <div className="mx-auto max-w-7xl space-y-5">
-      <header className="flex flex-wrap items-center justify-between gap-3"><div><h1 className="text-3xl font-bold text-red-400">Red Spectrum Intelligence</h1><p className="text-zinc-400">Paid revenue, subscription status, checkout pipeline, and customer risk.</p></div><button onClick={syncWooCommerce} className="rounded bg-red-600 px-5 py-3 font-semibold hover:bg-red-500">Sync Center</button></header>
-      <nav className="sticky top-0 z-10 flex gap-2 overflow-auto rounded-xl border border-zinc-800 bg-zinc-900/90 p-3 backdrop-blur">{tabs.map((t) => <button key={t} onClick={() => setTab(t)} className={`whitespace-nowrap rounded px-4 py-2 text-sm font-semibold ${tab === t ? "bg-red-600 text-white shadow-lg shadow-red-950/40" : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"}`}>{t}</button>)}</nav>
-      <div className="flex flex-wrap items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-900/70 p-3">
+      <header className="rounded-2xl border border-red-950/60 bg-zinc-950/90 p-5 shadow-xl shadow-black/30">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-red-400">Red Spectrum</p>
+            <h1 className="mt-2 text-3xl font-bold text-white md:text-4xl">Customer Intelligence</h1>
+            <p className="mt-1 text-sm text-zinc-400">Paid revenue, subscription status, checkout pipeline, and customer risk.</p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={() => setTab("Sync Center")} className="rounded-lg bg-red-600 px-5 py-3 font-semibold text-white shadow-lg shadow-red-950/30 transition hover:bg-red-500">Sync Center</button>
+            <button onClick={logout} className="rounded-lg border border-zinc-700 bg-zinc-900 px-5 py-3 font-semibold text-zinc-200 transition hover:border-red-800 hover:bg-zinc-800">Logout</button>
+          </div>
+        </div>
+      </header>
+      <nav className="sticky top-0 z-10 flex gap-2 overflow-auto rounded-xl border border-red-950/40 bg-zinc-950/95 p-3 shadow-lg shadow-black/30 backdrop-blur">{tabs.map((t) => <button key={t} onClick={() => setTab(t)} className={`whitespace-nowrap rounded-lg px-4 py-2 text-sm font-semibold transition ${tab === t ? "bg-red-600 text-white shadow-lg shadow-red-950/50 ring-1 ring-red-400/30" : "border border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-red-900 hover:bg-zinc-800 hover:text-white"}`}>{t}</button>)}</nav>
+      <div className="flex flex-wrap items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-950/80 p-3">
         <input value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") loadCustomers(1); }} className="min-w-64 rounded bg-zinc-950 px-3 py-2 text-sm outline-none ring-1 ring-zinc-800" placeholder="Search customers by name, email, phone" />
         <select value={pageSize} onChange={(e) => { setPageSize(Number(e.target.value) as (typeof pageSizes)[number]); setPage(1); }} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">{pageSizes.map((size) => <option key={size} value={size}>{size} rows</option>)}</select>
         <button onClick={() => loadCustomers(1)} className="rounded bg-zinc-700 px-4 py-2 text-sm font-semibold">Apply</button>
@@ -638,7 +715,29 @@ export default function AdminPage() {
 
       {tab === "5-Year Sales" && <><section className="grid gap-3 sm:grid-cols-3"><Card label="Paid Revenue This Month" value={money(Number(summary.paidRevenueThisMonth ?? 0))} /><Card label="Attempted Pipeline This Month" value={money(Number(summary.attemptedPipelineThisMonth ?? 0))} /><Card label="Checkout Attempts This Month" value={Number(summary.checkoutAttemptsThisMonth ?? 0)} /></section><SalesHistoryTable rows={salesPage.rows} /><Pager {...salesPage} /></>}
 
-      {tab === "Sync Center" && <section className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-5"><h2 className="mb-3 text-xl font-semibold text-red-300">Sync Center</h2><p className="mb-4 text-sm text-zinc-400">WooCommerce sync fetches paginated orders, recalculates paid revenue, attempted pipeline, subscription candidates, and 5-year sales status.</p><button onClick={syncWooCommerce} className="rounded bg-red-600 px-5 py-3 font-semibold hover:bg-red-500">Run WooCommerce Sync</button></section>}
+      {tab === "Sync Center" && <section className="space-y-4 rounded-xl border border-zinc-800 bg-zinc-900/70 p-5">
+        <div>
+          <h2 className="mb-2 text-xl font-semibold text-red-300">Sync Center</h2>
+          <p className="text-sm text-zinc-400">Bulk backfill imports WooCommerce orders first. Customer rebuild aggregates from stored order records so the database is not built by one customer search at a time.</p>
+        </div>
+        <div className="flex flex-wrap gap-3">
+          <button onClick={() => runOrderBackfill(false)} className="rounded bg-red-600 px-5 py-3 font-semibold hover:bg-red-500">Backfill WooCommerce Orders</button>
+          <button onClick={() => runCustomerRebuild(false)} className="rounded bg-emerald-700 px-5 py-3 font-semibold hover:bg-emerald-600">Rebuild Customers From Orders</button>
+          <button onClick={() => runOrderBackfill(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Dry Run Backfill</button>
+          <button onClick={() => runCustomerRebuild(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Dry Run Rebuild</button>
+          <button onClick={syncWooCommerce} className="rounded bg-zinc-800 px-5 py-3 font-semibold text-zinc-200 hover:bg-zinc-700">Legacy WooCommerce Sync</button>
+        </div>
+        <p className="text-sm text-zinc-400">Single Customer Repair Sync is now intended only for targeted debug/repair work, not database-wide customer creation.</p>
+        <div className="grid gap-3 md:grid-cols-4">
+          <Card label="Job Status" value={syncResult ? syncResult.dryRun ? "Dry Run Complete" : "Complete" : "Idle"} />
+          <Card label="Pages Fetched" value={Number(syncResult?.pagesFetched ?? 0)} />
+          <Card label="Orders Imported" value={Number(syncResult?.ordersUpserted ?? 0)} />
+          <Card label="Customers Rebuilt" value={Number(syncResult?.customersRebuilt ?? syncResult?.dryRunCustomersMatched ?? 0)} />
+        </div>
+        {syncResult?.warnings?.length ? <p className="rounded border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100">{syncResult.warnings.slice(0, 5).join(" ")}</p> : null}
+        {syncResult?.failedRequests?.length ? <p className="rounded border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-100">Failed requests: {syncResult.failedRequests.length}</p> : null}
+        <p className="text-sm text-zinc-500">Last run: {syncResult ? new Date().toLocaleString() : "-"}</p>
+      </section>}
     </div>
   </main>;
 }
