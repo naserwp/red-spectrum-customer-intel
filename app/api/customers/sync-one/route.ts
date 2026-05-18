@@ -9,9 +9,12 @@ import { isWooCommerceConfigured, type WooCommerceOrder } from "@/lib/woocommerc
 import { Customer, type CustomerDocument, type CustomerOrderHistoryItem, type CustomerOrderLineItem } from "@/models/Customer";
 
 const todayIso = new Date().toISOString();
-const syncOneMaxPages = () => {
-  const value = Number(process.env.WC_SYNC_ONE_MAX_PAGES ?? process.env.WC_MAX_PAGES ?? 25);
-  return Number.isFinite(value) && value > 0 ? value : 25;
+type SyncStatus = "success" | "success_with_warnings" | "failed";
+
+const syncOneMaxPages = (requested?: unknown) => {
+  const value = Number(requested ?? process.env.WC_SYNC_ONE_MAX_PAGES ?? 5);
+  if (!Number.isFinite(value) || value <= 0) return 5;
+  return Math.min(25, Math.max(1, Math.floor(value)));
 };
 
 const getOrderEmail = (order: WooCommerceOrder) => order.billing?.email?.trim().toLowerCase() ?? "";
@@ -255,6 +258,10 @@ function buildRuleSummary(name: string, paidTotal: number, paidOrderCount: numbe
   };
 }
 
+function warningSummary(warnings: string[]) {
+  return Array.from(new Set(warnings.map((warning) => warning.trim()).filter(Boolean))).join(" ");
+}
+
 function gatewayRank(verification?: CustomerOrderHistoryItem["gatewayVerification"]) {
   if (!verification) return -1;
   const confidenceRank: Record<string, number> = { exact: 5, high: 4, medium: 3, low: 2, not_found: 1 };
@@ -276,7 +283,7 @@ async function buildCustomerFromOrders(
   existing: CustomerDocument | null,
   verifyGateways: boolean,
   audit: WooSourceAudit,
-  input: { phone?: string; customerName?: string; deepWooSearch: boolean }
+  input: { phone?: string; customerName?: string; deepWooSearch: boolean; syncStatus: SyncStatus; warningSummary: string }
 ) {
   const orderHistory = (await Promise.all(orders.map((order) => buildOrderHistoryItem(order, verifyGateways))))
     .sort((a, b) => new Date(b.dateCreated).getTime() - new Date(a.dateCreated).getTime());
@@ -375,11 +382,15 @@ async function buildCustomerFromOrders(
     },
     sourceCoverage: {
       deepWooSearch: input.deepWooSearch,
+      ordersStored: orderHistory.length,
       ordersStoredCount: orderHistory.length,
       matchReasonCounts: audit.matchReasonCounts,
       statusCounts: audit.statusCounts,
       paymentMethodCounts: audit.paymentMethodCounts,
+      syncStatus: input.syncStatus,
+      lastDeepSyncAt: input.deepWooSearch ? todayIso : "",
       lastSyncedAt: todayIso,
+      warningSummary: input.warningSummary,
       warnings: audit.warnings,
     },
     ...summary,
@@ -388,15 +399,27 @@ async function buildCustomerFromOrders(
 }
 
 export async function POST(request: Request) {
+  const startedAt = Date.now();
   if (!isWooCommerceConfigured()) {
-    return NextResponse.json({ error: "WooCommerce is not configured.", saved: false }, { status: 400 });
+    return NextResponse.json({ error: "WooCommerce is not configured.", saved: false, syncStatus: "failed", totalSyncMs: Date.now() - startedAt }, { status: 400 });
   }
 
-  const body = await request.json().catch(() => ({})) as { email?: string; phone?: string; customerName?: string; company?: string; firstName?: string; lastName?: string; verifyGateways?: boolean; deepWooSearch?: boolean };
+  const body = await request.json().catch(() => ({})) as {
+    email?: string;
+    phone?: string;
+    customerName?: string;
+    company?: string;
+    firstName?: string;
+    lastName?: string;
+    verifyGateways?: boolean;
+    deepWooSearch?: boolean;
+    maxPagesPerStrategy?: number;
+  };
   const email = body.email?.trim().toLowerCase();
   const verifyGateways = body.verifyGateways === true;
   const deepWooSearch = body.deepWooSearch === true;
-  if (!email) return NextResponse.json({ error: "email is required" }, { status: 400 });
+  const maxPagesPerStrategy = syncOneMaxPages(body.maxPagesPerStrategy);
+  if (!email) return NextResponse.json({ error: "email is required", syncStatus: "failed", totalSyncMs: Date.now() - startedAt }, { status: 400 });
 
   const matchResult = await fetchWooCustomerMatches({
     email,
@@ -405,17 +428,26 @@ export async function POST(request: Request) {
     lastName: body.lastName,
     customerName: body.customerName,
     company: body.company,
-  }, { deepWooSearch, maxPages: syncOneMaxPages() });
+  }, { deepWooSearch, maxPages: maxPagesPerStrategy });
   const { orders, audit } = matchResult;
   if (!orders) {
-    return NextResponse.json({ error: "Unable to fetch WooCommerce orders.", email, saved: false }, { status: 502 });
+    return NextResponse.json({ error: "Unable to fetch WooCommerce orders.", email, saved: false, syncStatus: "failed", totalSyncMs: Date.now() - startedAt }, { status: 502 });
   }
 
   const connection = await connectToDatabase();
-  if (!connection) return NextResponse.json({ error: "MongoDB is unavailable.", email, saved: false, ordersFetchedForEmail: orders.length }, { status: 503 });
+  if (!connection) return NextResponse.json({ error: "MongoDB is unavailable.", email, saved: false, ordersFetchedForEmail: orders.length, syncStatus: "failed", totalSyncMs: Date.now() - startedAt }, { status: 503 });
 
   const existing = await Customer.findOne({ email }).lean<CustomerDocument | null>();
-  const customer = await buildCustomerFromOrders(email, orders, existing, verifyGateways, audit, { phone: body.phone, customerName: body.customerName, deepWooSearch });
+  const syncWarnings = warningSummary(audit.warnings);
+  const partialSync = audit.warnings.length > 0 || matchResult.failedRequests.length > 0;
+  const syncStatus: SyncStatus = partialSync ? "success_with_warnings" : "success";
+  const customer = await buildCustomerFromOrders(email, orders, existing, verifyGateways, audit, {
+    phone: body.phone,
+    customerName: body.customerName,
+    deepWooSearch,
+    syncStatus,
+    warningSummary: syncWarnings,
+  });
   await Customer.findOneAndUpdate(
     { email },
     { $set: customer },
@@ -439,11 +471,18 @@ export async function POST(request: Request) {
   const nmiMatchedOrders = nmiOrders.filter((order) => order.gatewayVerification.matched).length;
   const nmiUnmatchedOrders = nmiOrders.filter((order) => !order.gatewayVerification.matched).length;
   const stripeWarning = verifyGateways && stripeOrders.length === 0 ? "No Stripe WooCommerce orders found for this customer." : "";
+  const totalSyncMs = Date.now() - startedAt;
+  const message = partialSync && customer.orders.length > 0
+    ? `Saved ${customer.orders.length} matched orders. Some broad search sources reached page limits, but matched customer history was saved.`
+    : `Saved ${customer.orders.length} matched order${customer.orders.length === 1 ? "" : "s"}.`;
 
   return NextResponse.json({
     email,
     saved: true,
+    syncStatus,
+    message,
     deepWooSearch,
+    maxPagesPerStrategy,
     ordersFetchedForEmail: audit.matches.byEmail.count,
     ordersFetchedByEmail: audit.matches.byEmail.count,
     ordersFetchedByPhone: audit.matches.byPhone.count,
@@ -470,8 +509,10 @@ export async function POST(request: Request) {
     paymentMethods,
     products,
     pagesFetched: matchResult.pagesFetched,
+    totalSyncMs,
+    strategyTimings: matchResult.strategyTimings,
     failedRequests: matchResult.failedRequests,
-    partialSync: audit.warnings.length > 0 || matchResult.failedRequests.length > 0,
+    partialSync,
     matchReasonCounts: audit.matchReasonCounts,
     statusCounts: audit.statusCounts,
     paymentMethodCounts: audit.paymentMethodCounts,

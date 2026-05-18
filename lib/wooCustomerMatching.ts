@@ -68,7 +68,10 @@ export type WooCustomerMatchResult = {
   audit: WooSourceAudit;
   pagesFetched: number;
   failedRequests: Array<{ status: string; page: number; message: string }>;
+  strategyTimings: Record<WooSearchStrategy, number>;
 };
+
+export type WooSearchStrategy = "email" | "phone" | "name" | "company" | "customer_user" | "all_orders_scan";
 
 function normalizeText(value?: string) {
   return (value ?? "")
@@ -232,6 +235,35 @@ function addCandidates(
   }
 }
 
+function emptyStrategyTimings(): Record<WooSearchStrategy, number> {
+  return {
+    email: 0,
+    phone: 0,
+    name: 0,
+    company: 0,
+    customer_user: 0,
+    all_orders_scan: 0,
+  };
+}
+
+async function timeStrategy<T>(strategy: WooSearchStrategy, timings: Record<WooSearchStrategy, number>, work: () => Promise<T>) {
+  const startedAt = Date.now();
+  try {
+    return await work();
+  } finally {
+    timings[strategy] += Date.now() - startedAt;
+  }
+}
+
+function strategyForSearch(search: string, input: WooCustomerMatchInput, normalizedInput: NormalizedInput): WooSearchStrategy {
+  const normalizedSearch = search.trim().toLowerCase();
+  if (normalizedInput.email && normalizedSearch === normalizedInput.email) return "email";
+  if (normalizedInput.phone && normalizedSearch === normalizedInput.phone) return "phone";
+  if (input.customerName?.trim() && normalizedSearch === input.customerName.trim().toLowerCase()) return "name";
+  if (input.company?.trim() && normalizedSearch === input.company.trim().toLowerCase()) return "company";
+  return "name";
+}
+
 function auditFor(input: WooCustomerMatchInput, normalizedInput: NormalizedInput, orders: WooMatchedOrder[], warnings: string[], fetchedBySource: Record<string, number>): WooSourceAudit {
   const statusCounts: Record<string, number> = {};
   const paymentMethodCounts: Record<string, number> = {};
@@ -279,16 +311,18 @@ export async function fetchWooCustomerMatches(input: WooCustomerMatchInput, opti
   const warnings: string[] = [];
   const failedRequests: WooCustomerMatchResult["failedRequests"] = [];
   const fetchedBySource: Record<string, number> = {};
+  const strategyTimings = emptyStrategyTimings();
   let pagesFetched = 0;
 
-  const emailResult = await fetchWooCommerceOrders({ email: normalizedInput.email, maxPages });
+  const emailResult = await timeStrategy("email", strategyTimings, () => fetchWooCommerceOrders({ email: normalizedInput.email, maxPages }));
   pagesFetched += collectFetchWarning("email", emailResult, warnings, failedRequests);
   addCandidates(emailResult, "email", candidates, fetchedBySource);
 
   if (deepWooSearch) {
     const customerSearches = Array.from(new Set([normalizedInput.email, normalizedInput.phone, input.customerName, input.company].map((value) => value?.trim()).filter(Boolean) as string[]));
     for (const search of customerSearches) {
-      const customerResult = await fetchWooCommerceCustomers({ search, maxPages: Math.min(5, maxPages) });
+      const strategy = strategyForSearch(search, input, normalizedInput);
+      const customerResult = await timeStrategy(strategy, strategyTimings, () => fetchWooCommerceCustomers({ search, maxPages: Math.min(5, maxPages) }));
       pagesFetched += collectFetchWarning(`customer:${search}`, customerResult, warnings, failedRequests);
       for (const customer of customerResult?.items ?? []) {
         if (matchCustomer(customer, normalizedInput)) customerIds.add(customer.id);
@@ -296,19 +330,20 @@ export async function fetchWooCustomerMatches(input: WooCustomerMatchInput, opti
     }
 
     for (const customerId of customerIds) {
-      const customerOrderResult = await fetchWooCommerceOrders({ customerId, maxPages });
+      const customerOrderResult = await timeStrategy("customer_user", strategyTimings, () => fetchWooCommerceOrders({ customerId, maxPages }));
       pagesFetched += collectFetchWarning(`customer_id:${customerId}`, customerOrderResult, warnings, failedRequests);
       addCandidates(customerOrderResult, "customer_id", candidates, fetchedBySource);
     }
 
     const orderSearches = Array.from(new Set([normalizedInput.email, normalizedInput.phone, input.customerName, input.company].map((value) => value?.trim()).filter(Boolean) as string[]));
     for (const search of orderSearches) {
-      const orderResult = await fetchWooCommerceOrders({ search, maxPages });
+      const strategy = strategyForSearch(search, input, normalizedInput);
+      const orderResult = await timeStrategy(strategy, strategyTimings, () => fetchWooCommerceOrders({ search, maxPages }));
       pagesFetched += collectFetchWarning(`order_search:${search}`, orderResult, warnings, failedRequests);
       addCandidates(orderResult, "search", candidates, fetchedBySource);
     }
 
-    const allOrdersResult = await fetchWooCommerceOrders({ maxPages });
+    const allOrdersResult = await timeStrategy("all_orders_scan", strategyTimings, () => fetchWooCommerceOrders({ maxPages }));
     pagesFetched += collectFetchWarning("all_orders_scan", allOrdersResult, warnings, failedRequests);
     addCandidates(allOrdersResult, "all_orders_scan", candidates, fetchedBySource);
   }
@@ -326,5 +361,6 @@ export async function fetchWooCustomerMatches(input: WooCustomerMatchInput, opti
     audit: auditFor(input, normalizedInput, matchedOrders, Array.from(new Set(warnings)), fetchedBySource),
     pagesFetched,
     failedRequests,
+    strategyTimings,
   };
 }

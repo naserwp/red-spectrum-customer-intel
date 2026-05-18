@@ -87,7 +87,7 @@ type WooCommerceFetchOptions = {
   perPage?: number;
 };
 
-export const wooCommerceOrderStatuses = ["completed", "processing", "pending", "failed", "cancelled", "canceled", "on-hold", "checkout-draft", "refunded"];
+export const wooCommerceOrderStatuses = ["completed", "processing", "pending", "failed", "cancelled", "on-hold", "checkout-draft", "refunded"];
 
 function getWooCommerceConfig() {
   if (!WC_STORE_URL || !WC_CONSUMER_KEY || !WC_CONSUMER_SECRET) {

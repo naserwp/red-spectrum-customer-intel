@@ -87,11 +87,15 @@ type OrderHistoryItem = {
 
 type SourceCoverage = {
   deepWooSearch?: boolean;
+  ordersStored?: number;
   ordersStoredCount?: number;
   matchReasonCounts?: Record<string, number>;
   statusCounts?: Record<string, number>;
   paymentMethodCounts?: Record<string, number>;
+  syncStatus?: "success" | "success_with_warnings" | "failed" | "";
+  lastDeepSyncAt?: string;
   lastSyncedAt?: string;
+  warningSummary?: string;
   warnings?: string[];
 };
 
@@ -237,6 +241,11 @@ function listOrDash(values: string[]) {
   return values.length ? values.join(", ") : "-";
 }
 
+function countSummary(counts?: Record<string, number>) {
+  const entries = Object.entries(counts ?? {}).filter(([, count]) => Number(count) > 0);
+  return entries.length ? entries.map(([key, count]) => `${displayStatus(key)} (${count})`).join(", ") : "-";
+}
+
 function buildTemplates(customer: CustomerDetail, actualPaid: number, attempted: number, attemptedOrders: OrderHistoryItem[]) {
   const latestAttempt = attemptedOrders[0];
   const fallbackProducts = actualPaid > 0
@@ -379,6 +388,10 @@ export default function CustomerDetailPage() {
   const boostAndAddOns = [...boostProductsPurchased, ...addOnProductsPurchased];
   const classifiedAttemptedProducts = [...attemptedBaseProducts, ...attemptedBoostProducts, ...attemptedAddOnProducts];
   const attemptedProductSummary = classifiedAttemptedProducts.length ? classifiedAttemptedProducts : customer.attemptedProducts ?? [];
+  const sourceCoverage = customer.sourceCoverage;
+  const sourceWarningSummary = sourceCoverage?.warningSummary || sourceCoverage?.warnings?.join(" ") || "";
+  const sourceSyncStatus = sourceCoverage?.syncStatus || (sourceWarningSummary ? "success_with_warnings" : sourceCoverage?.deepWooSearch ? "success" : "");
+  const sourceIncomplete = sourceSyncStatus === "success_with_warnings" || sourceSyncStatus === "failed" || !sourceCoverage?.deepWooSearch;
   const requiresProductReview = isLead && attemptedBoostProducts.length > 0 && baseProductsPurchased.length === 0;
   const plan = isLead
     ? {
@@ -440,13 +453,13 @@ export default function CustomerDetailPage() {
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
         <h2 className="text-xl font-semibold text-emerald-300">Data Source Coverage</h2>
         <div className="mt-3 grid gap-3 md:grid-cols-4">
-          <div><p className="text-xs uppercase text-zinc-400">Orders Stored</p><p className="font-semibold">{customer.sourceCoverage?.ordersStoredCount ?? orders.length}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Match Methods Used</p><p className="font-semibold">{Object.keys(customer.sourceCoverage?.matchReasonCounts ?? {}).join(", ") || "-"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Deep Woo Sync</p><p className="font-semibold">{customer.sourceCoverage?.deepWooSearch ? "Yes" : "No"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Last Synced</p><p className="font-semibold">{displayDateTime(customer.sourceCoverage?.lastSyncedAt || customer.lastSyncedAt)}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Orders Stored</p><p className="font-semibold">{sourceCoverage?.ordersStored ?? sourceCoverage?.ordersStoredCount ?? orders.length}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Match Methods Used</p><p className="font-semibold">{countSummary(sourceCoverage?.matchReasonCounts)}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Last Synced</p><p className="font-semibold">{displayDateTime(sourceCoverage?.lastDeepSyncAt || sourceCoverage?.lastSyncedAt || customer.lastSyncedAt)}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Sync Status</p><p className="font-semibold">{displayStatus(sourceSyncStatus || "unknown")}</p></div>
         </div>
-        {customer.sourceCoverage?.warnings?.length ? <p className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100">{customer.sourceCoverage.warnings.join(" ")}</p> : null}
-        {!customer.sourceCoverage?.deepWooSearch && <p className="mt-3 text-sm text-zinc-400">Suggested action: run deep WooCommerce sync if WooCommerce admin shows more orders than this timeline.</p>}
+        <p className="mt-3 text-sm text-zinc-300">Warning summary: {sourceWarningSummary || "-"}</p>
+        {sourceIncomplete && <p className="mt-2 text-sm text-zinc-400">Suggested action: Run deep WooCommerce sync.</p>}
       </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">

@@ -167,11 +167,15 @@ export interface CustomerDocument {
 
 export interface CustomerSourceCoverage {
   deepWooSearch: boolean;
+  ordersStored: number;
   ordersStoredCount: number;
   matchReasonCounts: Record<string, number>;
   statusCounts: Record<string, number>;
   paymentMethodCounts: Record<string, number>;
+  syncStatus: "success" | "success_with_warnings" | "failed" | "";
+  lastDeepSyncAt: string;
   lastSyncedAt: string;
+  warningSummary: string;
   warnings: string[];
 }
 
@@ -279,11 +283,15 @@ const customerOrderHistorySchema = new Schema<CustomerOrderHistoryItem>(
 const customerSourceCoverageSchema = new Schema<CustomerSourceCoverage>(
   {
     deepWooSearch: { type: Boolean, default: false },
+    ordersStored: { type: Number, default: 0 },
     ordersStoredCount: { type: Number, default: 0 },
     matchReasonCounts: { type: Schema.Types.Mixed, default: () => ({}) },
     statusCounts: { type: Schema.Types.Mixed, default: () => ({}) },
     paymentMethodCounts: { type: Schema.Types.Mixed, default: () => ({}) },
+    syncStatus: { type: String, enum: ["success", "success_with_warnings", "failed", ""], default: "" },
+    lastDeepSyncAt: { type: String, default: "" },
     lastSyncedAt: { type: String, default: "" },
+    warningSummary: { type: String, default: "" },
     warnings: { type: [String], default: [] },
   },
   { _id: false }
