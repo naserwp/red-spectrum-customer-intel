@@ -4,6 +4,7 @@ import { connectToDatabase } from "@/lib/mongodb";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { SalesHistory, type SalesHistoryDocument } from "@/models/SalesHistory";
 import { Subscription, type SubscriptionDocument } from "@/models/Subscription";
+import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 
 export async function GET() {
   await connectToDatabase();
@@ -12,6 +13,7 @@ export async function GET() {
     Subscription.find({}).lean<SubscriptionDocument[]>(),
     SalesHistory.findOne({ source: "woocommerce" }).lean<SalesHistoryDocument | null>(),
   ]);
+  const storedOrders = await WooCommerceOrderRecord.find({}).lean<WooCommerceOrderDocument[]>();
 
   const now = new Date();
   const startOfMonth = monthStart(now);
@@ -26,12 +28,18 @@ export async function GET() {
   const failedSubsLast30Days = failedSubs.filter((s) => isInRange(s.lastBillingDate ?? s.lastSyncedAt ?? "", last30, now));
   const currentMonthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
   const currentMonthSales = salesHistory?.monthly?.find((m) => m.period === currentMonthKey);
+  const paidStoredOrdersThisMonth = storedOrders.filter((order) => order.isPaid && isInRange(order.dateCreated, startOfMonth, now));
+  const attemptedStoredOrdersThisMonth = storedOrders.filter((order) => order.isAttempted && isInRange(order.dateCreated, startOfMonth, now));
 
-  const paidRevenue = customers.reduce((a, c) => a + (c.paidTotal ?? c.totalPaid ?? 0), 0);
-  const attemptedRevenue = customers.reduce((a, c) => a + (c.attemptedTotal ?? 0), 0);
+  const paidRevenue = storedOrders.length > 0 ? storedOrders.reduce((a, order) => a + Number(order.paidAmount ?? 0), 0) : customers.reduce((a, c) => a + (c.paidTotal ?? c.totalPaid ?? 0), 0);
+  const attemptedRevenue = storedOrders.length > 0 ? storedOrders.reduce((a, order) => a + Number(order.attemptedAmount ?? 0), 0) : customers.reduce((a, c) => a + (c.attemptedTotal ?? 0), 0);
   const newCustomersThisMonth = customers.filter((c) => isInRange(c.firstOrderDate ?? "", startOfMonth, now)).length;
   const newPaidCustomersThisMonth = customers.filter((c) => (c.paidTotal ?? c.totalPaid ?? 0) > 0 && isInRange(c.firstOrderDate ?? "", startOfMonth, now)).length;
-  const newHotLeadsThisMonth = customers.filter((c) => (c.paidTotal ?? c.totalPaid ?? 0) === 0 && (c.attemptedTotal ?? 0) > 0 && isInRange(c.lastAttemptDate ?? c.firstOrderDate ?? "", startOfMonth, now)).length;
+  const attemptedEmailsThisMonth = new Set(attemptedStoredOrdersThisMonth.map((order) => order.normalizedEmail).filter(Boolean));
+  const paidEmails = new Set(storedOrders.filter((order) => order.isPaid).map((order) => order.normalizedEmail).filter(Boolean));
+  const newHotLeadsThisMonth = storedOrders.length > 0
+    ? Array.from(attemptedEmailsThisMonth).filter((email) => !paidEmails.has(email)).length
+    : customers.filter((c) => (c.paidTotal ?? c.totalPaid ?? 0) === 0 && (c.attemptedTotal ?? 0) > 0 && isInRange(c.lastAttemptDate ?? c.firstOrderDate ?? "", startOfMonth, now)).length;
   const highValueCustomers = customers.filter((c) => (c.paidTotal ?? c.totalPaid ?? 0) >= highValueThreshold);
   const highValueCustomersThisMonth = highValueCustomers.filter((c) => isInRange(c.lastPaidDate ?? c.lastOrderDate ?? "", startOfMonth, now)).length;
   const failedCheckoutAttemptsThisMonth = customers
@@ -66,9 +74,9 @@ export async function GET() {
     newCustomersThisMonth,
     newPaidCustomersThisMonth,
     newHotLeadsThisMonth,
-    checkoutAttemptsThisMonth: currentMonthSales?.attemptedOrders ?? customers.filter((c) => isInRange(c.lastAttemptDate ?? "", startOfMonth, now)).reduce((a, c) => a + (c.attemptedOrderCount ?? 0), 0),
-    paidRevenueThisMonth: currentMonthSales?.paidRevenue ?? customers.filter((c) => isInRange(c.lastPaidDate ?? "", startOfMonth, now)).reduce((a, c) => a + (c.paidTotal ?? c.totalPaid ?? 0), 0),
-    attemptedPipelineThisMonth: currentMonthSales?.attemptedPipeline ?? customers.filter((c) => isInRange(c.lastAttemptDate ?? "", startOfMonth, now)).reduce((a, c) => a + (c.attemptedTotal ?? 0), 0),
+    checkoutAttemptsThisMonth: storedOrders.length > 0 ? attemptedStoredOrdersThisMonth.length : currentMonthSales?.attemptedOrders ?? customers.filter((c) => isInRange(c.lastAttemptDate ?? "", startOfMonth, now)).reduce((a, c) => a + (c.attemptedOrderCount ?? 0), 0),
+    paidRevenueThisMonth: storedOrders.length > 0 ? paidStoredOrdersThisMonth.reduce((a, order) => a + Number(order.paidAmount ?? 0), 0) : currentMonthSales?.paidRevenue ?? customers.filter((c) => isInRange(c.lastPaidDate ?? "", startOfMonth, now)).reduce((a, c) => a + (c.paidTotal ?? c.totalPaid ?? 0), 0),
+    attemptedPipelineThisMonth: storedOrders.length > 0 ? attemptedStoredOrdersThisMonth.reduce((a, order) => a + Number(order.attemptedAmount ?? 0), 0) : currentMonthSales?.attemptedPipeline ?? customers.filter((c) => isInRange(c.lastAttemptDate ?? "", startOfMonth, now)).reduce((a, c) => a + (c.attemptedTotal ?? 0), 0),
     highValueCustomers: highValueCustomers.length,
     highValueCustomersThisMonth,
     sourceBreakdown,

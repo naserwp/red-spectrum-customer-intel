@@ -12,12 +12,23 @@ type Customer = {
   activeSubscriptions: number; failedPayments: number; chargebacks: number; estimatedCreditLimit: number; tier: string; riskLevel: string;
   score: number; stars: number; aiSummaryPreview: string; aiSummary: string; subscriptionStatus: string; orderCount: number; averageOrderValue: number;
   firstOrderDate: string; lastOrderDate: string; refunds: number; riskExplanation: string; recommendedAction: string;
+  attemptedProducts?: string[]; lastAttemptedProduct?: string;
 };
 
 type Subscription = {
   _id?: string; subscriptionId: string; source: string; customerEmail: string; customerName: string; status: string; amount: number;
   monthlyRecurringRevenue?: number; billingInterval?: string; nextBillingDate?: string; lastBillingDate?: string; failedPaymentCount?: number;
   lastPaymentStatus?: string; sourceStatus?: string; recordType?: string;
+};
+
+type RecurringCandidate = {
+  customerName: string;
+  customerEmail: string;
+  product: string;
+  paidMonths: number;
+  lastPaid: string;
+  averageAmount: number;
+  suggestedReview: string;
 };
 
 type SalesMetric = {
@@ -185,6 +196,7 @@ function Pager({ start, end, total, page, maxPage, setPage }: { start: number; e
 }
 
 function CustomerTable({ rows, exportCustomerPdf }: { rows: Customer[]; exportCustomerPdf: (c: Customer) => void }) {
+  if (rows.length === 0) return <p className="rounded-xl border border-zinc-800 bg-zinc-900 p-4 text-zinc-400">No customer profiles found. Go to Sync Center and run Import WooCommerce Orders, then Update Customer Profiles.</p>;
   return <div className="overflow-x-auto rounded-xl border border-zinc-800">
     <table className="min-w-[1750px] table-fixed text-sm">
       <thead className="sticky top-0 bg-zinc-950"><tr>{["Customer", "Category", "Tier", "Actual Paid", "Attempted Pipeline", "Paid Orders", "Attempted Orders", "Start", "Tenure", "Payment Status", "Lead Status", "Last Paid", "Last Attempt", "Risk", "Score", "Preview", "Actions"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
@@ -210,6 +222,42 @@ function CustomerTable({ rows, exportCustomerPdf }: { rows: Customer[]; exportCu
           <td className="px-3 py-3"><div className="flex gap-2"><Link className="rounded bg-zinc-700 px-2 py-1" href={customerDetailHref(c)}>View</Link><button onClick={() => exportCustomerPdf(c)} className="rounded bg-red-700 px-2 py-1">PDF</button></div></td>
         </tr>;
       })}</tbody>
+    </table>
+  </div>;
+}
+
+function HotLeadsTable({ rows }: { rows: Customer[] }) {
+  if (rows.length === 0) return <p className="rounded-xl border border-zinc-800 bg-zinc-900 p-4 text-zinc-400">No hot checkout leads found. Run Import WooCommerce Orders, then Update Customer Profiles.</p>;
+  return <div className="overflow-x-auto rounded-xl border border-zinc-800">
+    <table className="min-w-[1100px] text-sm">
+      <thead className="sticky top-0 bg-zinc-950"><tr>{["Customer", "Attempted Pipeline", "Attempted Orders", "Last Attempt", "Payment Status", "Lead Status", "Products Attempted", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
+      <tbody>{rows.map((c) => <tr key={c._id} className="border-t border-zinc-800 bg-orange-500/5">
+        <td className="px-3 py-3"><p className="font-semibold">{c.name || c.email}</p><p className="text-xs text-zinc-400">{c.email || c._id}</p></td>
+        <td className="px-3 py-3 font-semibold">{money(attemptedAmount(c))}</td>
+        <td className="px-3 py-3">{c.attemptedOrderCount ?? 0}</td>
+        <td className="px-3 py-3">{displayDate(c.lastAttemptDate)}</td>
+        <td className="px-3 py-3">{displayStatus(c.paymentStatus)}</td>
+        <td className="px-3 py-3">{displayStatus(c.leadStatus)}</td>
+        <td className="px-3 py-3">{(c.attemptedProducts?.length ? c.attemptedProducts : c.lastAttemptedProduct ? [c.lastAttemptedProduct] : []).join(", ") || "-"}</td>
+        <td className="px-3 py-3"><Link className="rounded bg-zinc-700 px-2 py-1" href={customerDetailHref(c)}>View</Link></td>
+      </tr>)}</tbody>
+    </table>
+  </div>;
+}
+
+function RecurringCandidatesTable({ rows }: { rows: RecurringCandidate[] }) {
+  if (rows.length === 0) return <p className="rounded-xl border border-zinc-800 bg-zinc-900 p-4 text-zinc-400">No recurring candidates found yet.</p>;
+  return <div className="overflow-x-auto rounded-xl border border-zinc-800">
+    <table className="min-w-[950px] text-sm">
+      <thead className="sticky top-0 bg-zinc-950"><tr>{["Customer", "Product", "Paid Months", "Last Paid", "Average Amount", "Suggested Review"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
+      <tbody>{rows.map((row) => <tr key={`${row.customerEmail}-${row.product}`} className="border-t border-zinc-800">
+        <td className="px-3 py-3"><p className="font-semibold">{row.customerName || row.customerEmail}</p><p className="text-xs text-zinc-400">{row.customerEmail}</p></td>
+        <td className="px-3 py-3">{row.product}</td>
+        <td className="px-3 py-3">{row.paidMonths}</td>
+        <td className="px-3 py-3">{displayDate(row.lastPaid)}</td>
+        <td className="px-3 py-3">{money(Number(row.averageAmount ?? 0))}</td>
+        <td className="px-3 py-3">{row.suggestedReview}</td>
+      </tr>)}</tbody>
     </table>
   </div>;
 }
@@ -465,6 +513,8 @@ export default function AdminPage() {
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
   const [subscriptionCandidates, setSubscriptionCandidates] = useState<Subscription[]>([]);
   const [upcomingBills, setUpcomingBills] = useState<Subscription[]>([]);
+  const [recurringCandidates, setRecurringCandidates] = useState<RecurringCandidate[]>([]);
+  const [hotLeadRows, setHotLeadRows] = useState<Customer[]>([]);
   const [riskRows, setRiskRows] = useState<Customer[]>([]);
   const [salesHistory, setSalesHistory] = useState<SalesMetric[]>([]);
   const [gatewayAnalytics, setGatewayAnalytics] = useState<GatewayAnalytics | null>(null);
@@ -495,6 +545,11 @@ export default function AdminPage() {
     setPage(data.page || nextPage);
   }, [page, pageSize, search]);
 
+  const loadHotLeads = useCallback(async () => {
+    const data = await fetch("/api/customers/table?kind=hot-leads&limit=100", { cache: "no-store" }).then((r) => r.json());
+    setHotLeadRows(data.rows || []);
+  }, []);
+
   const loadDashboardData = useCallback(async () => {
     const [summaryData, subscriptionData, candidateData, upcomingData, riskData, salesData] = await Promise.all([
       fetch("/api/analytics/summary", { cache: "no-store" }).then((r) => r.json()),
@@ -508,6 +563,7 @@ export default function AdminPage() {
     setSubscriptions(subscriptionData.rows || []);
     setSubscriptionCandidates(candidateData.rows || []);
     setUpcomingBills(upcomingData.rows || []);
+    setRecurringCandidates(upcomingData.recurringCandidates || []);
     setUpcomingMeta(upcomingData || {});
     setRiskRows(riskData.rows || []);
     setSalesHistory(salesData.yearly || []);
@@ -556,8 +612,9 @@ export default function AdminPage() {
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     loadCustomers(1).catch(() => setError("Unable to load customers."));
+    loadHotLeads().catch(() => setError("Unable to load hot checkout leads."));
     loadDashboardData().catch(() => setError("Unable to load dashboard data."));
-  }, [loadCustomers, loadDashboardData]);
+  }, [loadCustomers, loadHotLeads, loadDashboardData]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -573,6 +630,7 @@ export default function AdminPage() {
     const warning = data.warning ? ` ${data.warning}` : "";
     setMessage(`${data.message || "Sync completed"} Orders fetched: ${data.totalOrdersFetched ?? 0}. Paid orders: ${data.paidOrders ?? 0}. Unpaid orders: ${data.unpaidOrders ?? 0}.${warning}`);
     await loadCustomers(1);
+    await loadHotLeads();
     await loadDashboardData();
   };
 
@@ -652,6 +710,7 @@ export default function AdminPage() {
       lastRunTime: new Date().toLocaleString(),
     });
     await loadCustomers(1);
+    await loadHotLeads();
     await loadDashboardData();
   };
 
@@ -683,7 +742,6 @@ export default function AdminPage() {
   const customerEnd = Math.min(total, page * pageSize);
   const customerMaxPage = Math.max(1, Math.ceil(total / pageSize));
   const highValueRows = useMemo(() => customers.filter((c) => paidAmount(c) >= highValueThreshold).sort((a, b) => paidAmount(b) - paidAmount(a)), [customers]);
-  const hotLeadRows = useMemo(() => customers.filter((c) => paidAmount(c) === 0 && attemptedAmount(c) > 0).sort((a, b) => attemptedAmount(b) - attemptedAmount(a)), [customers]);
   const riskDisplayRows = riskRows.length ? riskRows : customers.filter((c) => c.riskLevel === "high" || c.failedPayments > 0 || c.chargebacks > 0);
   const highValuePage = usePagedRows(highValueRows, pageSize);
   const hotLeadPage = usePagedRows(hotLeadRows, pageSize);
@@ -719,7 +777,7 @@ export default function AdminPage() {
 
       {tab === "Overview" && <>
         <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <Card label="Paid Revenue" value={money(Number(summary.paidRevenue ?? 0))} helper="Actual completed/processing/paid orders only" />
+          <Card label="Paid Revenue" value={money(Number(summary.paidRevenue ?? 0))} helper="Actual paid WooCommerce orders only" />
           <Card label="Attempted Pipeline" value={money(Number(summary.attemptedRevenue ?? 0))} helper="Unpaid checkout/payment attempts" />
           <Card label="Active Subscriptions" value={Number(summary.activeSubscriptions ?? 0)} helper={String(summary.subscriptionNote || "Real active subscription records only")} />
           <Card label="Failed Payments This Month" value={Number(summary.failedPaymentsThisMonth ?? 0)} helper="Real subscription failures this month" />
@@ -727,7 +785,7 @@ export default function AdminPage() {
         <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <Card label="New Customers This Month" value={Number(summary.newCustomersThisMonth ?? 0)} />
           <Card label="New Paid Customers This Month" value={Number(summary.newPaidCustomersThisMonth ?? 0)} />
-          <Card label="New Hot Leads This Month" value={Number(summary.newHotLeadsThisMonth ?? 0)} />
+          <Card label="New Hot Leads This Month" value={Number(summary.newHotLeadsThisMonth ?? 0)} helper="Customers who attempted checkout but did not complete payment" />
           <Card label="High Value This Month" value={Number(summary.highValueCustomersThisMonth ?? 0)} helper={`Paid customers at or above ${money(highValueThreshold)}`} />
         </section>
         <section className="space-y-3"><h2 className="text-xl font-semibold text-zinc-100">High-To-Low Customer Value</h2><ValueIndex rows={highValueRows.length ? highValueRows.slice(0, 10) : customers.slice(0, 10)} /></section>
@@ -743,13 +801,21 @@ export default function AdminPage() {
 
       {tab === "Upcoming Bills" && <>
         <section className="grid gap-3 sm:grid-cols-3"><Card label="Upcoming 30D" value={Number(summary.upcomingBills30d ?? 0)} helper="Active subscriptions with real next billing date" /><Card label="Est. Upcoming Revenue" value={money(Number(summary.estimatedUpcomingRevenue30d ?? 0))} /><Card label="High Risk Upcoming" value={Number(upcomingMeta.highRiskCount ?? 0)} /></section>
-        {upcomingMeta.message && <p className="rounded border border-zinc-800 bg-zinc-900 p-3 text-zinc-400">{String(upcomingMeta.message)}</p>}
-        <SubscriptionTable rows={upcomingPage.rows} /><Pager {...upcomingPage} />
+        <section className="space-y-3">
+          <h2 className="text-xl font-semibold text-zinc-100">Active Subscriptions With Next Billing Date</h2>
+          {typeof upcomingMeta.message === "string" && upcomingMeta.message && <p className="rounded border border-zinc-800 bg-zinc-900 p-3 text-zinc-400">{upcomingMeta.message}</p>}
+          {upcomingPage.rows.length > 0 ? <><SubscriptionTable rows={upcomingPage.rows} /><Pager {...upcomingPage} /></> : null}
+        </section>
+        <section className="space-y-3">
+          <h2 className="text-xl font-semibold text-zinc-100">Recurring Candidates</h2>
+          <p className="text-sm text-zinc-400">Customers with repeated paid Business Builder orders but no real next billing date.</p>
+          <RecurringCandidatesTable rows={recurringCandidates} />
+        </section>
       </>}
 
       {tab === "High Value" && <><Card label="High Value Paid Customers" value={Number(summary.highValueCustomers ?? 0)} helper="Unpaid leads excluded" /><ValueIndex rows={highValuePage.rows} /><Pager {...highValuePage} /></>}
 
-      {tab === "Hot Leads" && <><Card label="Hot Checkout Leads" value={hotLeadRows.length} helper="paidTotal = 0 and attemptedTotal > 0" /><CustomerTable rows={hotLeadPage.rows} exportCustomerPdf={exportCustomerPdf} /><Pager {...hotLeadPage} /></>}
+      {tab === "Hot Leads" && <><Card label="Hot Checkout Leads" value={hotLeadRows.length} helper="Unpaid checkout/payment attempts and newer failed attempts after last paid order" /><HotLeadsTable rows={hotLeadPage.rows} /><Pager {...hotLeadPage} /></>}
 
       {tab === "Risk Review" && <><section className="grid gap-3 sm:grid-cols-4"><Card label="Risk Customers" value={riskDisplayRows.length} /><Card label="Failed Payments Total" value={Number(summary.failedPaymentsTotal ?? 0)} /><Card label="Failed Payments Last 30D" value={Number(summary.failedPaymentsLast30Days ?? 0)} /><Card label="Failed Checkout Attempts This Month" value={Number(summary.failedCheckoutAttemptsThisMonth ?? 0)} /></section><CustomerTable rows={riskPage.rows} exportCustomerPdf={exportCustomerPdf} /><Pager {...riskPage} /></>}
 

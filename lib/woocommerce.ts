@@ -65,6 +65,31 @@ export type WooCommerceOrder = {
   line_items?: WooCommerceLineItem[];
 };
 
+export type WooCommerceSubscription = {
+  id: number;
+  number?: string;
+  status?: string;
+  customer_id?: number;
+  billing?: WooCommerceAddress;
+  line_items?: WooCommerceLineItem[];
+  total?: string;
+  currency?: string;
+  billing_interval?: string | number;
+  billing_period?: string;
+  date_created?: string;
+  start_date?: string;
+  next_payment_date?: string;
+  next_payment_date_gmt?: string;
+  last_payment_date?: string;
+  last_payment_date_gmt?: string;
+  end_date?: string;
+  payment_method?: string;
+  payment_method_title?: string;
+  parent_id?: number;
+  related_orders?: number[];
+  meta_data?: WooCommerceMeta[];
+};
+
 export type WooCommerceFetchResult<T> = {
   items: T[];
   totalFetched: number;
@@ -91,6 +116,7 @@ type WooCommerceFetchOptions = {
 };
 
 export const wooCommerceOrderStatuses = ["completed", "processing", "pending", "failed", "cancelled", "on-hold", "checkout-draft", "refunded"];
+export const wooCommerceSubscriptionStatuses = ["active", "pending", "on-hold", "cancelled", "expired", "pending-cancel"];
 
 function getWooCommerceConfig() {
   if (!WC_STORE_URL || !WC_CONSUMER_KEY || !WC_CONSUMER_SECRET) {
@@ -134,7 +160,7 @@ async function fetchWithTimeout(url: URL, headers: HeadersInit, timeoutMs: numbe
   }
 }
 
-async function fetchWooCommerceCollection<T>(resource: "customers" | "orders", options: WooCommerceFetchOptions = {}): Promise<WooCommerceFetchResult<T> | null> {
+async function fetchWooCommerceCollection<T>(resource: "customers" | "orders" | "subscriptions", options: WooCommerceFetchOptions = {}): Promise<WooCommerceFetchResult<T> | null> {
   const config = getWooCommerceConfig();
   if (!config) return null;
 
@@ -143,7 +169,7 @@ async function fetchWooCommerceCollection<T>(resource: "customers" | "orders", o
   const perPage = Math.min(100, Math.max(1, options.perPage ?? getNumericEnv("WC_PER_PAGE", 100)));
   const maxPages = Math.max(1, options.maxPages ?? getNumericEnv("WC_MAX_PAGES", 25));
   const timeoutMs = getNumericEnv("WC_REQUEST_TIMEOUT_MS", 12000);
-  const statuses = resource === "orders" ? options.statuses ?? wooCommerceOrderStatuses : [""];
+  const statuses = resource === "orders" ? options.statuses ?? wooCommerceOrderStatuses : resource === "subscriptions" ? options.statuses ?? wooCommerceSubscriptionStatuses : [""];
   const seen = new Set<string>();
   const fetchedByStatus: Record<string, number> = {};
   const pagesFetchedByStatus: Record<string, number> = {};
@@ -162,7 +188,7 @@ async function fetchWooCommerceCollection<T>(resource: "customers" | "orders", o
       const url = new URL(`${config.storeUrl}/wp-json/wc/v3/${resource}`);
       url.searchParams.set("per_page", String(perPage));
       url.searchParams.set("page", String(page));
-      if (resource === "orders" && status) {
+      if ((resource === "orders" || resource === "subscriptions") && status) {
         url.searchParams.set("status", status);
       }
       if (resource === "orders" && options.email) {
@@ -171,13 +197,13 @@ async function fetchWooCommerceCollection<T>(resource: "customers" | "orders", o
       if (options.search) {
         url.searchParams.set("search", options.search);
       }
-      if (resource === "orders" && options.customerId) {
+      if ((resource === "orders" || resource === "subscriptions") && options.customerId) {
         url.searchParams.set("customer", String(options.customerId));
       }
-      if (resource === "orders" && options.after) {
+      if ((resource === "orders" || resource === "subscriptions") && options.after) {
         url.searchParams.set("after", options.after);
       }
-      if (resource === "orders" && options.before) {
+      if ((resource === "orders" || resource === "subscriptions") && options.before) {
         url.searchParams.set("before", options.before);
       }
 
@@ -248,4 +274,8 @@ export function fetchWooCommerceCustomers(options: WooCommerceFetchOptions = {})
 
 export function fetchWooCommerceOrders(options: WooCommerceFetchOptions = {}) {
   return fetchWooCommerceCollection<WooCommerceOrder>("orders", options);
+}
+
+export function fetchWooCommerceSubscriptions(options: WooCommerceFetchOptions = {}) {
+  return fetchWooCommerceCollection<WooCommerceSubscription>("subscriptions", options);
 }
