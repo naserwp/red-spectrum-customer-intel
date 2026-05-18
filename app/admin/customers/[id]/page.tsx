@@ -30,6 +30,18 @@ type GatewayVerification = {
   notes: string;
 };
 
+type ProductJourneyItem = {
+  date: string;
+  orderNumber: string;
+  status: string;
+  paymentMethod: string;
+  productName: string;
+  category: "base_product" | "boost" | "design_or_setup" | "other";
+  productType: string;
+  amount: number;
+  type: "paid" | "attempted";
+};
+
 type OrderHistoryItem = {
   orderId: string;
   orderNumber: string;
@@ -85,6 +97,19 @@ type CustomerDetail = {
   lastProducts?: string[];
   attemptedProducts?: string[];
   paidProducts?: string[];
+  firstSignupOrderNumber?: string;
+  firstSignupDate?: string;
+  firstSignupAmount?: number;
+  firstSignupProduct?: string;
+  baseProductsPurchased?: string[];
+  boostProductsPurchased?: string[];
+  addOnProductsPurchased?: string[];
+  attemptedBaseProducts?: string[];
+  attemptedBoostProducts?: string[];
+  attemptedAddOnProducts?: string[];
+  lastPurchasedProduct?: string;
+  lastAttemptedProduct?: string;
+  productJourney?: ProductJourneyItem[];
   gatewayVerification?: GatewayVerification;
   orderCount: number;
   averageOrderValue: number;
@@ -130,11 +155,16 @@ const productNames = (order?: OrderHistoryItem, fallback: string[] = []) => {
   const names = (order?.lineItems?.length ? order.lineItems : order?.products ?? []).map((item) => item.name).filter(Boolean);
   return names.length ? names.join(", ") : fallback.length ? fallback.join(", ") : "the selected product";
 };
+const paidStatuses = new Set(["completed", "processing", "paid"]);
+
+function isPaidOrder(order: OrderHistoryItem) {
+  return order.isPaid || paidStatuses.has(order.status.toLowerCase());
+}
 
 function getOrderType(order: OrderHistoryItem) {
   const status = order.status.toLowerCase();
   const method = `${order.paymentMethod} ${order.paymentMethodTitle}`.toLowerCase();
-  if (order.isPaid) return "Paid";
+  if (isPaidOrder(order)) return "Paid";
   if (status.includes("crypto") || method.includes("crypto")) return "Crypto Attempt";
   if (status === "failed") return "Failed";
   if (status === "on-hold") return "On Hold";
@@ -151,9 +181,30 @@ function badgeClass(type: string) {
   return "border-orange-500/50 bg-orange-500/15 text-orange-200";
 }
 
+function productCategoryLabel(category?: string) {
+  if (category === "base_product") return "Base";
+  if (category === "boost") return "Boost";
+  if (category === "design_or_setup") return "Add-on";
+  return "Other";
+}
+
+function productCategoryBadgeClass(category?: string) {
+  if (category === "base_product") return "border-sky-500/50 bg-sky-500/15 text-sky-200";
+  if (category === "boost") return "border-emerald-500/50 bg-emerald-500/15 text-emerald-200";
+  if (category === "design_or_setup") return "border-fuchsia-500/50 bg-fuchsia-500/15 text-fuchsia-200";
+  return "border-zinc-500/50 bg-zinc-500/15 text-zinc-200";
+}
+
+function listOrDash(values: string[]) {
+  return values.length ? values.join(", ") : "-";
+}
+
 function buildTemplates(customer: CustomerDetail, actualPaid: number, attempted: number, attemptedOrders: OrderHistoryItem[]) {
   const latestAttempt = attemptedOrders[0];
-  const products = productNames(latestAttempt, customer.attemptedProducts ?? customer.lastProducts ?? []);
+  const fallbackProducts = actualPaid > 0
+    ? (customer.paidProducts?.length ? customer.paidProducts : customer.lastProducts ?? [])
+    : (customer.attemptedProducts?.length ? customer.attemptedProducts : customer.lastProducts ?? []);
+  const products = productNames(latestAttempt, fallbackProducts);
   const shortProduct = products.split(",")[0] || products;
   const attemptDate = displayLongDate(latestAttempt?.attemptedDate || latestAttempt?.dateCreated || customer.lastAttemptDate);
   const attemptAmount = money(attempted);
@@ -215,7 +266,7 @@ export default function CustomerDetailPage() {
   const attemptedProductRows = useMemo(() => {
     const rows = new Map<string, { name: string; quantity: number; amount: number; lastAttemptDate: string; status: string; paymentMethod: string }>();
     for (const order of customer?.orders?.filter((item) => item.isAttempted) ?? []) {
-      const items = order.lineItems.length ? order.lineItems : order.products?.length ? order.products : [{ name: "Unknown product", quantity: 1, total: order.total } as OrderLineItem];
+      const items = order.lineItems?.length ? order.lineItems : order.products?.length ? order.products : [{ name: "Unknown product", quantity: 1, total: order.total } as OrderLineItem];
       for (const item of items) {
         const existing = rows.get(item.name);
         const currentDate = order.attemptedDate || order.dateCreated;
@@ -232,23 +283,86 @@ export default function CustomerDetailPage() {
     return Array.from(rows.values()).sort((a, b) => new Date(b.lastAttemptDate).getTime() - new Date(a.lastAttemptDate).getTime());
   }, [customer]);
 
+  const paidProductRows = useMemo(() => {
+    const rows = new Map<string, { name: string; quantity: number; amount: number; lastPaidDate: string; status: string; paymentMethod: string }>();
+    for (const order of customer?.orders?.filter(isPaidOrder) ?? []) {
+      const items = order.lineItems?.length ? order.lineItems : order.products?.length ? order.products : [{ name: "Unknown product", quantity: 1, total: order.total } as OrderLineItem];
+      for (const item of items) {
+        const existing = rows.get(item.name);
+        const currentDate = order.paidDate || order.dateCreated;
+        const itemTotal = Number(item.total ?? 0) || Number(item.price ?? 0) * Number(item.quantity ?? 0);
+        rows.set(item.name, {
+          name: item.name,
+          quantity: (existing?.quantity ?? 0) + Number(item.quantity ?? 0),
+          amount: (existing?.amount ?? 0) + itemTotal,
+          lastPaidDate: !existing || new Date(currentDate).getTime() > new Date(existing.lastPaidDate).getTime() ? currentDate : existing.lastPaidDate,
+          status: order.status,
+          paymentMethod: order.paymentMethodTitle || order.paymentMethod || existing?.paymentMethod || "-",
+        });
+      }
+    }
+
+    if (rows.size === 0 && Number(customer?.paidTotal ?? customer?.totalPaid ?? 0) > 0) {
+      for (const name of customer?.paidProducts ?? []) {
+        rows.set(name, {
+          name,
+          quantity: 0,
+          amount: 0,
+          lastPaidDate: customer?.lastPaidDate || customer?.lastOrderDate || "",
+          status: "timeline not synced",
+          paymentMethod: customer?.lastPaymentMethod || "-",
+        });
+      }
+    }
+
+    return Array.from(rows.values()).sort((a, b) => new Date(b.lastPaidDate).getTime() - new Date(a.lastPaidDate).getTime());
+  }, [customer]);
+
   if (!customer) return <main className="min-h-screen bg-black p-8 text-zinc-300">Loading customer details...</main>;
 
   const orders = [...(customer.orders ?? [])].sort((a, b) => new Date(b.dateCreated).getTime() - new Date(a.dateCreated).getTime());
   const attemptedOrders = orders.filter((order) => order.isAttempted);
+  const paidOrdersFromTimeline = orders.filter(isPaidOrder);
   const actualPaid = Number(customer.paidTotal ?? customer.totalPaid ?? 0);
   const attempted = Number(customer.attemptedTotal ?? 0);
+  const displayedPaidOrderCount = orders.length > 0 ? paidOrdersFromTimeline.length : customer.paidOrderCount ?? 0;
+  const timelineMissingForPaid = actualPaid > 0 && orders.length === 0 && Number(customer.orderCount ?? 0) > 0;
   const templates = buildTemplates(customer, actualPaid, attempted, attemptedOrders);
   const isLead = actualPaid === 0 && attempted > 0;
   const latestRelevantOrder = attemptedOrders[0] ?? orders[0];
   const verification = latestRelevantOrder?.gatewayVerification ?? customer.gatewayVerification;
+  const productJourney = [...(customer.productJourney ?? [])].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+  const baseProductsPurchased = customer.baseProductsPurchased ?? [];
+  const boostProductsPurchased = customer.boostProductsPurchased ?? [];
+  const addOnProductsPurchased = customer.addOnProductsPurchased ?? [];
+  const attemptedBaseProducts = customer.attemptedBaseProducts ?? [];
+  const attemptedBoostProducts = customer.attemptedBoostProducts ?? [];
+  const attemptedAddOnProducts = customer.attemptedAddOnProducts ?? [];
+  const boostAndAddOns = [...boostProductsPurchased, ...addOnProductsPurchased];
+  const classifiedAttemptedProducts = [...attemptedBaseProducts, ...attemptedBoostProducts, ...attemptedAddOnProducts];
+  const attemptedProductSummary = classifiedAttemptedProducts.length ? classifiedAttemptedProducts : customer.attemptedProducts ?? [];
+  const requiresProductReview = isLead && attemptedBoostProducts.length > 0 && baseProductsPurchased.length === 0;
   const plan = isLead
     ? {
         priority: customer.leadUrgency === "very_high" ? "Very High" : "High",
-        bestAction: customer.nextAction || "Call and resend payment link",
+        bestAction: requiresProductReview ? "Manual review: attempted boost without paid base product" : customer.nextAction || "Call and resend payment link",
         goal: "Help complete payment",
-        detail: "Mention the attempted product, offer payment support, and send a secure payment link or invoice. Do not call this lead a paid customer until payment completes.",
+        detail: `Mention attempted products: ${listOrDash(attemptedProductSummary)}. Offer payment support and send a secure payment link or invoice. Do not call this lead a paid customer until payment completes.`,
       }
+    : actualPaid > 0 && baseProductsPurchased.length > 0 && boostProductsPurchased.length > 0
+      ? {
+          priority: "Normal",
+          bestAction: customer.nextAction || "Review retention and cross-sell missing boosts or add-ons",
+          goal: "Retain customer and identify relevant cross-sell",
+          detail: `Base product: ${listOrDash(baseProductsPurchased)}. Purchased boosts/add-ons: ${listOrDash(boostAndAddOns)}. Review missing boosts, add-ons, or support needs.`,
+        }
+      : actualPaid > 0 && baseProductsPurchased.length > 0
+        ? {
+            priority: "Normal",
+            bestAction: customer.nextAction || "Suggest a boost upsell for the base product",
+            goal: "Grow paid customer value",
+            detail: `Base product: ${listOrDash(baseProductsPurchased)}. No purchased boost is recorded yet; suggest a relevant boost or setup add-on.`,
+          }
     : {
         priority: "Normal",
         bestAction: customer.nextAction || "Review upsell or renewal opportunity",
@@ -267,7 +381,7 @@ export default function CustomerDetailPage() {
         {[
           ["Actual Paid", money(actualPaid)],
           ["Attempted Amount", money(attempted)],
-          ["Paid Orders", customer.paidOrderCount ?? 0],
+          ["Paid Orders", displayedPaidOrderCount],
           ["Attempted Orders", customer.attemptedOrderCount ?? 0],
           ["Lead Status", displayStatus(customer.leadStatus)],
           ["Payment Status", displayStatus(customer.paymentStatus)],
@@ -278,6 +392,45 @@ export default function CustomerDetailPage() {
           ["Risk", customer.riskLevel],
           ["Tier", actualPaid > 0 ? customer.tier : "Lead"],
         ].map(([k, v]) => <div key={String(k)} className="rounded-xl border border-zinc-800 bg-zinc-900 p-4"><p className="text-xs font-semibold uppercase text-zinc-400">{k}</p><p className="mt-2 text-xl font-bold">{String(v)}</p></div>)}
+      </section>
+
+      {timelineMissingForPaid && <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-4 text-amber-100">
+        <p className="font-semibold">Timeline not synced yet - run single customer sync</p>
+        <p className="mt-1 text-sm text-amber-100/80">This customer has paid value and historical order count, but no saved WooCommerce order timeline on the selected record.</p>
+      </div>}
+
+      <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+        <h2 className="text-xl font-semibold text-sky-300">Customer Product Journey</h2>
+        <div className="mt-3 grid gap-3 md:grid-cols-4">
+          {[
+            ["First Signup Product", customer.firstSignupProduct || "-"],
+            ["First Signup Date", displayDate(customer.firstSignupDate)],
+            ["First Signup Amount", money(Number(customer.firstSignupAmount ?? 0))],
+            ["Last Purchased Product", customer.lastPurchasedProduct || "-"],
+            ["Base Products", listOrDash(baseProductsPurchased)],
+            ["Boost/Add-ons", listOrDash(boostAndAddOns)],
+            ["Attempted Products", listOrDash(attemptedProductSummary)],
+          ].map(([label, value]) => <div key={label} className="rounded border border-zinc-700 bg-zinc-950 p-3">
+            <p className="text-xs font-semibold uppercase text-zinc-400">{label}</p>
+            <p className="mt-2 text-sm font-semibold text-zinc-100">{value}</p>
+          </div>)}
+        </div>
+        <div className="mt-4 overflow-x-auto rounded border border-zinc-800">
+          <table className="min-w-[1000px] text-sm">
+            <thead className="bg-zinc-950"><tr>{["Date", "Order #", "Product", "Category", "Amount", "Type", "Status", "Payment Method"].map((h) => <th key={h} className="px-3 py-2 text-left text-xs uppercase text-zinc-400">{h}</th>)}</tr></thead>
+            <tbody>{productJourney.map((item, index) => <tr key={`${item.orderNumber}-${item.productName}-${index}`} className="border-t border-zinc-800">
+              <td className="px-3 py-3">{displayDate(item.date)}</td>
+              <td className="px-3 py-3">{item.orderNumber}</td>
+              <td className="px-3 py-3 font-semibold">{item.productName}</td>
+              <td className="px-3 py-3"><span className={`rounded border px-2 py-1 text-xs ${productCategoryBadgeClass(item.category)}`}>{productCategoryLabel(item.category)}</span></td>
+              <td className="px-3 py-3">{money(item.amount)}</td>
+              <td className="px-3 py-3">{displayStatus(item.type)}</td>
+              <td className="px-3 py-3">{displayStatus(item.status)}</td>
+              <td className="px-3 py-3">{item.paymentMethod || "-"}</td>
+            </tr>)}</tbody>
+          </table>
+          {productJourney.length === 0 && <p className="p-3 text-zinc-400">No product journey has been synced for this customer yet.</p>}
+        </div>
       </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
@@ -304,7 +457,20 @@ export default function CustomerDetailPage() {
       </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
-        <h2 className="text-xl font-semibold text-orange-300">Products Attempted</h2>
+        <h2 className="text-xl font-semibold text-emerald-300">Products Purchased</h2>
+        <div className="mt-3 grid gap-3 md:grid-cols-3">{paidProductRows.map((product) => <div key={product.name} className="rounded border border-emerald-500/30 bg-emerald-500/10 p-3">
+          <p className="font-semibold">{product.name}</p>
+          <p className="text-sm text-zinc-300">Qty: {product.quantity || "-"}</p>
+          <p className="text-sm text-zinc-300">Paid: {product.amount > 0 ? money(product.amount) : "-"}</p>
+          <p className="text-sm text-zinc-400">Last paid: {displayDate(product.lastPaidDate)}</p>
+          <p className="text-sm text-zinc-400">Status: {displayStatus(product.status)}</p>
+          <p className="text-sm text-zinc-400">Payment method: {product.paymentMethod}</p>
+        </div>)}</div>
+        {paidProductRows.length === 0 && <p className="mt-2 text-zinc-400">No purchased products found.</p>}
+      </section>
+
+      <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+        <h2 className="text-xl font-semibold text-orange-300">Attempted Products</h2>
         <div className="mt-3 grid gap-3 md:grid-cols-3">{attemptedProductRows.map((product) => <div key={product.name} className="rounded border border-orange-500/30 bg-orange-500/10 p-3">
           <p className="font-semibold">{product.name}</p>
           <p className="text-sm text-zinc-300">Qty: {product.quantity}</p>

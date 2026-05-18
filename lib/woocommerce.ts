@@ -70,7 +70,21 @@ export type WooCommerceFetchResult<T> = {
   pagesFetched: number;
   reachedPageLimit: boolean;
   maxPages: number;
+  partialSync: boolean;
+  warning: string;
+  fetchedByStatus: Record<string, number>;
+  pagesFetchedByStatus: Record<string, number>;
+  failedRequests: Array<{ status: string; page: number; message: string }>;
 };
+
+type WooCommerceFetchOptions = {
+  email?: string;
+  statuses?: string[];
+  maxPages?: number;
+  perPage?: number;
+};
+
+export const wooCommerceOrderStatuses = ["completed", "processing", "pending", "failed", "cancelled", "canceled", "on-hold", "checkout-draft", "refunded"];
 
 function getWooCommerceConfig() {
   if (!WC_STORE_URL || !WC_CONSUMER_KEY || !WC_CONSUMER_SECRET) {
@@ -91,58 +105,119 @@ export function isWooCommerceConfigured() {
   return Boolean(WC_STORE_URL && WC_CONSUMER_KEY && WC_CONSUMER_SECRET);
 }
 
-async function fetchWooCommerceCollection<T>(resource: "customers" | "orders"): Promise<WooCommerceFetchResult<T> | null> {
+function getNumericEnv(name: string, fallback: number) {
+  const value = Number(process.env[name] ?? fallback);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+async function fetchWithTimeout(url: URL, headers: HeadersInit, timeoutMs: number) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      headers,
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchWooCommerceCollection<T>(resource: "customers" | "orders", options: WooCommerceFetchOptions = {}): Promise<WooCommerceFetchResult<T> | null> {
   const config = getWooCommerceConfig();
   if (!config) return null;
 
   const auth = Buffer.from(`${config.consumerKey}:${config.consumerSecret}`).toString("base64");
   const results: T[] = [];
-  const maxPages = Math.max(1, Number(process.env.WC_MAX_PAGES ?? 100));
-  let pagesFetched = 0;
+  const perPage = Math.min(100, Math.max(1, options.perPage ?? getNumericEnv("WC_PER_PAGE", 100)));
+  const maxPages = Math.max(1, options.maxPages ?? getNumericEnv("WC_MAX_PAGES", 25));
+  const timeoutMs = getNumericEnv("WC_REQUEST_TIMEOUT_MS", 12000);
+  const statuses = resource === "orders" ? options.statuses ?? wooCommerceOrderStatuses : [""];
+  const seen = new Set<string>();
+  const fetchedByStatus: Record<string, number> = {};
+  const pagesFetchedByStatus: Record<string, number> = {};
+  const failedRequests: Array<{ status: string; page: number; message: string }> = [];
+  let totalPagesFetched = 0;
   let reachedPageLimit = false;
+  let partialSync = false;
 
-  try {
+  for (const status of statuses) {
+    fetchedByStatus[status || "all"] = 0;
+    pagesFetchedByStatus[status || "all"] = 0;
+
     for (let page = 1; page <= maxPages; page += 1) {
       const url = new URL(`${config.storeUrl}/wp-json/wc/v3/${resource}`);
-      url.searchParams.set("per_page", "100");
+      url.searchParams.set("per_page", String(perPage));
       url.searchParams.set("page", String(page));
-      if (resource === "orders") {
-        url.searchParams.set("status", "any");
+      if (resource === "orders" && status) {
+        url.searchParams.set("status", status);
+      }
+      if (resource === "orders" && options.email) {
+        url.searchParams.set("search", options.email);
       }
 
-      const response = await fetch(url, {
-        headers: {
+      try {
+        const response = await fetchWithTimeout(url, {
           Authorization: `Basic ${auth}`,
           Accept: "application/json",
-        },
-        cache: "no-store",
-      });
+        }, timeoutMs);
 
-      if (!response.ok) {
-        console.warn(`[woocommerce] Failed to fetch ${resource}: ${response.status} ${response.statusText}`);
-        return null;
+        if (!response.ok) {
+          const message = `${response.status} ${response.statusText}`;
+          failedRequests.push({ status: status || "all", page, message });
+          partialSync = true;
+          break;
+        }
+
+        const pageResults = (await response.json()) as T[];
+        totalPagesFetched += 1;
+        pagesFetchedByStatus[status || "all"] = page;
+
+        for (const item of pageResults) {
+          const maybeId = (item as { id?: number | string }).id;
+          const key = maybeId === undefined ? `${status}-${page}-${fetchedByStatus[status || "all"]}` : String(maybeId);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          results.push(item);
+          fetchedByStatus[status || "all"] += 1;
+        }
+
+        if (pageResults.length < perPage) break;
+        if (page === maxPages) {
+          reachedPageLimit = true;
+          partialSync = true;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown WooCommerce request error.";
+        failedRequests.push({ status: status || "all", page, message });
+        partialSync = true;
+        break;
       }
-
-      const pageResults = (await response.json()) as T[];
-      pagesFetched = page;
-      results.push(...pageResults);
-
-      if (pageResults.length < 100) break;
-      if (page === maxPages) reachedPageLimit = true;
     }
-
-    return { items: results, totalFetched: results.length, pagesFetched, reachedPageLimit, maxPages };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown WooCommerce request error.";
-    console.warn(`[woocommerce] Failed to fetch ${resource}. ${message}`);
-    return null;
   }
+
+  const warningParts = [];
+  if (reachedPageLimit) warningParts.push("Partial sync, reached page limit.");
+  if (failedRequests.length > 0) warningParts.push("Partial sync, one or more WooCommerce status pages failed or timed out.");
+  return {
+    items: results,
+    totalFetched: results.length,
+    pagesFetched: totalPagesFetched,
+    reachedPageLimit,
+    maxPages,
+    partialSync,
+    warning: warningParts.join(" "),
+    fetchedByStatus,
+    pagesFetchedByStatus,
+    failedRequests,
+  };
 }
 
 export function fetchWooCommerceCustomers() {
   return fetchWooCommerceCollection<WooCommerceCustomer>("customers");
 }
 
-export function fetchWooCommerceOrders() {
-  return fetchWooCommerceCollection<WooCommerceOrder>("orders");
+export function fetchWooCommerceOrders(options: WooCommerceFetchOptions = {}) {
+  return fetchWooCommerceCollection<WooCommerceOrder>("orders", options);
 }

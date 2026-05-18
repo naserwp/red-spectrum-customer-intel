@@ -30,6 +30,7 @@ const highValueThreshold = 2000;
 const money = (n: number) => `$${n.toFixed(2)}`;
 const paidAmount = (c: Customer) => Number(c.paidTotal ?? c.totalPaid ?? 0);
 const attemptedAmount = (c: Customer) => Number(c.attemptedTotal ?? 0);
+const customerDetailHref = (c: Customer) => `/admin/customers/${encodeURIComponent(c.email || c._id)}`;
 const displayStatus = (value?: string) => value ? value.replaceAll("_", " ") : "-";
 const displayDate = (value?: string) => {
   if (!value) return "-";
@@ -123,7 +124,7 @@ function CustomerTable({ rows, exportCustomerPdf }: { rows: Customer[]; exportCu
           <td className="px-3 py-3">{c.riskLevel}</td>
           <td className="px-3 py-3">{c.score}/{c.stars}</td>
           <td className="truncate px-3 py-3">{c.aiSummaryPreview}</td>
-          <td className="px-3 py-3"><div className="flex gap-2"><Link className="rounded bg-zinc-700 px-2 py-1" href={`/admin/customers/${c._id}`}>View</Link><button onClick={() => exportCustomerPdf(c)} className="rounded bg-red-700 px-2 py-1">PDF</button></div></td>
+          <td className="px-3 py-3"><div className="flex gap-2"><Link className="rounded bg-zinc-700 px-2 py-1" href={customerDetailHref(c)}>View</Link><button onClick={() => exportCustomerPdf(c)} className="rounded bg-red-700 px-2 py-1">PDF</button></div></td>
         </tr>;
       })}</tbody>
     </table>
@@ -169,7 +170,7 @@ function ValueIndex({ rows }: { rows: Customer[] }) {
           <td className="px-3 py-3">{displayDate(c.lastPaidDate || c.lastOrderDate)}</td>
           <td className="px-3 py-3">{money(attemptedAmount(c))}</td>
           <td className="px-3 py-3"><span className={`inline-flex rounded border px-2 py-1 text-xs ${badgeClass[cat]}`}>{categoryLabel[cat]}</span></td>
-          <td className="px-3 py-3"><Link className="rounded bg-zinc-700 px-2 py-1" href={`/admin/customers/${c._id}`}>View</Link></td>
+          <td className="px-3 py-3"><Link className="rounded bg-zinc-700 px-2 py-1" href={customerDetailHref(c)}>View</Link></td>
         </tr>;
       })}</tbody>
     </table>

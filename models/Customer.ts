@@ -72,6 +72,18 @@ export interface CustomerOrderHistoryItem {
   gatewayVerification: GatewayVerification;
 }
 
+export interface CustomerProductJourneyItem {
+  date: string;
+  orderNumber: string;
+  status: string;
+  paymentMethod: string;
+  productName: string;
+  category: "base_product" | "boost" | "design_or_setup" | "other";
+  productType: string;
+  amount: number;
+  type: "paid" | "attempted";
+}
+
 export interface CustomerDocument {
   name: string;
   email: string;
@@ -115,6 +127,19 @@ export interface CustomerDocument {
   lastPaymentMethod: string;
   lastAttemptPaymentMethod: string;
   lastAttemptStatus: string;
+  firstSignupOrderNumber: string;
+  firstSignupDate: string;
+  firstSignupAmount: number;
+  firstSignupProduct: string;
+  baseProductsPurchased: string[];
+  boostProductsPurchased: string[];
+  addOnProductsPurchased: string[];
+  attemptedBaseProducts: string[];
+  attemptedBoostProducts: string[];
+  attemptedAddOnProducts: string[];
+  lastPurchasedProduct: string;
+  lastAttemptedProduct: string;
+  productJourney: CustomerProductJourneyItem[];
   leadUrgency: string;
   recommendedContactMethod: string;
   nextAction: string;
@@ -201,6 +226,21 @@ const customerOrderHistorySchema = new Schema<CustomerOrderHistoryItem>(
   { _id: false }
 );
 
+const customerProductJourneySchema = new Schema<CustomerProductJourneyItem>(
+  {
+    date: { type: String, default: "" },
+    orderNumber: { type: String, default: "" },
+    status: { type: String, default: "" },
+    paymentMethod: { type: String, default: "" },
+    productName: { type: String, default: "" },
+    category: { type: String, enum: ["base_product", "boost", "design_or_setup", "other"], default: "other" },
+    productType: { type: String, default: "Other" },
+    amount: { type: Number, default: 0 },
+    type: { type: String, enum: ["paid", "attempted"], default: "attempted" },
+  },
+  { _id: false }
+);
+
 const customerSchema = new Schema<CustomerDocument>(
   {
     name: { type: String, required: true },
@@ -245,6 +285,19 @@ const customerSchema = new Schema<CustomerDocument>(
     lastPaymentMethod: { type: String, default: "" },
     lastAttemptPaymentMethod: { type: String, default: "" },
     lastAttemptStatus: { type: String, default: "" },
+    firstSignupOrderNumber: { type: String, default: "" },
+    firstSignupDate: { type: String, default: "" },
+    firstSignupAmount: { type: Number, default: 0 },
+    firstSignupProduct: { type: String, default: "" },
+    baseProductsPurchased: { type: [String], default: [] },
+    boostProductsPurchased: { type: [String], default: [] },
+    addOnProductsPurchased: { type: [String], default: [] },
+    attemptedBaseProducts: { type: [String], default: [] },
+    attemptedBoostProducts: { type: [String], default: [] },
+    attemptedAddOnProducts: { type: [String], default: [] },
+    lastPurchasedProduct: { type: String, default: "" },
+    lastAttemptedProduct: { type: String, default: "" },
+    productJourney: { type: [customerProductJourneySchema], default: [] },
     leadUrgency: { type: String, default: "medium" },
     recommendedContactMethod: { type: String, default: "email" },
     nextAction: { type: String, default: "Manual review" },

@@ -8,8 +8,9 @@ import { Subscription } from "@/models/Subscription";
 import { buildSourcePlaceholders, mapWooOrdersToSubscriptions } from "@/lib/subscriptions";
 import { getOrderStatus, isPaidOrder, parseMoney, summarizeWooOrdersForSalesHistory } from "@/lib/businessMetrics";
 import { getGatewayConfigurationSummary, hasConfiguredGateway, verifyOrderPayment } from "@/lib/paymentGateways";
+import { buildProductJourneySummary, type ProductJourneySummary } from "@/lib/productClassification";
 
-type SyncedCustomer = CustomerScoreInput & {
+type SyncedCustomer = CustomerScoreInput & ProductJourneySummary & {
   name: string;
   email: string;
   phone: string;
@@ -52,7 +53,7 @@ type SyncedCustomer = CustomerScoreInput & {
   gatewayVerification: CustomerOrderHistoryItem["gatewayVerification"];
 };
 
-type CustomerAccumulator = Omit<SyncedCustomer, "score" | "stars" | "tier" | "leadStatus" | "paymentStatus" | "aiSummary" | "aiSummaryPreview" | "riskExplanation" | "recommendedAction" | "averageOrderValue" | "estimatedCreditLimit" | "riskLevel" | "lastSyncedAt" | "leadUrgency" | "recommendedContactMethod" | "nextAction" | "gatewayVerification">;
+type CustomerAccumulator = Omit<SyncedCustomer, "score" | "stars" | "tier" | "leadStatus" | "paymentStatus" | "aiSummary" | "aiSummaryPreview" | "riskExplanation" | "recommendedAction" | "averageOrderValue" | "estimatedCreditLimit" | "riskLevel" | "lastSyncedAt" | "leadUrgency" | "recommendedContactMethod" | "nextAction" | "gatewayVerification" | keyof ProductJourneySummary>;
 type RuleSummaryCustomer = Omit<SyncedCustomer, "aiSummary" | "aiSummaryPreview" | "riskExplanation" | "recommendedAction">;
 
 const subscriptionStatuses: CustomerScoreInput["subscriptionStatus"][] = ["active", "inactive", "canceled", "past_due", "unknown"];
@@ -176,6 +177,40 @@ function getNextAction(paidTotal: number, recommendedContactMethod: string, atte
   return "Send checkout recovery email";
 }
 
+function productList(values: string[]) {
+  return values.length > 0 ? values.join(", ") : "selected product";
+}
+
+function getProductAwareNextAction(
+  paidTotal: number,
+  attemptedTotal: number,
+  fallbackNextAction: string,
+  productSummary: ProductJourneySummary
+) {
+  if (paidTotal > 0) {
+    if (productSummary.baseProductsPurchased.length > 0 && productSummary.boostProductsPurchased.length > 0) {
+      return "Review retention and cross-sell missing boosts or add-ons.";
+    }
+    if (productSummary.baseProductsPurchased.length > 0) {
+      return "Suggest a boost upsell for the base product.";
+    }
+    return fallbackNextAction;
+  }
+
+  const attemptedProducts = [
+    ...productSummary.attemptedBaseProducts,
+    ...productSummary.attemptedBoostProducts,
+    ...productSummary.attemptedAddOnProducts,
+  ];
+  if (attemptedTotal > 0 && productSummary.attemptedBoostProducts.length > 0 && productSummary.baseProductsPurchased.length === 0) {
+    return `Requires review: attempted boost without paid base product (${productList(productSummary.attemptedBoostProducts)}).`;
+  }
+  if (attemptedTotal > 0 && attemptedProducts.length > 0) {
+    return `Recover checkout for ${productList(attemptedProducts)}.`;
+  }
+  return fallbackNextAction;
+}
+
 function getSubscriptionStatus(order: WooCommerceOrder): CustomerScoreInput["subscriptionStatus"] {
   const metaValue = order.meta_data?.find((meta) => meta.key?.toLowerCase().includes("subscription_status"))?.value?.toString().toLowerCase();
   if (metaValue && subscriptionStatuses.includes(metaValue as CustomerScoreInput["subscriptionStatus"])) return metaValue as CustomerScoreInput["subscriptionStatus"];
@@ -282,8 +317,8 @@ async function transformOrdersToCustomers(orders: WooCommerceOrder[]) {
       attemptedTotal: (existing?.attemptedTotal ?? 0) + attemptedAmount,
       totalPaid: (existing?.paidTotal ?? 0) + paidAmount,
       orderCount: (existing?.orderCount ?? 0) + 1,
-      paidOrderCount: (existing?.paidOrderCount ?? 0) + (paidAmount > 0 ? 1 : 0),
-      attemptedOrderCount: (existing?.attemptedOrderCount ?? 0) + (attemptedAmount > 0 ? 1 : 0),
+      paidOrderCount: (existing?.paidOrderCount ?? 0) + (isPaidOrder(order) ? 1 : 0),
+      attemptedOrderCount: (existing?.attemptedOrderCount ?? 0) + (!isPaidOrder(order) ? 1 : 0),
       firstOrderDate: !existing ? orderDate : new Date(orderDate) < new Date(existing.firstOrderDate) ? orderDate : existing.firstOrderDate,
       lastOrderDate: isLatest || !existing ? orderDate : existing.lastOrderDate,
       lastPaidDate: isLatestPaid ? orderDate : existing?.lastPaidDate ?? "",
@@ -312,12 +347,16 @@ async function transformOrdersToCustomers(orders: WooCommerceOrder[]) {
     const averageOrderValue = customer.paidOrderCount > 0 ? customer.paidTotal / customer.paidOrderCount : 0;
     const estimatedCreditLimit = customer.paidTotal > 0 ? estimateCreditLimit(customer.paidTotal, customer.paidOrderCount, customer.failedPayments, customer.refunds, score) : 0;
     const sortedOrders = [...customer.orders].sort((a, b) => new Date(b.dateCreated).getTime() - new Date(a.dateCreated).getTime());
+    const productSummary = buildProductJourneySummary(sortedOrders);
     const leadUrgency = getLeadUrgency(customer.paidTotal, customer.attemptedTotal, customer.attemptedOrderCount, customer.lastAttemptDate);
     const recommendedContactMethod = getRecommendedContactMethod(customer.phone, leadUrgency, customer.paidTotal);
+    const nextAction = getNextAction(customer.paidTotal, recommendedContactMethod, customer.attemptedTotal);
+    const productAwareNextAction = getProductAwareNextAction(customer.paidTotal, customer.attemptedTotal, nextAction, productSummary);
     const gatewayVerification = sortedOrders.find((order) => order.gatewayVerification?.matched)?.gatewayVerification ?? sortedOrders[0]?.gatewayVerification;
     const baseCustomer = {
       ...customer,
       orders: sortedOrders,
+      ...productSummary,
       totalPaid: customer.paidTotal,
       averageOrderValue,
       estimatedCreditLimit,
@@ -330,7 +369,7 @@ async function transformOrdersToCustomers(orders: WooCommerceOrder[]) {
       stars: scoreToStars(score),
       leadUrgency,
       recommendedContactMethod,
-      nextAction: getNextAction(customer.paidTotal, recommendedContactMethod, customer.attemptedTotal),
+      nextAction: productAwareNextAction,
       gatewayVerification: gatewayVerification ?? {
         provider: "",
         matched: false,
@@ -348,7 +387,7 @@ async function transformOrdersToCustomers(orders: WooCommerceOrder[]) {
       },
     };
     const aiSummary = buildRuleBasedSummary(baseCustomer);
-    return { ...baseCustomer, ...aiSummary };
+    return { ...baseCustomer, ...aiSummary, recommendedAction: productAwareNextAction };
   }));
 }
 
@@ -408,6 +447,7 @@ export async function POST() {
   const customersWithAttemptedTimeline = customers.filter((customer) => customer.orders.some((order) => order.isAttempted)).length;
   const customersWithAttemptedProducts = customers.filter((customer) => customer.attemptedProducts.length > 0).length;
   const customersWithPaidProducts = customers.filter((customer) => customer.paidProducts.length > 0).length;
+  const customersWithProductJourney = customers.filter((customer) => customer.productJourney.length > 0).length;
   const gatewayConfiguration = getGatewayConfigurationSummary();
 
   return NextResponse.json({
@@ -430,12 +470,16 @@ export async function POST() {
     customersWithAttemptedTimeline,
     customersWithAttemptedProducts,
     customersWithPaidProducts,
+    customersWithProductJourney,
     gatewayVerificationChecked: orders.length,
     gatewayVerificationConfigured: hasConfiguredGateway(),
     gatewayConfiguration,
     pagesFetched: orderResult.pagesFetched,
-    partialSync: orderResult.reachedPageLimit,
-    warning: orderResult.reachedPageLimit ? "Partial sync, reached page limit." : "",
+    partialSync: orderResult.partialSync,
+    warning: orderResult.warning || (orderResult.reachedPageLimit ? "Partial sync, reached page limit." : ""),
+    fetchedByStatus: orderResult.fetchedByStatus,
+    pagesFetchedByStatus: orderResult.pagesFetchedByStatus,
+    failedRequests: orderResult.failedRequests,
     subscriptionsSynced: allSubscriptions.length,
     subscriptionCandidatesSynced: wooSubscriptions.filter((sub) => sub.recordType === "subscription_candidate").length,
     realSubscriptionsSynced: wooSubscriptions.filter((sub) => sub.recordType === "subscription").length,
