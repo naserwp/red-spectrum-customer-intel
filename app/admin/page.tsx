@@ -72,6 +72,15 @@ type SyncRunResult = {
   message?: string;
 };
 
+type SyncLastRun = {
+  action: string;
+  status: string;
+  ordersImported: number;
+  customersUpdated: number;
+  warnings: string[];
+  lastRunTime: string;
+};
+
 const tabs = ["Overview", "Customers", "Subscriptions", "Upcoming Bills", "High Value", "Hot Leads", "Risk Review", "Gateway Analytics", "5-Year Sales", "Sync Center"] as const;
 const pageSizes = [25, 50, 100] as const;
 const highValueThreshold = 2000;
@@ -469,6 +478,8 @@ export default function AdminPage() {
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [syncResult, setSyncResult] = useState<SyncRunResult | null>(null);
+  const [syncLastRun, setSyncLastRun] = useState<SyncLastRun | null>(null);
+  const [importedOrdersCount, setImportedOrdersCount] = useState(0);
   const [tab, setTab] = useState<(typeof tabs)[number]>("Overview");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState<(typeof pageSizes)[number]>(25);
@@ -572,7 +583,7 @@ export default function AdminPage() {
 
   const runOrderBackfill = async (dryRun: boolean) => {
     setError("");
-    setMessage(dryRun ? "Dry run backfill in progress..." : "WooCommerce order backfill in progress...");
+    setMessage(dryRun ? "Testing WooCommerce order import..." : "Importing WooCommerce orders...");
     const res = await fetch("/api/woocommerce/backfill-orders", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -587,13 +598,30 @@ export default function AdminPage() {
     const data = await res.json();
     setSyncResult(data);
     if (!res.ok) return setError(data.error || "Backfill failed");
-    setMessage(`${dryRun ? "Dry run backfill" : "Order backfill"} completed. Orders fetched: ${data.ordersFetched ?? 0}. Orders imported: ${data.ordersUpserted ?? 0}.`);
+    const ordersImported = Number(data.ordersUpserted ?? 0);
+    if (!dryRun) setImportedOrdersCount(ordersImported);
+    const successMessage = dryRun
+      ? "Test complete. WooCommerce connection is working."
+      : `Imported ${ordersImported} WooCommerce orders.`;
+    setMessage(successMessage);
+    setSyncLastRun({
+      action: dryRun ? "Test WooCommerce Order Import" : "Import WooCommerce Orders",
+      status: data.partialSync ? "Completed with warnings" : "Completed",
+      ordersImported: dryRun ? 0 : ordersImported,
+      customersUpdated: 0,
+      warnings: data.warnings ?? [],
+      lastRunTime: new Date().toLocaleString(),
+    });
     await loadDashboardData();
   };
 
   const runCustomerRebuild = async (dryRun: boolean) => {
     setError("");
-    setMessage(dryRun ? "Dry run rebuild in progress..." : "Customer rebuild in progress...");
+    if (!dryRun && importedOrdersCount === 0) {
+      setError("Run Import WooCommerce Orders before updating customer profiles. If this is a new browser session, run Test WooCommerce Order Import first to confirm available orders.");
+      return;
+    }
+    setMessage(dryRun ? "Previewing customer profile update..." : "Updating customer profiles...");
     const res = await fetch("/api/customers/rebuild-from-orders", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -608,7 +636,21 @@ export default function AdminPage() {
     const data = await res.json();
     setSyncResult(data);
     if (!res.ok) return setError(data.error || "Customer rebuild failed");
-    setMessage(data.message || "Customer rebuild completed.");
+    const customersUpdated = Number(data.customersRebuilt ?? data.dryRunCustomersMatched ?? 0);
+    const successMessage = dryRun
+      ? `Preview complete. ${customersUpdated} customer profiles can be updated.`
+      : customersUpdated === 0
+        ? "Updated 0 customer profiles. This usually means no WooCommerce orders were imported yet."
+        : `Updated ${customersUpdated} customer profiles.`;
+    setMessage(successMessage);
+    setSyncLastRun({
+      action: dryRun ? "Preview Customer Profile Update" : "Update Customer Profiles",
+      status: data.partialSync ? "Completed with warnings" : "Completed",
+      ordersImported: 0,
+      customersUpdated: dryRun ? 0 : customersUpdated,
+      warnings: data.warnings ?? [],
+      lastRunTime: new Date().toLocaleString(),
+    });
     await loadCustomers(1);
     await loadDashboardData();
   };
@@ -718,25 +760,47 @@ export default function AdminPage() {
       {tab === "Sync Center" && <section className="space-y-4 rounded-xl border border-zinc-800 bg-zinc-900/70 p-5">
         <div>
           <h2 className="mb-2 text-xl font-semibold text-red-300">Sync Center</h2>
-          <p className="text-sm text-zinc-400">Bulk backfill imports WooCommerce orders first. Customer rebuild aggregates from stored order records so the database is not built by one customer search at a time.</p>
+          <p className="text-sm text-zinc-400">Use this workflow to bring WooCommerce order history into Red Spectrum and update customer reporting from imported orders.</p>
+        </div>
+        <div className="grid gap-3 md:grid-cols-3">
+          <div className="rounded-xl border border-red-950/50 bg-zinc-950 p-4">
+            <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Step 1</p>
+            <h3 className="mt-2 font-semibold text-white">Test WooCommerce Order Import</h3>
+            <p className="mt-2 text-sm text-zinc-400">Checks WooCommerce connection and estimates how many orders can be imported. No data is saved.</p>
+          </div>
+          <div className="rounded-xl border border-red-950/50 bg-zinc-950 p-4">
+            <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Step 2</p>
+            <h3 className="mt-2 font-semibold text-white">Import WooCommerce Orders</h3>
+            <p className="mt-2 text-sm text-zinc-400">Imports WooCommerce order history into the internal database. This is the source of truth for customer reporting.</p>
+          </div>
+          <div className="rounded-xl border border-red-950/50 bg-zinc-950 p-4">
+            <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Step 3</p>
+            <h3 className="mt-2 font-semibold text-white">Update Customer Profiles</h3>
+            <p className="mt-2 text-sm text-zinc-400">Rebuilds customer profiles, paid revenue, attempted checkout pipeline, hot leads, and product history from imported orders.</p>
+          </div>
+        </div>
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-100">
+          <p>Run Step 1 first when testing. Run Step 2 before Step 3. If Step 3 shows 0 customers rebuilt, it usually means no WooCommerce orders were imported yet. Single Customer Repair Sync is only for debugging one customer, not for full database updates.</p>
         </div>
         <div className="flex flex-wrap gap-3">
-          <button onClick={() => runOrderBackfill(false)} className="rounded bg-red-600 px-5 py-3 font-semibold hover:bg-red-500">Backfill WooCommerce Orders</button>
-          <button onClick={() => runCustomerRebuild(false)} className="rounded bg-emerald-700 px-5 py-3 font-semibold hover:bg-emerald-600">Rebuild Customers From Orders</button>
-          <button onClick={() => runOrderBackfill(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Dry Run Backfill</button>
-          <button onClick={() => runCustomerRebuild(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Dry Run Rebuild</button>
-          <button onClick={syncWooCommerce} className="rounded bg-zinc-800 px-5 py-3 font-semibold text-zinc-200 hover:bg-zinc-700">Legacy WooCommerce Sync</button>
+          <button onClick={() => runOrderBackfill(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Test WooCommerce Order Import</button>
+          <button onClick={() => runOrderBackfill(false)} className="rounded bg-red-600 px-5 py-3 font-semibold hover:bg-red-500">Import WooCommerce Orders</button>
+          <button onClick={() => runCustomerRebuild(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Preview Customer Profile Update</button>
+          <button disabled={importedOrdersCount === 0} onClick={() => runCustomerRebuild(false)} className="rounded bg-emerald-700 px-5 py-3 font-semibold hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50">Update Customer Profiles</button>
+          <button onClick={syncWooCommerce} className="rounded bg-zinc-800 px-5 py-3 font-semibold text-zinc-200 hover:bg-zinc-700">Single Customer Repair Sync</button>
         </div>
-        <p className="text-sm text-zinc-400">Single Customer Repair Sync is now intended only for targeted debug/repair work, not database-wide customer creation.</p>
+        {importedOrdersCount === 0 && <p className="text-sm text-zinc-400">Update Customer Profiles is disabled until this page has imported WooCommerce orders. Run Import WooCommerce Orders first.</p>}
         <div className="grid gap-3 md:grid-cols-4">
-          <Card label="Job Status" value={syncResult ? syncResult.dryRun ? "Dry Run Complete" : "Complete" : "Idle"} />
-          <Card label="Pages Fetched" value={Number(syncResult?.pagesFetched ?? 0)} />
-          <Card label="Orders Imported" value={Number(syncResult?.ordersUpserted ?? 0)} />
-          <Card label="Customers Rebuilt" value={Number(syncResult?.customersRebuilt ?? syncResult?.dryRunCustomersMatched ?? 0)} />
+          <Card label="Last Action" value={syncLastRun?.action ?? "None"} />
+          <Card label="Job Status" value={syncLastRun?.status ?? "Idle"} />
+          <Card label="Orders Imported" value={syncLastRun?.ordersImported ?? 0} />
+          <Card label="Customers Updated" value={syncLastRun?.customersUpdated ?? 0} />
         </div>
-        {syncResult?.warnings?.length ? <p className="rounded border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100">{syncResult.warnings.slice(0, 5).join(" ")}</p> : null}
+        <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 text-sm text-zinc-300">
+          <p><span className="font-semibold text-zinc-100">Last run time:</span> {syncLastRun?.lastRunTime ?? "-"}</p>
+          <p className="mt-2"><span className="font-semibold text-zinc-100">Warnings:</span> {syncLastRun?.warnings?.length ? syncLastRun.warnings.slice(0, 5).join(" ") : "-"}</p>
+        </div>
         {syncResult?.failedRequests?.length ? <p className="rounded border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-100">Failed requests: {syncResult.failedRequests.length}</p> : null}
-        <p className="text-sm text-zinc-500">Last run: {syncResult ? new Date().toLocaleString() : "-"}</p>
       </section>}
     </div>
   </main>;
