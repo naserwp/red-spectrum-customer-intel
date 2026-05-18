@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
-import { isInRange, isRealSubscriptionRecord } from "@/lib/businessMetrics";
+import { isInRange } from "@/lib/businessMetrics";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Customer, type CustomerDocument, type CustomerProductJourneyItem } from "@/models/Customer";
-import { Subscription, type SubscriptionDocument } from "@/models/Subscription";
+import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
+
+type LeanWooSubscription = WooCommerceSubscriptionDocument & { _id: unknown };
 
 function isBusinessBuilderProduct(name: string) {
   const normalized = name.toLowerCase();
@@ -40,16 +42,35 @@ export async function GET() {
   const now = new Date();
   const next30 = new Date(now.getTime() + 30 * 86400000);
   const [subs, customers] = await Promise.all([
-    Subscription.find({ status: "active", isPlaceholder: { $ne: true }, sourceStatus: "real", recordType: "subscription" }).sort({ nextBillingDate: 1 }).lean<SubscriptionDocument[]>(),
+    WooCommerceSubscriptionRecord.find({ status: "active", nextPaymentDate: { $ne: "" } }).sort({ nextPaymentDate: 1 }).lean<LeanWooSubscription[]>(),
     Customer.find({ paidOrderCount: { $gt: 1 } }, { name: 1, email: 1, productJourney: 1, lastPaidDate: 1 }).lean<CustomerDocument[]>(),
   ]);
-  const rows = subs.filter((sub) => isRealSubscriptionRecord(sub) && isInRange(sub.nextBillingDate ?? "", now, next30));
-  const highRisk = rows.filter((r) => (r.failedPaymentCount ?? 0) > 0 || r.status === "pending" || r.status === "past_due");
+  const rows = subs.filter((sub) => isInRange(sub.nextPaymentDate ?? "", now, next30)).map((record) => ({
+    _id: String(record._id),
+    subscriptionId: String(record.wooSubscriptionId),
+    subscriptionNumber: record.subscriptionNumber,
+    source: "woocommerce",
+    customerEmail: record.customerEmail,
+    customerName: record.customerName,
+    customerPhone: record.customerPhone,
+    status: record.status,
+    amount: record.amount,
+    monthlyRecurringRevenue: record.amount,
+    billingInterval: [record.billingInterval, record.billingPeriod].filter(Boolean).join(" "),
+    nextBillingDate: record.nextPaymentDate,
+    lastBillingDate: record.lastPaymentDate,
+    startDate: record.startDate,
+    paymentMethodTitle: record.paymentMethodTitle || record.paymentMethod,
+    productNames: record.productNames,
+    sourceStatus: "real",
+    recordType: "subscription",
+  }));
+  const highRisk = rows.filter((r) => r.status === "pending" || r.status === "on-hold");
   return NextResponse.json({
     rows,
     recurringCandidates: recurringCandidates(customers),
     highRiskCount: highRisk.length,
     estimatedUpcomingRevenue: rows.reduce((a, r) => a + (r.amount ?? 0), 0),
-    message: rows.length === 0 ? "No active subscriptions with a next billing date are available yet. Import orders and connect subscription source data to populate this tab." : "",
+    message: subs.length === 0 ? "No WooCommerce subscription records imported yet. Go to Sync Center and run Import WooCommerce Subscriptions." : rows.length === 0 ? "No active subscriptions with a next billing date are available in the next 30 days." : "",
   });
 }

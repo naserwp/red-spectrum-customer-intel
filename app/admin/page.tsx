@@ -18,7 +18,7 @@ type Customer = {
 type Subscription = {
   _id?: string; subscriptionId: string; source: string; customerEmail: string; customerName: string; status: string; amount: number;
   monthlyRecurringRevenue?: number; billingInterval?: string; nextBillingDate?: string; lastBillingDate?: string; failedPaymentCount?: number;
-  lastPaymentStatus?: string; sourceStatus?: string; recordType?: string;
+  lastPaymentStatus?: string; sourceStatus?: string; recordType?: string; productNames?: string[]; startDate?: string; paymentMethodTitle?: string;
 };
 
 type RecurringCandidate = {
@@ -75,6 +75,8 @@ type SyncRunResult = {
   pagesFetched?: number;
   ordersFetched?: number;
   ordersUpserted?: number;
+  subscriptionsFetched?: number;
+  subscriptionsUpserted?: number;
   customersRebuilt?: number;
   dryRunCustomersMatched?: number;
   customersSkippedSmallerHistory?: number;
@@ -87,6 +89,7 @@ type SyncLastRun = {
   action: string;
   status: string;
   ordersImported: number;
+  subscriptionsImported?: number;
   customersUpdated: number;
   warnings: string[];
   lastRunTime: string;
@@ -263,36 +266,36 @@ function RecurringCandidatesTable({ rows }: { rows: RecurringCandidate[] }) {
 }
 
 function SubscriptionTable({ rows }: { rows: Subscription[] }) {
+  if (rows.length === 0) return <p className="rounded-xl border border-zinc-800 bg-zinc-900 p-4 text-zinc-400">No subscription records found.</p>;
   return <div className="overflow-x-auto rounded-xl border border-zinc-800">
     <table className="min-w-[1200px] text-sm">
-      <thead className="sticky top-0 bg-zinc-950"><tr>{["Customer", "Type", "Source", "Status", "Amount", "MRR", "Next Bill", "Last Bill", "Failed", "Last Payment"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
+      <thead className="sticky top-0 bg-zinc-950"><tr>{["Customer", "Product", "Status", "Amount", "MRR", "Start Date", "Next Payment", "Last Payment", "Payment Method", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
       <tbody>{rows.map((s) => {
-        const isCandidate = s.recordType === "subscription_candidate" || s.sourceStatus === "candidate";
         return <tr key={s._id ?? s.subscriptionId} className="border-t border-zinc-800">
           <td className="px-3 py-3"><p className="font-semibold">{s.customerName || "-"}</p><p className="text-xs text-zinc-400">{s.customerEmail}</p></td>
-          <td className="px-3 py-3">{isCandidate ? "Subscription Candidate" : "Active Subscription"}</td>
-          <td className="px-3 py-3">{s.source}</td>
+          <td className="px-3 py-3">{s.productNames?.join(", ") || s.source}</td>
           <td className="px-3 py-3">{displayStatus(s.status)}</td>
           <td className="px-3 py-3">{money(Number(s.amount ?? 0))}</td>
           <td className="px-3 py-3">{money(Number(s.monthlyRecurringRevenue ?? 0))}</td>
+          <td className="px-3 py-3">{displayDate(s.startDate)}</td>
           <td className="px-3 py-3">{displayDate(s.nextBillingDate)}</td>
           <td className="px-3 py-3">{displayDate(s.lastBillingDate)}</td>
-          <td className="px-3 py-3">{s.failedPaymentCount ?? 0}</td>
-          <td className="px-3 py-3">{displayStatus(s.lastPaymentStatus)}</td>
+          <td className="px-3 py-3">{displayStatus(s.paymentMethodTitle || s.lastPaymentStatus)}</td>
+          <td className="px-3 py-3"><Link className="rounded bg-zinc-700 px-2 py-1" href={`/admin/customers/${encodeURIComponent(s.customerEmail || s.subscriptionId)}`}>View</Link></td>
         </tr>;
       })}</tbody>
     </table>
   </div>;
 }
 
-function ValueIndex({ rows }: { rows: Customer[] }) {
+function ValueIndex({ rows, rankOffset = 0 }: { rows: Customer[]; rankOffset?: number }) {
   return <div className="overflow-x-auto rounded-xl border border-zinc-800">
     <table className="min-w-[1150px] text-sm">
       <thead className="sticky top-0 bg-zinc-950"><tr>{["Rank", "Customer", "Customer Lifetime Value", "Start", "Paid Months", "Stay With Us", "Last Paid", "Attempted Pipeline", "Category", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
       <tbody>{rows.map((c, index) => {
         const cat = getCustomerCategory(c);
         return <tr key={c._id} className="border-t border-zinc-800">
-          <td className="px-3 py-3 font-semibold">#{index + 1}</td>
+          <td className="px-3 py-3 font-semibold">#{rankOffset + index + 1}</td>
           <td className="px-3 py-3"><p className="font-semibold">{c.name}</p><p className="text-xs text-zinc-400">{c.email}</p></td>
           <td className="px-3 py-3 font-semibold">{money(paidAmount(c))}</td>
           <td className="px-3 py-3">{displayDate(c.firstOrderDate)}</td>
@@ -673,6 +676,40 @@ export default function AdminPage() {
     await loadDashboardData();
   };
 
+  const runSubscriptionBackfill = async (dryRun: boolean) => {
+    setError("");
+    setMessage(dryRun ? "Testing WooCommerce subscription import..." : "Importing WooCommerce subscriptions...");
+    const res = await fetch("/api/woocommerce/backfill-subscriptions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        perPage: 100,
+        maxPages: 100,
+        dryRun,
+      }),
+    });
+    const data = await res.json();
+    setSyncResult(data);
+    if (!res.ok) return setError(data.error || "Subscription import failed");
+    const subscriptionsImported = Number(data.subscriptionsUpserted ?? 0);
+    const successMessage = dryRun
+      ? "Test complete. WooCommerce subscription connection is working."
+      : data.partialSync && Number(data.subscriptionsFetched ?? 0) === 0
+        ? "No WooCommerce subscriptions were imported. Check warnings for endpoint availability."
+        : `Imported ${subscriptionsImported} WooCommerce subscriptions.`;
+    setMessage(successMessage);
+    setSyncLastRun({
+      action: dryRun ? "Test WooCommerce Subscription Import" : "Import WooCommerce Subscriptions",
+      status: data.partialSync ? "Completed with warnings" : "Completed",
+      ordersImported: 0,
+      subscriptionsImported: dryRun ? 0 : subscriptionsImported,
+      customersUpdated: 0,
+      warnings: data.warnings ?? [],
+      lastRunTime: new Date().toLocaleString(),
+    });
+    await loadDashboardData();
+  };
+
   const runCustomerRebuild = async (dryRun: boolean) => {
     setError("");
     if (!dryRun && importedOrdersCount === 0) {
@@ -788,7 +825,11 @@ export default function AdminPage() {
           <Card label="New Hot Leads This Month" value={Number(summary.newHotLeadsThisMonth ?? 0)} helper="Customers who attempted checkout but did not complete payment" />
           <Card label="High Value This Month" value={Number(summary.highValueCustomersThisMonth ?? 0)} helper={`Paid customers at or above ${money(highValueThreshold)}`} />
         </section>
-        <section className="space-y-3"><h2 className="text-xl font-semibold text-zinc-100">High-To-Low Customer Value</h2><ValueIndex rows={highValueRows.length ? highValueRows.slice(0, 10) : customers.slice(0, 10)} /></section>
+        <section className="space-y-3">
+          <h2 className="text-xl font-semibold text-zinc-100">High-To-Low Customer Value</h2>
+          <ValueIndex rows={customers} rankOffset={(page - 1) * pageSize} />
+          <Pager start={customerStart} end={customerEnd} total={total} page={page} maxPage={customerMaxPage} setPage={loadCustomers} />
+        </section>
       </>}
 
       {tab === "Customers" && <><CustomerTable rows={customers} exportCustomerPdf={exportCustomerPdf} /><Pager start={customerStart} end={customerEnd} total={total} page={page} maxPage={customerMaxPage} setPage={loadCustomers} /></>}
@@ -796,11 +837,15 @@ export default function AdminPage() {
       {tab === "Subscriptions" && <>
         <section className="grid gap-3 sm:grid-cols-3"><Card label="Total Subscriptions" value={Number(summary.totalSubscriptions ?? 0)} helper="Excludes placeholders and candidates" /><Card label="MRR" value={money(Number(summary.monthlyRecurringRevenue ?? 0))} helper="Active real subscriptions only" /><Card label="Subscription Candidates" value={Number(summary.subscriptionCandidates ?? 0)} helper="Recurring-like WooCommerce orders, not active subscriptions" /></section>
         <h2 className="text-xl font-semibold text-zinc-100">Active Subscriptions</h2><SubscriptionTable rows={subPage.rows} /><Pager {...subPage} />
-        <h2 className="text-xl font-semibold text-zinc-100">Subscription Candidates</h2><SubscriptionTable rows={candidatePage.rows} /><Pager {...candidatePage} />
+        <div>
+          <h2 className="text-xl font-semibold text-zinc-100">Subscription Candidates</h2>
+          <p className="mt-1 text-sm text-zinc-400">Subscription Candidates are recurring-like WooCommerce orders, not confirmed active subscriptions.</p>
+        </div>
+        <SubscriptionTable rows={candidatePage.rows} /><Pager {...candidatePage} />
       </>}
 
       {tab === "Upcoming Bills" && <>
-        <section className="grid gap-3 sm:grid-cols-3"><Card label="Upcoming 30D" value={Number(summary.upcomingBills30d ?? 0)} helper="Active subscriptions with real next billing date" /><Card label="Est. Upcoming Revenue" value={money(Number(summary.estimatedUpcomingRevenue30d ?? 0))} /><Card label="High Risk Upcoming" value={Number(upcomingMeta.highRiskCount ?? 0)} /></section>
+        <section className="grid gap-3 sm:grid-cols-3"><Card label="Upcoming 30D" value={Number(summary.upcomingBills30d ?? 0)} helper="Active subscriptions with real next billing date" /><Card label="Estimated Upcoming Revenue" value={money(Number(summary.estimatedUpcomingRevenue30d ?? 0))} /><Card label="High Risk Upcoming" value={Number(upcomingMeta.highRiskCount ?? 0)} /></section>
         <section className="space-y-3">
           <h2 className="text-xl font-semibold text-zinc-100">Active Subscriptions With Next Billing Date</h2>
           {typeof upcomingMeta.message === "string" && upcomingMeta.message && <p className="rounded border border-zinc-800 bg-zinc-900 p-3 text-zinc-400">{upcomingMeta.message}</p>}
@@ -815,7 +860,10 @@ export default function AdminPage() {
 
       {tab === "High Value" && <><Card label="High Value Paid Customers" value={Number(summary.highValueCustomers ?? 0)} helper="Unpaid leads excluded" /><ValueIndex rows={highValuePage.rows} /><Pager {...highValuePage} /></>}
 
-      {tab === "Hot Leads" && <><Card label="Hot Checkout Leads" value={hotLeadRows.length} helper="Unpaid checkout/payment attempts and newer failed attempts after last paid order" /><HotLeadsTable rows={hotLeadPage.rows} /><Pager {...hotLeadPage} /></>}
+      {tab === "Hot Leads" && <>
+        <section className="grid gap-3 sm:grid-cols-3"><Card label="Hot Checkout Leads" value={hotLeadRows.length} helper="Unpaid checkout/payment attempts and newer failed attempts after last paid order" /><Card label="Attempted Pipeline" value={money(hotLeadRows.reduce((sum, row) => sum + attemptedAmount(row), 0))} /><Card label="Failed/Pending Attempts This Month" value={Number(summary.failedCheckoutAttemptsThisMonth ?? 0)} /></section>
+        <HotLeadsTable rows={hotLeadPage.rows} /><Pager {...hotLeadPage} />
+      </>}
 
       {tab === "Risk Review" && <><section className="grid gap-3 sm:grid-cols-4"><Card label="Risk Customers" value={riskDisplayRows.length} /><Card label="Failed Payments Total" value={Number(summary.failedPaymentsTotal ?? 0)} /><Card label="Failed Payments Last 30D" value={Number(summary.failedPaymentsLast30Days ?? 0)} /><Card label="Failed Checkout Attempts This Month" value={Number(summary.failedCheckoutAttemptsThisMonth ?? 0)} /></section><CustomerTable rows={riskPage.rows} exportCustomerPdf={exportCustomerPdf} /><Pager {...riskPage} /></>}
 
@@ -826,33 +874,40 @@ export default function AdminPage() {
       {tab === "Sync Center" && <section className="space-y-4 rounded-xl border border-zinc-800 bg-zinc-900/70 p-5">
         <div>
           <h2 className="mb-2 text-xl font-semibold text-red-300">Sync Center</h2>
-          <p className="text-sm text-zinc-400">Use this workflow to bring WooCommerce order history into Red Spectrum and update customer reporting from imported orders.</p>
+          <p className="text-sm text-zinc-400">Use this workflow to bring WooCommerce orders and subscriptions into Red Spectrum before reviewing customer reporting.</p>
         </div>
-        <div className="grid gap-3 md:grid-cols-3">
+        <div className="grid gap-3 md:grid-cols-4">
           <div className="rounded-xl border border-red-950/50 bg-zinc-950 p-4">
             <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Step 1</p>
-            <h3 className="mt-2 font-semibold text-white">Test WooCommerce Order Import</h3>
-            <p className="mt-2 text-sm text-zinc-400">Checks WooCommerce connection and estimates how many orders can be imported. No data is saved.</p>
+            <h3 className="mt-2 font-semibold text-white">Import WooCommerce Orders</h3>
+            <p className="mt-2 text-sm text-zinc-400">Imports WooCommerce order history into the internal database for customer reporting.</p>
           </div>
           <div className="rounded-xl border border-red-950/50 bg-zinc-950 p-4">
             <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Step 2</p>
-            <h3 className="mt-2 font-semibold text-white">Import WooCommerce Orders</h3>
-            <p className="mt-2 text-sm text-zinc-400">Imports WooCommerce order history into the internal database. This is the source of truth for customer reporting.</p>
+            <h3 className="mt-2 font-semibold text-white">Update Customer Profiles</h3>
+            <p className="mt-2 text-sm text-zinc-400">Rebuilds paid revenue, attempted checkout pipeline, hot leads, and product history from imported orders.</p>
           </div>
           <div className="rounded-xl border border-red-950/50 bg-zinc-950 p-4">
             <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Step 3</p>
-            <h3 className="mt-2 font-semibold text-white">Update Customer Profiles</h3>
-            <p className="mt-2 text-sm text-zinc-400">Rebuilds customer profiles, paid revenue, attempted checkout pipeline, hot leads, and product history from imported orders.</p>
+            <h3 className="mt-2 font-semibold text-white">Import WooCommerce Subscriptions</h3>
+            <p className="mt-2 text-sm text-zinc-400">Imports real WooCommerce Subscriptions records, including active status and next payment dates.</p>
+          </div>
+          <div className="rounded-xl border border-red-950/50 bg-zinc-950 p-4">
+            <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Step 4</p>
+            <h3 className="mt-2 font-semibold text-white">Review Dashboard</h3>
+            <p className="mt-2 text-sm text-zinc-400">Review Overview, Hot Leads, Subscriptions, and Upcoming Bills after imports finish.</p>
           </div>
         </div>
         <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-100">
-          <p>Run Step 1 first when testing. Run Step 2 before Step 3. If Step 3 shows 0 customers rebuilt, it usually means no WooCommerce orders were imported yet. Single Customer Repair Sync is only for debugging one customer, not for full database updates.</p>
+          <p>Use Test buttons first when checking connections. Run Import WooCommerce Orders before Update Customer Profiles. Run Import WooCommerce Subscriptions before reviewing Active Subscriptions and Upcoming Bills. Single Customer Repair Sync is only for debugging one customer, not for full database updates.</p>
         </div>
         <div className="flex flex-wrap gap-3">
           <button onClick={() => runOrderBackfill(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Test WooCommerce Order Import</button>
           <button onClick={() => runOrderBackfill(false)} className="rounded bg-red-600 px-5 py-3 font-semibold hover:bg-red-500">Import WooCommerce Orders</button>
           <button onClick={() => runCustomerRebuild(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Preview Customer Profile Update</button>
           <button disabled={importedOrdersCount === 0} onClick={() => runCustomerRebuild(false)} className="rounded bg-emerald-700 px-5 py-3 font-semibold hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50">Update Customer Profiles</button>
+          <button onClick={() => runSubscriptionBackfill(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Test WooCommerce Subscription Import</button>
+          <button onClick={() => runSubscriptionBackfill(false)} className="rounded bg-red-700 px-5 py-3 font-semibold hover:bg-red-600">Import WooCommerce Subscriptions</button>
           <button onClick={syncWooCommerce} className="rounded bg-zinc-800 px-5 py-3 font-semibold text-zinc-200 hover:bg-zinc-700">Single Customer Repair Sync</button>
         </div>
         {importedOrdersCount === 0 && <p className="text-sm text-zinc-400">Update Customer Profiles is disabled until this page has imported WooCommerce orders. Run Import WooCommerce Orders first.</p>}
@@ -860,6 +915,7 @@ export default function AdminPage() {
           <Card label="Last Action" value={syncLastRun?.action ?? "None"} />
           <Card label="Job Status" value={syncLastRun?.status ?? "Idle"} />
           <Card label="Orders Imported" value={syncLastRun?.ordersImported ?? 0} />
+          <Card label="Subscriptions Imported" value={syncLastRun?.subscriptionsImported ?? 0} />
           <Card label="Customers Updated" value={syncLastRun?.customersUpdated ?? 0} />
         </div>
         <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 text-sm text-zinc-300">
