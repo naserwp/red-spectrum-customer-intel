@@ -10,6 +10,13 @@ type WooCommerceMeta = {
 export type WooCommerceAddress = {
   first_name?: string;
   last_name?: string;
+  company?: string;
+  address_1?: string;
+  address_2?: string;
+  city?: string;
+  state?: string;
+  postcode?: string;
+  country?: string;
   email?: string;
   phone?: string;
 };
@@ -17,6 +24,17 @@ export type WooCommerceAddress = {
 export type WooCommerceRefund = {
   id?: number;
   total?: string;
+};
+
+export type WooCommerceLineItem = {
+  product_id?: number;
+  variation_id?: number;
+  name?: string;
+  sku?: string;
+  quantity?: number;
+  subtotal?: string;
+  total?: string;
+  price?: number;
 };
 
 export type WooCommerceCustomer = {
@@ -29,13 +47,21 @@ export type WooCommerceCustomer = {
 
 export type WooCommerceOrder = {
   id: number;
+  number?: string;
   status?: string;
   total?: string;
+  currency?: string;
   date_created?: string;
+  date_modified?: string;
+  date_paid?: string;
+  payment_method?: string;
+  payment_method_title?: string;
+  transaction_id?: string;
+  customer_note?: string;
   billing?: WooCommerceAddress;
   refunds?: WooCommerceRefund[];
   meta_data?: WooCommerceMeta[];
-  line_items?: Array<{ name?: string; quantity?: number; total?: string }>;
+  line_items?: WooCommerceLineItem[];
 };
 
 export type WooCommerceFetchResult<T> = {

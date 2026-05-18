@@ -4,6 +4,74 @@ import { calculateCustomerScore, scoreToStars } from "@/lib/customerScore";
 export type SubscriptionStatus = "active" | "inactive" | "canceled" | "past_due" | "unknown";
 export type RiskLevel = "low" | "medium" | "high";
 
+export interface CustomerOrderLineItem {
+  productId: number;
+  variationId: number;
+  name: string;
+  sku: string;
+  quantity: number;
+  subtotal: number;
+  total: number;
+  price: number;
+}
+
+export interface CustomerBillingAddress {
+  address1: string;
+  address2: string;
+  city: string;
+  state: string;
+  postcode: string;
+  country: string;
+}
+
+export interface GatewayVerification {
+  provider: string;
+  matched: boolean;
+  confidence: "exact" | "high" | "medium" | "low" | "not_found";
+  matchedBy: string;
+  transactionId: string;
+  transactionStatus: string;
+  amount: number;
+  transactionDate: string;
+  paymentProfileId: string;
+  rawSummary: string;
+  lastCheckedAt: string;
+  configured: boolean;
+  notes: string;
+}
+
+export interface CustomerOrderHistoryItem {
+  orderId: string;
+  orderNumber: string;
+  status: string;
+  dateCreated: string;
+  dateModified: string;
+  total: number;
+  currency: string;
+  paymentMethod: string;
+  paymentMethodTitle: string;
+  transactionId: string;
+  paidDate: string;
+  attemptedDate: string;
+  isPaid: boolean;
+  isAttempted: boolean;
+  billingName: string;
+  billingEmail: string;
+  billingPhone: string;
+  billingFirstName: string;
+  billingLastName: string;
+  billingCompany: string;
+  billingAddress: CustomerBillingAddress;
+  lineItems: CustomerOrderLineItem[];
+  products: CustomerOrderLineItem[];
+  refundsCount: number;
+  refundsAmount: number;
+  customerNote: string;
+  checkoutSource: string;
+  source: string;
+  gatewayVerification: GatewayVerification;
+}
+
 export interface CustomerDocument {
   name: string;
   email: string;
@@ -40,7 +108,98 @@ export interface CustomerDocument {
   recommendedAction: string;
   score: number;
   stars: number;
+  orders: CustomerOrderHistoryItem[];
+  lastProducts: string[];
+  attemptedProducts: string[];
+  paidProducts: string[];
+  lastPaymentMethod: string;
+  lastAttemptPaymentMethod: string;
+  lastAttemptStatus: string;
+  leadUrgency: string;
+  recommendedContactMethod: string;
+  nextAction: string;
+  gatewayVerification: GatewayVerification;
 }
+
+const customerOrderLineItemSchema = new Schema<CustomerOrderLineItem>(
+  {
+    productId: { type: Number, default: 0 },
+    variationId: { type: Number, default: 0 },
+    name: { type: String, default: "" },
+    sku: { type: String, default: "" },
+    quantity: { type: Number, default: 0 },
+    subtotal: { type: Number, default: 0 },
+    total: { type: Number, default: 0 },
+    price: { type: Number, default: 0 },
+  },
+  { _id: false }
+);
+
+const customerBillingAddressSchema = new Schema<CustomerBillingAddress>(
+  {
+    address1: { type: String, default: "" },
+    address2: { type: String, default: "" },
+    city: { type: String, default: "" },
+    state: { type: String, default: "" },
+    postcode: { type: String, default: "" },
+    country: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
+const gatewayVerificationSchema = new Schema<GatewayVerification>(
+  {
+    provider: { type: String, default: "" },
+    matched: { type: Boolean, default: false },
+    confidence: { type: String, enum: ["exact", "high", "medium", "low", "not_found"], default: "not_found" },
+    matchedBy: { type: String, default: "" },
+    transactionId: { type: String, default: "" },
+    transactionStatus: { type: String, default: "" },
+    amount: { type: Number, default: 0 },
+    transactionDate: { type: String, default: "" },
+    paymentProfileId: { type: String, default: "" },
+    rawSummary: { type: String, default: "" },
+    lastCheckedAt: { type: String, default: "" },
+    configured: { type: Boolean, default: false },
+    notes: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
+const customerOrderHistorySchema = new Schema<CustomerOrderHistoryItem>(
+  {
+    orderId: { type: String, default: "" },
+    orderNumber: { type: String, default: "" },
+    status: { type: String, default: "" },
+    dateCreated: { type: String, default: "" },
+    dateModified: { type: String, default: "" },
+    total: { type: Number, default: 0 },
+    currency: { type: String, default: "" },
+    paymentMethod: { type: String, default: "" },
+    paymentMethodTitle: { type: String, default: "" },
+    transactionId: { type: String, default: "" },
+    paidDate: { type: String, default: "" },
+    attemptedDate: { type: String, default: "" },
+    isPaid: { type: Boolean, default: false },
+    isAttempted: { type: Boolean, default: false },
+    billingName: { type: String, default: "" },
+    billingEmail: { type: String, default: "" },
+    billingPhone: { type: String, default: "" },
+    billingFirstName: { type: String, default: "" },
+    billingLastName: { type: String, default: "" },
+    billingCompany: { type: String, default: "" },
+    billingAddress: { type: customerBillingAddressSchema, default: () => ({}) },
+    lineItems: { type: [customerOrderLineItemSchema], default: [] },
+    products: { type: [customerOrderLineItemSchema], default: [] },
+    refundsCount: { type: Number, default: 0 },
+    refundsAmount: { type: Number, default: 0 },
+    customerNote: { type: String, default: "" },
+    checkoutSource: { type: String, default: "woocommerce" },
+    source: { type: String, default: "woocommerce" },
+    gatewayVerification: { type: gatewayVerificationSchema, default: () => ({}) },
+  },
+  { _id: false }
+);
 
 const customerSchema = new Schema<CustomerDocument>(
   {
@@ -79,6 +238,17 @@ const customerSchema = new Schema<CustomerDocument>(
     recommendedAction: { type: String, required: true },
     score: { type: Number, required: true, default: 0 },
     stars: { type: Number, required: true, default: 1 },
+    orders: { type: [customerOrderHistorySchema], default: [] },
+    lastProducts: { type: [String], default: [] },
+    attemptedProducts: { type: [String], default: [] },
+    paidProducts: { type: [String], default: [] },
+    lastPaymentMethod: { type: String, default: "" },
+    lastAttemptPaymentMethod: { type: String, default: "" },
+    lastAttemptStatus: { type: String, default: "" },
+    leadUrgency: { type: String, default: "medium" },
+    recommendedContactMethod: { type: String, default: "email" },
+    nextAction: { type: String, default: "Manual review" },
+    gatewayVerification: { type: gatewayVerificationSchema, default: () => ({}) },
   },
   { timestamps: true }
 );

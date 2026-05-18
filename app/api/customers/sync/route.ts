@@ -2,11 +2,12 @@ import { NextResponse } from "next/server";
 import { calculateCustomerScore, scoreToStars, type CustomerScoreInput } from "@/lib/customerScore";
 import { connectToDatabase } from "@/lib/mongodb";
 import { fetchWooCommerceOrders, isWooCommerceConfigured, type WooCommerceCustomer, type WooCommerceOrder } from "@/lib/woocommerce";
-import { Customer } from "@/models/Customer";
+import { Customer, type CustomerOrderHistoryItem, type CustomerOrderLineItem } from "@/models/Customer";
 import { SalesHistory } from "@/models/SalesHistory";
 import { Subscription } from "@/models/Subscription";
 import { buildSourcePlaceholders, mapWooOrdersToSubscriptions } from "@/lib/subscriptions";
 import { getOrderStatus, isPaidOrder, parseMoney, summarizeWooOrdersForSalesHistory } from "@/lib/businessMetrics";
+import { getGatewayConfigurationSummary, hasConfiguredGateway, verifyOrderPayment } from "@/lib/paymentGateways";
 
 type SyncedCustomer = CustomerScoreInput & {
   name: string;
@@ -38,9 +39,20 @@ type SyncedCustomer = CustomerScoreInput & {
   recommendedAction: string;
   score: number;
   stars: number;
+  orders: CustomerOrderHistoryItem[];
+  lastProducts: string[];
+  attemptedProducts: string[];
+  paidProducts: string[];
+  lastPaymentMethod: string;
+  lastAttemptPaymentMethod: string;
+  lastAttemptStatus: string;
+  leadUrgency: string;
+  recommendedContactMethod: string;
+  nextAction: string;
+  gatewayVerification: CustomerOrderHistoryItem["gatewayVerification"];
 };
 
-type CustomerAccumulator = Omit<SyncedCustomer, "score" | "stars" | "tier" | "leadStatus" | "paymentStatus" | "aiSummary" | "aiSummaryPreview" | "riskExplanation" | "recommendedAction" | "averageOrderValue" | "estimatedCreditLimit" | "riskLevel" | "lastSyncedAt">;
+type CustomerAccumulator = Omit<SyncedCustomer, "score" | "stars" | "tier" | "leadStatus" | "paymentStatus" | "aiSummary" | "aiSummaryPreview" | "riskExplanation" | "recommendedAction" | "averageOrderValue" | "estimatedCreditLimit" | "riskLevel" | "lastSyncedAt" | "leadUrgency" | "recommendedContactMethod" | "nextAction" | "gatewayVerification">;
 type RuleSummaryCustomer = Omit<SyncedCustomer, "aiSummary" | "aiSummaryPreview" | "riskExplanation" | "recommendedAction">;
 
 const subscriptionStatuses: CustomerScoreInput["subscriptionStatus"][] = ["active", "inactive", "canceled", "past_due", "unknown"];
@@ -48,6 +60,121 @@ const todayIso = new Date().toISOString();
 
 const getOrderEmail = (order: WooCommerceOrder) => order.billing?.email?.trim().toLowerCase() ?? "";
 const getOrderName = (order: WooCommerceOrder) => `${order.billing?.first_name?.trim() ?? ""} ${order.billing?.last_name?.trim() ?? ""}`.trim() || order.billing?.email || "WooCommerce Customer";
+const unique = (values: string[]) => Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+
+function getLineItems(order: WooCommerceOrder): CustomerOrderLineItem[] {
+  return (order.line_items ?? []).map((item) => {
+    const quantity = Number(item.quantity ?? 0);
+    const subtotal = parseMoney(item.subtotal);
+    const parsedTotal = parseMoney(item.total);
+    const price = Number.isFinite(Number(item.price)) ? Number(item.price) : 0;
+    const total = parsedTotal > 0 ? parsedTotal : subtotal > 0 ? subtotal : price * quantity;
+    return {
+      productId: Number(item.product_id ?? 0),
+      variationId: Number(item.variation_id ?? 0),
+      name: item.name ?? "Unknown product",
+      sku: item.sku ?? "",
+      quantity,
+      subtotal,
+      total,
+      price: price > 0 ? price : quantity > 0 ? total / quantity : total,
+    };
+  });
+}
+
+function getOrderTotal(order: WooCommerceOrder, lineItems = getLineItems(order)) {
+  const total = parseMoney(order.total);
+  if (total > 0) return total;
+  return lineItems.reduce((sum, item) => sum + item.total, 0);
+}
+
+function getPaymentMethodLabel(order: WooCommerceOrder) {
+  return order.payment_method_title || order.payment_method || "";
+}
+
+async function buildOrderHistoryItem(order: WooCommerceOrder): Promise<CustomerOrderHistoryItem> {
+  const lineItems = getLineItems(order);
+  const paid = isPaidOrder(order);
+  const orderDate = order.date_created ?? todayIso;
+  const item: CustomerOrderHistoryItem = {
+    orderId: String(order.id),
+    orderNumber: String(order.number ?? order.id),
+    status: getOrderStatus(order) || "unknown",
+    dateCreated: orderDate,
+    dateModified: order.date_modified ?? "",
+    total: getOrderTotal(order, lineItems),
+    currency: order.currency ?? "",
+    paymentMethod: order.payment_method ?? "",
+    paymentMethodTitle: order.payment_method_title ?? "",
+    transactionId: order.transaction_id ?? "",
+    paidDate: order.date_paid ?? "",
+    attemptedDate: paid ? "" : orderDate,
+    isPaid: paid,
+    isAttempted: !paid,
+    billingName: getOrderName(order),
+    billingEmail: getOrderEmail(order),
+    billingPhone: order.billing?.phone ?? "",
+    billingFirstName: order.billing?.first_name ?? "",
+    billingLastName: order.billing?.last_name ?? "",
+    billingCompany: order.billing?.company ?? "",
+    billingAddress: {
+      address1: order.billing?.address_1 ?? "",
+      address2: order.billing?.address_2 ?? "",
+      city: order.billing?.city ?? "",
+      state: order.billing?.state ?? "",
+      postcode: order.billing?.postcode ?? "",
+      country: order.billing?.country ?? "",
+    },
+    lineItems,
+    products: lineItems,
+    refundsCount: order.refunds?.length ?? (getOrderStatus(order) === "refunded" ? 1 : 0),
+    refundsAmount: (order.refunds ?? []).reduce((sum, refund) => sum + Math.abs(parseMoney(refund.total)), 0),
+    customerNote: order.customer_note ?? "",
+    checkoutSource: "woocommerce",
+    source: "woocommerce",
+    gatewayVerification: {
+      provider: "",
+      matched: false,
+      confidence: "not_found",
+      matchedBy: "",
+      transactionId: order.transaction_id ?? "",
+      transactionStatus: "",
+      amount: getOrderTotal(order, lineItems),
+      transactionDate: paid ? order.date_paid ?? orderDate : orderDate,
+      paymentProfileId: "",
+      rawSummary: "",
+      lastCheckedAt: "",
+      configured: false,
+      notes: "",
+    },
+  };
+  item.gatewayVerification = await verifyOrderPayment(item);
+  return item;
+}
+
+function getLeadUrgency(paidTotal: number, attemptedTotal: number, attemptedOrderCount: number, lastAttemptDate: string) {
+  if (paidTotal > 0) return "customer";
+  const lastAttempt = lastAttemptDate ? new Date(lastAttemptDate) : null;
+  const attemptedWithin24h = Boolean(lastAttempt && !Number.isNaN(lastAttempt.getTime()) && Date.now() - lastAttempt.getTime() <= 86400000);
+  if (attemptedTotal >= 500 || attemptedWithin24h) return "very_high";
+  if (attemptedTotal >= 100 || attemptedOrderCount > 1) return "high";
+  return "medium";
+}
+
+function getRecommendedContactMethod(phone: string, leadUrgency: string, paidTotal: number) {
+  if (paidTotal > 0) return phone ? "phone" : "email";
+  if (phone && ["very_high", "high"].includes(leadUrgency)) return "phone";
+  if (phone) return "SMS";
+  return "email";
+}
+
+function getNextAction(paidTotal: number, recommendedContactMethod: string, attemptedTotal: number) {
+  if (paidTotal > 0) return "Review upsell or renewal opportunity";
+  if (attemptedTotal <= 0) return "Manual review";
+  if (recommendedContactMethod === "phone") return "Call and resend payment link";
+  if (recommendedContactMethod === "SMS") return "Send checkout recovery SMS";
+  return "Send checkout recovery email";
+}
 
 function getSubscriptionStatus(order: WooCommerceOrder): CustomerScoreInput["subscriptionStatus"] {
   const metaValue = order.meta_data?.find((meta) => meta.key?.toLowerCase().includes("subscription_status"))?.value?.toString().toLowerCase();
@@ -57,7 +184,12 @@ function getSubscriptionStatus(order: WooCommerceOrder): CustomerScoreInput["sub
 
 const getTier = (paidTotal: number, attemptedTotal: number) => paidTotal > 0 ? paidTotal >= 2500 ? "Platinum" : paidTotal >= 999 ? "Gold" : paidTotal >= 200 ? "Silver" : "Bronze" : attemptedTotal > 0 ? "Lead" : "Cold Lead";
 const getLeadStatus = (paidTotal: number, attemptedTotal: number) => paidTotal > 0 ? "customer" : attemptedTotal >= 2000 ? "very_hot_lead" : attemptedTotal > 0 ? "hot_lead" : "cold_lead";
-const getPaymentStatus = (paidTotal: number, attemptedTotal: number) => paidTotal > 0 ? "paid" : attemptedTotal > 0 ? "attempted_unpaid" : "unpaid";
+const getPaymentStatus = (paidTotal: number, attemptedTotal: number, lastAttemptStatus = "", lastAttemptPaymentMethod = "") => {
+  if (paidTotal > 0) return "paid";
+  const paymentMethod = lastAttemptPaymentMethod.toLowerCase();
+  if (attemptedTotal > 0 && lastAttemptStatus === "on-hold" && paymentMethod.includes("crypto")) return "crypto_on_hold";
+  return attemptedTotal > 0 ? "attempted_unpaid" : "unpaid";
+};
 const getRiskLevel = (
   c: Pick<CustomerScoreInput, "chargebacks" | "failedPayments" | "refunds">,
   score: number
@@ -126,7 +258,10 @@ async function transformOrdersToCustomers(orders: WooCommerceOrder[]) {
     const email = getOrderEmail(order);
     if (!email) continue;
 
-    const total = parseMoney(order.total);
+    const orderHistoryItem = await buildOrderHistoryItem(order);
+    const productNames = orderHistoryItem.lineItems.map((item) => item.name);
+    const paymentMethodLabel = getPaymentMethodLabel(order);
+    const total = orderHistoryItem.total;
     const paidAmount = isPaidOrder(order) ? total : 0;
     const attemptedAmount = isPaidOrder(order) ? 0 : total;
     const orderDate = order.date_created ?? todayIso;
@@ -162,6 +297,13 @@ async function transformOrdersToCustomers(orders: WooCommerceOrder[]) {
       actualCreditLimit: actualFromMeta ?? existing?.actualCreditLimit ?? null,
       notes: existing?.notes ?? "",
       tags: existing?.tags ?? [],
+      orders: [...(existing?.orders ?? []), orderHistoryItem],
+      lastProducts: isLatest || !existing ? productNames : existing.lastProducts,
+      attemptedProducts: unique([...(existing?.attemptedProducts ?? []), ...(!isPaidOrder(order) ? productNames : [])]),
+      paidProducts: unique([...(existing?.paidProducts ?? []), ...(isPaidOrder(order) ? productNames : [])]),
+      lastPaymentMethod: isLatestPaid ? paymentMethodLabel : existing?.lastPaymentMethod ?? "",
+      lastAttemptPaymentMethod: isLatestAttempt ? paymentMethodLabel : existing?.lastAttemptPaymentMethod ?? "",
+      lastAttemptStatus: isLatestAttempt ? getOrderStatus(order) : existing?.lastAttemptStatus ?? "",
     });
   }
 
@@ -169,18 +311,41 @@ async function transformOrdersToCustomers(orders: WooCommerceOrder[]) {
     const score = calculateCustomerScore(customer);
     const averageOrderValue = customer.paidOrderCount > 0 ? customer.paidTotal / customer.paidOrderCount : 0;
     const estimatedCreditLimit = customer.paidTotal > 0 ? estimateCreditLimit(customer.paidTotal, customer.paidOrderCount, customer.failedPayments, customer.refunds, score) : 0;
+    const sortedOrders = [...customer.orders].sort((a, b) => new Date(b.dateCreated).getTime() - new Date(a.dateCreated).getTime());
+    const leadUrgency = getLeadUrgency(customer.paidTotal, customer.attemptedTotal, customer.attemptedOrderCount, customer.lastAttemptDate);
+    const recommendedContactMethod = getRecommendedContactMethod(customer.phone, leadUrgency, customer.paidTotal);
+    const gatewayVerification = sortedOrders.find((order) => order.gatewayVerification?.matched)?.gatewayVerification ?? sortedOrders[0]?.gatewayVerification;
     const baseCustomer = {
       ...customer,
+      orders: sortedOrders,
       totalPaid: customer.paidTotal,
       averageOrderValue,
       estimatedCreditLimit,
       tier: getTier(customer.paidTotal, customer.attemptedTotal),
       leadStatus: getLeadStatus(customer.paidTotal, customer.attemptedTotal),
-      paymentStatus: getPaymentStatus(customer.paidTotal, customer.attemptedTotal),
+      paymentStatus: getPaymentStatus(customer.paidTotal, customer.attemptedTotal, customer.lastAttemptStatus, customer.lastAttemptPaymentMethod),
       riskLevel: getRiskLevel(customer, score),
       lastSyncedAt: todayIso,
       score,
       stars: scoreToStars(score),
+      leadUrgency,
+      recommendedContactMethod,
+      nextAction: getNextAction(customer.paidTotal, recommendedContactMethod, customer.attemptedTotal),
+      gatewayVerification: gatewayVerification ?? {
+        provider: "",
+        matched: false,
+        confidence: "not_found" as const,
+        matchedBy: "",
+        transactionId: "",
+        transactionStatus: "",
+        amount: 0,
+        transactionDate: "",
+        paymentProfileId: "",
+        rawSummary: "",
+        lastCheckedAt: "",
+        configured: false,
+        notes: "No WooCommerce orders found for gateway verification.",
+      },
     };
     const aiSummary = buildRuleBasedSummary(baseCustomer);
     return { ...baseCustomer, ...aiSummary };
@@ -230,10 +395,20 @@ export async function POST() {
   )));
 
   const paidOrders = orders.filter(isPaidOrder).length;
-  const unpaidOrders = orders.length - paidOrders;
+  const attemptedOrders = orders.length - paidOrders;
+  const unpaidOrders = attemptedOrders;
+  const onHoldOrders = orders.filter((order) => getOrderStatus(order) === "on-hold").length;
+  const cryptoAttemptOrders = orders.filter((order) => !isPaidOrder(order) && getPaymentMethodLabel(order).toLowerCase().includes("crypto")).length;
+  const ordersWithZeroTotal = orders.filter((order) => parseMoney(order.total) <= 0).length;
+  const ordersRecoveredFromLineItems = orders.filter((order) => parseMoney(order.total) <= 0 && getOrderTotal(order) > 0).length;
   const skippedOrdersWithoutEmail = orders.filter((order) => !getOrderEmail(order)).length;
   const paidCustomers = customers.filter((customer) => customer.paidTotal > 0).length;
   const attemptedCheckoutLeads = customers.filter((customer) => customer.paidTotal === 0 && customer.attemptedTotal > 0).length;
+  const customersWithOrderTimeline = customers.filter((customer) => customer.orders.length > 0).length;
+  const customersWithAttemptedTimeline = customers.filter((customer) => customer.orders.some((order) => order.isAttempted)).length;
+  const customersWithAttemptedProducts = customers.filter((customer) => customer.attemptedProducts.length > 0).length;
+  const customersWithPaidProducts = customers.filter((customer) => customer.paidProducts.length > 0).length;
+  const gatewayConfiguration = getGatewayConfigurationSummary();
 
   return NextResponse.json({
     message: `Synced ${customers.length} unique WooCommerce customer${customers.length === 1 ? "" : "s"}.`,
@@ -246,6 +421,18 @@ export async function POST() {
     skippedOrdersWithoutEmail,
     unpaidOrders,
     paidOrders,
+    attemptedOrders,
+    onHoldOrders,
+    cryptoAttemptOrders,
+    ordersWithZeroTotal,
+    ordersRecoveredFromLineItems,
+    customersWithOrderTimeline,
+    customersWithAttemptedTimeline,
+    customersWithAttemptedProducts,
+    customersWithPaidProducts,
+    gatewayVerificationChecked: orders.length,
+    gatewayVerificationConfigured: hasConfiguredGateway(),
+    gatewayConfiguration,
     pagesFetched: orderResult.pagesFetched,
     partialSync: orderResult.reachedPageLimit,
     warning: orderResult.reachedPageLimit ? "Partial sync, reached page limit." : "",
