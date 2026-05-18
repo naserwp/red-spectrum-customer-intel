@@ -3,8 +3,10 @@ import { calculateCustomerScore, scoreToStars, type CustomerScoreInput } from "@
 import { connectToDatabase } from "@/lib/mongodb";
 import { fetchWooCommerceOrders, isWooCommerceConfigured, type WooCommerceCustomer, type WooCommerceOrder } from "@/lib/woocommerce";
 import { Customer } from "@/models/Customer";
+import { SalesHistory } from "@/models/SalesHistory";
 import { Subscription } from "@/models/Subscription";
 import { buildSourcePlaceholders, mapWooOrdersToSubscriptions } from "@/lib/subscriptions";
+import { getOrderStatus, isPaidOrder, parseMoney, summarizeWooOrdersForSalesHistory } from "@/lib/businessMetrics";
 
 type SyncedCustomer = CustomerScoreInput & {
   name: string;
@@ -43,13 +45,9 @@ type RuleSummaryCustomer = Omit<SyncedCustomer, "aiSummary" | "aiSummaryPreview"
 
 const subscriptionStatuses: CustomerScoreInput["subscriptionStatus"][] = ["active", "inactive", "canceled", "past_due", "unknown"];
 const todayIso = new Date().toISOString();
-const paidOrderStatuses = new Set(["completed", "processing", "paid"]);
 
-const parseMoney = (value: string | undefined) => Number.isFinite(Number(value ?? 0)) ? Number(value ?? 0) : 0;
 const getOrderEmail = (order: WooCommerceOrder) => order.billing?.email?.trim().toLowerCase() ?? "";
 const getOrderName = (order: WooCommerceOrder) => `${order.billing?.first_name?.trim() ?? ""} ${order.billing?.last_name?.trim() ?? ""}`.trim() || order.billing?.email || "WooCommerce Customer";
-const getOrderStatus = (order: WooCommerceOrder) => (order.status ?? "").trim().toLowerCase();
-const isPaidOrder = (order: WooCommerceOrder) => paidOrderStatuses.has(getOrderStatus(order));
 
 function getSubscriptionStatus(order: WooCommerceOrder): CustomerScoreInput["subscriptionStatus"] {
   const metaValue = order.meta_data?.find((meta) => meta.key?.toLowerCase().includes("subscription_status"))?.value?.toString().toLowerCase();
@@ -202,9 +200,10 @@ export async function POST() {
     return NextResponse.json({ message: "WooCommerce is not configured. Add WC_STORE_URL, WC_CONSUMER_KEY, and WC_CONSUMER_SECRET to enable sync.", customers: [], saved: false });
   }
 
-  const orders = await fetchWooCommerceOrders();
-  if (!orders) return NextResponse.json({ error: "Unable to fetch WooCommerce orders.", customers: [], saved: false }, { status: 502 });
+  const orderResult = await fetchWooCommerceOrders();
+  if (!orderResult) return NextResponse.json({ error: "Unable to fetch WooCommerce orders.", customers: [], saved: false }, { status: 502 });
 
+  const orders = orderResult.items;
   const customers = await transformOrdersToCustomers(orders);
   const wooSubscriptions = mapWooOrdersToSubscriptions(orders);
   const sourcePlaceholders = buildSourcePlaceholders(todayIso);
@@ -219,16 +218,40 @@ export async function POST() {
   if (!connection) return NextResponse.json({ message: "WooCommerce data transformed. MongoDB is unavailable, so customers were not saved.", customers, saved: false });
 
   await saveCustomers(customers);
+  await SalesHistory.findOneAndUpdate(
+    { source: "woocommerce" },
+    { $set: { source: "woocommerce", ...summarizeWooOrdersForSalesHistory(orders, 5) } },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
   await Promise.all(allSubscriptions.map((sub) => Subscription.findOneAndUpdate(
     { source: sub.source, subscriptionId: sub.subscriptionId },
     { $set: sub },
-    { upsert: true, new: true }
+    { upsert: true, new: true, setDefaultsOnInsert: true }
   )));
 
+  const paidOrders = orders.filter(isPaidOrder).length;
+  const unpaidOrders = orders.length - paidOrders;
+  const skippedOrdersWithoutEmail = orders.filter((order) => !getOrderEmail(order)).length;
+  const paidCustomers = customers.filter((customer) => customer.paidTotal > 0).length;
+  const attemptedCheckoutLeads = customers.filter((customer) => customer.paidTotal === 0 && customer.attemptedTotal > 0).length;
+
   return NextResponse.json({
-    message: `Synced ${customers.length} WooCommerce customer${customers.length === 1 ? "" : "s"}.`,
+    message: `Synced ${customers.length} unique WooCommerce customer${customers.length === 1 ? "" : "s"}.`,
     customers,
+    totalOrdersFetched: orderResult.totalFetched,
+    uniqueCustomersSynced: customers.length,
+    paidCustomers,
+    hotLeads: attemptedCheckoutLeads,
+    attemptedCheckoutLeads,
+    skippedOrdersWithoutEmail,
+    unpaidOrders,
+    paidOrders,
+    pagesFetched: orderResult.pagesFetched,
+    partialSync: orderResult.reachedPageLimit,
+    warning: orderResult.reachedPageLimit ? "Partial sync, reached page limit." : "",
     subscriptionsSynced: allSubscriptions.length,
+    subscriptionCandidatesSynced: wooSubscriptions.filter((sub) => sub.recordType === "subscription_candidate").length,
+    realSubscriptionsSynced: wooSubscriptions.filter((sub) => sub.recordType === "subscription").length,
     subscriptionSources: {
       woocommerce: wooSubscriptions.length,
       stripe: sourcePlaceholders.stripe.length,

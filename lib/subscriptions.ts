@@ -13,6 +13,8 @@ export function mapWooOrdersToSubscriptions(orders: WooCommerceOrder[]): Partial
     if (!email) return acc;
     const nextBillingMeta = order.meta_data?.find((m) => (m.key ?? "").toLowerCase().includes("next_payment"))?.value?.toString();
     const subStatus = order.meta_data?.find((m) => (m.key ?? "").toLowerCase().includes("subscription_status"))?.value?.toString().toLowerCase() ?? "unknown";
+    const nextBillingDate = toIso(nextBillingMeta);
+    const isRealSubscription = subStatus === "active" && Boolean(nextBillingDate);
     const amount = Number(order.total ?? 0);
     acc.push({
       subscriptionId: `wc-order-${order.id}`,
@@ -22,14 +24,17 @@ export function mapWooOrdersToSubscriptions(orders: WooCommerceOrder[]): Partial
       customerPhone: order.billing?.phone ?? "",
       gatewayCustomerId: "",
       gatewayProfileId: "",
-      status: subStatus as SubscriptionDocument["status"],
+      status: isRealSubscription ? "active" : subStatus as SubscriptionDocument["status"],
       amount: Number.isFinite(amount) ? amount : 0,
       billingInterval: "monthly",
-      nextBillingDate: toIso(nextBillingMeta),
+      nextBillingDate,
       lastBillingDate: toIso(order.date_created),
       failedPaymentCount: order.status === "failed" ? 1 : 0,
       lastPaymentStatus: order.status ?? "unknown",
-      monthlyRecurringRevenue: Number.isFinite(amount) ? amount : 0,
+      monthlyRecurringRevenue: isRealSubscription && Number.isFinite(amount) ? amount : 0,
+      isPlaceholder: false,
+      sourceStatus: isRealSubscription ? "real" : "candidate",
+      recordType: isRealSubscription ? "subscription" : "subscription_candidate",
       lastSyncedAt: new Date().toISOString(),
     });
     return acc;

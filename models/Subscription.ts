@@ -27,6 +27,9 @@ export interface SubscriptionDocument {
   availableCredits: number;
   totalOutstanding: number;
   monthlyRecurringRevenue: number;
+  isPlaceholder: boolean;
+  sourceStatus: "real" | "candidate" | "placeholder";
+  recordType: "subscription" | "subscription_candidate" | "placeholder";
   lastSyncedAt: string;
 }
 
@@ -55,6 +58,9 @@ const subscriptionSchema = new Schema<SubscriptionDocument>(
     availableCredits: { type: Number, default: 0, index: true },
     totalOutstanding: { type: Number, default: 0, index: true },
     monthlyRecurringRevenue: { type: Number, default: 0 },
+    isPlaceholder: { type: Boolean, default: false, index: true },
+    sourceStatus: { type: String, enum: ["real", "candidate", "placeholder"], default: "real", index: true },
+    recordType: { type: String, enum: ["subscription", "subscription_candidate", "placeholder"], default: "subscription", index: true },
     lastSyncedAt: { type: String, required: true },
   },
   { timestamps: true }

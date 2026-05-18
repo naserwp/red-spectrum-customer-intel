@@ -35,6 +35,15 @@ export type WooCommerceOrder = {
   billing?: WooCommerceAddress;
   refunds?: WooCommerceRefund[];
   meta_data?: WooCommerceMeta[];
+  line_items?: Array<{ name?: string; quantity?: number; total?: string }>;
+};
+
+export type WooCommerceFetchResult<T> = {
+  items: T[];
+  totalFetched: number;
+  pagesFetched: number;
+  reachedPageLimit: boolean;
+  maxPages: number;
 };
 
 function getWooCommerceConfig() {
@@ -56,15 +65,18 @@ export function isWooCommerceConfigured() {
   return Boolean(WC_STORE_URL && WC_CONSUMER_KEY && WC_CONSUMER_SECRET);
 }
 
-async function fetchWooCommerceCollection<T>(resource: "customers" | "orders") {
+async function fetchWooCommerceCollection<T>(resource: "customers" | "orders"): Promise<WooCommerceFetchResult<T> | null> {
   const config = getWooCommerceConfig();
   if (!config) return null;
 
   const auth = Buffer.from(`${config.consumerKey}:${config.consumerSecret}`).toString("base64");
   const results: T[] = [];
+  const maxPages = Math.max(1, Number(process.env.WC_MAX_PAGES ?? 100));
+  let pagesFetched = 0;
+  let reachedPageLimit = false;
 
   try {
-    for (let page = 1; page <= 10; page += 1) {
+    for (let page = 1; page <= maxPages; page += 1) {
       const url = new URL(`${config.storeUrl}/wp-json/wc/v3/${resource}`);
       url.searchParams.set("per_page", "100");
       url.searchParams.set("page", String(page));
@@ -86,12 +98,14 @@ async function fetchWooCommerceCollection<T>(resource: "customers" | "orders") {
       }
 
       const pageResults = (await response.json()) as T[];
+      pagesFetched = page;
       results.push(...pageResults);
 
       if (pageResults.length < 100) break;
+      if (page === maxPages) reachedPageLimit = true;
     }
 
-    return results;
+    return { items: results, totalFetched: results.length, pagesFetched, reachedPageLimit, maxPages };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown WooCommerce request error.";
     console.warn(`[woocommerce] Failed to fetch ${resource}. ${message}`);

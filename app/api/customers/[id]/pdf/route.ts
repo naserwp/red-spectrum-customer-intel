@@ -18,7 +18,14 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
   line("Name", String(customer.name ?? ""));
   line("Email", String(customer.email ?? ""));
   line("Phone", String(customer.phone ?? ""));
-  line("Total Paid", `$${Number(customer.totalPaid ?? 0).toFixed(2)}`);
+  line("Actual Paid Amount", `$${Number(customer.paidTotal ?? customer.totalPaid ?? 0).toFixed(2)}`);
+  line("Attempted Amount", `$${Number(customer.attemptedTotal ?? 0).toFixed(2)}`);
+  line("Paid Order Count", String(customer.paidOrderCount ?? 0));
+  line("Attempted Order Count", String(customer.attemptedOrderCount ?? 0));
+  line("Lead Status", String(customer.leadStatus ?? ""));
+  line("Payment Status", String(customer.paymentStatus ?? ""));
+  line("Last Paid Date", String(customer.lastPaidDate ?? ""));
+  line("Last Attempt Date", String(customer.lastAttemptDate ?? ""));
   line("Order Count", String(customer.orderCount ?? 0));
   line("Average Order Value", `$${Number(customer.averageOrderValue ?? 0).toFixed(2)}`);
   line("First Order", String(customer.firstOrderDate ?? ""));

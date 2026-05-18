@@ -4,6 +4,6 @@ import { Customer } from "@/models/Customer";
 
 export async function GET() {
   await connectToDatabase();
-  const rows = await Customer.find({ paidTotal: { $gte: 2000 } }).sort({ paidTotal: -1 }).limit(50).lean();
+  const rows = await Customer.find({ paidTotal: { $gte: 2000 } }).sort({ paidTotal: -1 }).limit(100).lean();
   return NextResponse.json({ rows });
 }
