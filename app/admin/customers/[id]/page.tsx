@@ -26,6 +26,10 @@ type GatewayVerification = {
   customerVaultId?: string;
   paymentProfileId: string;
   customerProfileId?: string;
+  paymentIntentId?: string;
+  chargeId?: string;
+  stripeCustomerId?: string;
+  paymentMethodId?: string;
   last4?: string;
   cardType?: string;
   candidatesCount?: number;
@@ -512,6 +516,9 @@ export default function CustomerDetailPage() {
           <div><p className="text-xs uppercase text-zinc-400">Confidence</p><p className="font-semibold">{verification?.confidence || "not_found"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Matched By</p><p className="font-semibold">{verification?.matchedBy || "-"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Transaction ID</p><p className="font-semibold">{verification?.transactionId || "-"}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Payment Intent ID</p><p className="font-semibold">{verification?.paymentIntentId || "-"}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Charge ID</p><p className="font-semibold">{verification?.chargeId || "-"}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Stripe Customer ID</p><p className="font-semibold">{verification?.stripeCustomerId || "-"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Customer Vault ID</p><p className="font-semibold">{verification?.customerVaultId || "-"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Last 4</p><p className="font-semibold">{verification?.last4 || "-"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Card Type</p><p className="font-semibold">{verification?.cardType || "-"}</p></div>

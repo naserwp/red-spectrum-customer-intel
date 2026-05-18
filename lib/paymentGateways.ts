@@ -66,6 +66,27 @@ type MatchableTransaction = {
   address1: string;
 };
 
+type StripeTransaction = MatchableTransaction & {
+  transactionId: string;
+  paymentIntentId: string;
+  chargeId: string;
+  status: string;
+  stripeCustomerId: string;
+  paymentMethodId: string;
+  last4: string;
+  cardType: string;
+};
+
+type StripeQueryResult = {
+  transaction?: StripeTransaction;
+  transactions: StripeTransaction[];
+  candidatesCount: number;
+  error?: string;
+};
+
+const STRIPE_REQUEST_TIMEOUT_MS = 12000;
+const STRIPE_MATCH_WINDOW_DAYS = 3;
+const STRIPE_MAX_CANDIDATES = 100;
 const NMI_REQUEST_TIMEOUT_MS = 12000;
 const NMI_MATCH_WINDOW_DAYS = 3;
 const AUTHORIZE_REQUEST_TIMEOUT_MS = 12000;
@@ -91,6 +112,10 @@ function nmiConfigured() {
   return Boolean(process.env.NMI_SECURITY_KEY);
 }
 
+function stripeConfigured() {
+  return Boolean(process.env.STRIPE_SECRET_KEY);
+}
+
 function authorizeNetConfigured() {
   return Boolean(process.env.AUTHORIZE_NET_API_LOGIN_ID && process.env.AUTHORIZE_NET_TRANSACTION_KEY);
 }
@@ -99,6 +124,12 @@ function inferProvider(order: Pick<CustomerOrderHistoryItem, "paymentMethod" | "
   const method = (order.paymentMethod ?? "").toLowerCase();
   const title = (order.paymentMethodTitle ?? "").toLowerCase();
   const value = `${method} ${title}`;
+  const stripeLike =
+    value.includes("stripe") ||
+    value.includes("payment_intent") ||
+    value.includes("payment intent") ||
+    value.includes("checkout_session") ||
+    value.includes("checkout session");
   const nmiLike =
     method.includes("nmi") ||
     method.includes("cliq") ||
@@ -109,24 +140,30 @@ function inferProvider(order: Pick<CustomerOrderHistoryItem, "paymentMethod" | "
     value.includes("cliq") ||
     value.includes("quick pay") ||
     value.includes("gateway");
-  if (value.includes("stripe")) return "stripe";
-  if (nmiLike) return "nmi";
-  if (
+  const authorizeLike =
     value.includes("authorize_net") ||
     value.includes("authorize.net") ||
     value.includes("authorize") ||
     value.includes("cim") ||
-    value.includes("credit card payment")
-  ) return "authorize_net";
-  if (value.includes("nmi") || value.includes("quick pay")) return "nmi";
-  if (value.includes("cliq")) return "cliq";
+    value.includes("credit card payment");
+  if (stripeLike) return "stripe";
+  if (nmiLike) return "nmi";
+  if (authorizeLike) return "authorize_net";
   if (value.includes("crypto")) return "crypto";
+  if (
+    method === "card" ||
+    title === "card" ||
+    value.includes(" card") ||
+    value.includes("card ") ||
+    value.includes("credit card") ||
+    value.includes("checkout")
+  ) return "stripe";
   return value.trim() ? "unknown_gateway" : "woocommerce";
 }
 
 function providerConfigured(provider: string) {
   if (provider === "nmi") return nmiConfigured();
-  if (provider === "stripe") return Boolean(process.env.STRIPE_SECRET_KEY);
+  if (provider === "stripe") return stripeConfigured();
   if (provider === "authorize_net") return authorizeNetConfigured();
   if (provider === "cliq") return Boolean(process.env.CLIQ_WEBHOOK_SECRET || process.env.NMI_SECURITY_KEY);
   return hasConfiguredGateway();
@@ -149,6 +186,10 @@ function baseVerification(
     customerVaultId: "",
     paymentProfileId: "",
     customerProfileId: "",
+    paymentIntentId: "",
+    chargeId: "",
+    stripeCustomerId: "",
+    paymentMethodId: "",
     last4: "",
     cardType: "",
     candidatesCount: 0,
@@ -297,6 +338,252 @@ function firstAmount(record: Record<string, unknown>, names: string[]) {
     if (Number.isFinite(parsed) && parsed > 0) return parsed;
   }
   return 0;
+}
+
+function stripeAmount(value: unknown) {
+  const parsed = typeof value === "number" ? value : Number(asString(value));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed / 100 : 0;
+}
+
+function stripeDate(value: unknown) {
+  const seconds = typeof value === "number" ? value : Number(asString(value));
+  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+  return new Date(seconds * 1000).toISOString();
+}
+
+function stripeId(value: unknown) {
+  if (typeof value === "string") return value;
+  return firstString(asRecord(value), ["id"]);
+}
+
+function splitName(value: string) {
+  const parts = value.trim().split(/\s+/).filter(Boolean);
+  return {
+    firstName: parts[0] ?? "",
+    lastName: parts.length > 1 ? parts.slice(1).join(" ") : "",
+  };
+}
+
+function parseStripeCharge(value: unknown): StripeTransaction | null {
+  const charge = asRecord(value);
+  const chargeId = firstString(charge, ["id"]);
+  if (!chargeId) return null;
+
+  const billing = asRecord(charge.billing_details);
+  const billingAddress = asRecord(billing.address);
+  const customer = asRecord(charge.customer);
+  const metadata = asRecord(charge.metadata);
+  const paymentMethodDetails = asRecord(charge.payment_method_details);
+  const card = asRecord(paymentMethodDetails.card);
+  const name = firstString(billing, ["name"]) || firstString(customer, ["name"]);
+  const { firstName, lastName } = splitName(name);
+
+  return {
+    transactionId: chargeId,
+    paymentIntentId: stripeId(charge.payment_intent),
+    chargeId,
+    status: firstString(charge, ["status", "failure_message"]) || firstString(asRecord(charge.outcome), ["seller_message", "type"]),
+    amount: stripeAmount(charge.amount),
+    transactionDate: stripeDate(charge.created),
+    email: (firstString(billing, ["email"]) || firstString(charge, ["receipt_email"]) || firstString(customer, ["email"])).toLowerCase(),
+    phone: firstString(billing, ["phone"]) || firstString(customer, ["phone"]),
+    firstName,
+    lastName,
+    company: firstString(metadata, ["company", "billing_company"]),
+    address1: firstString(billingAddress, ["line1"]),
+    stripeCustomerId: stripeId(charge.customer),
+    paymentMethodId: firstString(charge, ["payment_method"]),
+    last4: safeLast4(firstString(card, ["last4"])),
+    cardType: firstString(card, ["brand", "network"]),
+  };
+}
+
+function parseStripePaymentIntent(value: unknown): StripeTransaction | null {
+  const intent = asRecord(value);
+  const paymentIntentId = firstString(intent, ["id"]);
+  if (!paymentIntentId) return null;
+
+  const latestCharge = parseStripeCharge(intent.latest_charge);
+  const customer = asRecord(intent.customer);
+  const paymentMethod = asRecord(intent.payment_method);
+  const card = asRecord(paymentMethod.card);
+  const name = firstString(customer, ["name"]);
+  const { firstName, lastName } = splitName(name);
+  const amount = stripeAmount(intent.amount_received) || stripeAmount(intent.amount);
+
+  return {
+    transactionId: paymentIntentId,
+    paymentIntentId,
+    chargeId: latestCharge?.chargeId ?? "",
+    status: firstString(intent, ["status"]) || latestCharge?.status || "found",
+    amount,
+    transactionDate: stripeDate(intent.created) || latestCharge?.transactionDate || "",
+    email: latestCharge?.email || firstString(intent, ["receipt_email"]).toLowerCase() || firstString(customer, ["email"]).toLowerCase(),
+    phone: latestCharge?.phone || firstString(customer, ["phone"]),
+    firstName: latestCharge?.firstName || firstName,
+    lastName: latestCharge?.lastName || lastName,
+    company: latestCharge?.company || firstString(asRecord(intent.metadata), ["company", "billing_company"]),
+    address1: latestCharge?.address1 || firstString(asRecord(customer.address), ["line1"]),
+    stripeCustomerId: stripeId(intent.customer),
+    paymentMethodId: stripeId(intent.payment_method),
+    last4: latestCharge?.last4 || safeLast4(firstString(card, ["last4"])),
+    cardType: latestCharge?.cardType || firstString(card, ["brand", "network"]),
+  };
+}
+
+function parseStripeCheckoutSession(value: unknown): StripeTransaction | null {
+  const session = asRecord(value);
+  const sessionId = firstString(session, ["id"]);
+  if (!sessionId) return null;
+
+  const intent = parseStripePaymentIntent(session.payment_intent);
+  const customer = asRecord(session.customer);
+  const customerDetails = asRecord(session.customer_details);
+  const customerAddress = asRecord(customerDetails.address);
+  const name = firstString(customerDetails, ["name"]) || firstString(customer, ["name"]);
+  const { firstName, lastName } = splitName(name);
+
+  return {
+    transactionId: sessionId,
+    paymentIntentId: intent?.paymentIntentId || stripeId(session.payment_intent),
+    chargeId: intent?.chargeId ?? "",
+    status: firstString(session, ["payment_status", "status"]) || intent?.status || "found",
+    amount: stripeAmount(session.amount_total) || intent?.amount || 0,
+    transactionDate: stripeDate(session.created) || intent?.transactionDate || "",
+    email: intent?.email || firstString(customerDetails, ["email"]).toLowerCase() || firstString(customer, ["email"]).toLowerCase(),
+    phone: intent?.phone || firstString(customerDetails, ["phone"]) || firstString(customer, ["phone"]),
+    firstName: intent?.firstName || firstName,
+    lastName: intent?.lastName || lastName,
+    company: intent?.company || firstString(asRecord(session.metadata), ["company", "billing_company"]),
+    address1: intent?.address1 || firstString(customerAddress, ["line1"]),
+    stripeCustomerId: stripeId(session.customer) || intent?.stripeCustomerId || "",
+    paymentMethodId: intent?.paymentMethodId ?? "",
+    last4: intent?.last4 ?? "",
+    cardType: intent?.cardType ?? "",
+  };
+}
+
+async function queryStripe(path: string, params?: URLSearchParams): Promise<{ data?: unknown; error?: string }> {
+  const secretKey = process.env.STRIPE_SECRET_KEY;
+  if (!secretKey) return { error: "Stripe secret key is not configured." };
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), STRIPE_REQUEST_TIMEOUT_MS);
+  const url = new URL(`https://api.stripe.com/v1/${path.replace(/^\//, "")}`);
+  params?.forEach((value, key) => url.searchParams.append(key, value));
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${secretKey}` },
+      signal: controller.signal,
+      cache: "no-store",
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const message = firstString(asRecord(asRecord(data).error), ["message"]) || `Stripe API returned HTTP ${response.status}.`;
+      return { data, error: message };
+    }
+    return { data };
+  } catch (error) {
+    const message = error instanceof Error && error.name === "AbortError"
+      ? "Stripe API request timed out."
+      : error instanceof Error
+        ? error.message
+        : "Stripe API request failed.";
+    return { error: message };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function stripeExpandParams(expands: string[]) {
+  const params = new URLSearchParams();
+  for (const expand of expands) params.append("expand[]", expand);
+  return params;
+}
+
+async function getStripePaymentIntent(paymentIntentId: string) {
+  const params = stripeExpandParams(["customer", "payment_method", "latest_charge", "latest_charge.customer"]);
+  const result = await queryStripe(`payment_intents/${encodeURIComponent(paymentIntentId)}`, params);
+  return { transaction: parseStripePaymentIntent(result.data), error: result.error };
+}
+
+async function getStripeCharge(chargeId: string) {
+  const params = stripeExpandParams(["customer"]);
+  const result = await queryStripe(`charges/${encodeURIComponent(chargeId)}`, params);
+  return { transaction: parseStripeCharge(result.data), error: result.error };
+}
+
+async function getStripeCheckoutSession(sessionId: string) {
+  const params = stripeExpandParams(["customer", "payment_intent", "payment_intent.customer", "payment_intent.latest_charge"]);
+  const result = await queryStripe(`checkout/sessions/${encodeURIComponent(sessionId)}`, params);
+  return { transaction: parseStripeCheckoutSession(result.data), error: result.error };
+}
+
+function stripeDateWindow(order: CustomerOrderHistoryItem) {
+  const orderDate = new Date(order.paidDate || order.attemptedDate || order.dateCreated);
+  const safeDate = Number.isNaN(orderDate.getTime()) ? new Date() : orderDate;
+  const start = new Date(safeDate);
+  start.setUTCDate(start.getUTCDate() - STRIPE_MATCH_WINDOW_DAYS);
+  start.setUTCHours(0, 0, 0, 0);
+  const end = new Date(safeDate);
+  end.setUTCDate(end.getUTCDate() + STRIPE_MATCH_WINDOW_DAYS);
+  end.setUTCHours(23, 59, 59, 999);
+  return {
+    start,
+    end,
+    startUnix: Math.floor(start.getTime() / 1000),
+    endUnix: Math.floor(end.getTime() / 1000),
+  };
+}
+
+async function findStripeTransactionById(transactionId: string): Promise<StripeQueryResult> {
+  const errors: string[] = [];
+  const lookups = transactionId.startsWith("cs_")
+    ? [() => getStripeCheckoutSession(transactionId), () => getStripePaymentIntent(transactionId), () => getStripeCharge(transactionId)]
+    : [() => getStripePaymentIntent(transactionId), () => getStripeCharge(transactionId), () => getStripeCheckoutSession(transactionId)];
+
+  for (const lookup of lookups) {
+    const result = await lookup();
+    if (result.transaction) return { transaction: result.transaction, transactions: [result.transaction], candidatesCount: 1 };
+    if (result.error) errors.push(result.error);
+  }
+
+  return { transactions: [], candidatesCount: 0, error: errors.filter(Boolean).join("; ") };
+}
+
+async function collectStripeTransactionCandidates(order: CustomerOrderHistoryItem): Promise<StripeQueryResult> {
+  const window = stripeDateWindow(order);
+  const candidates = new Map<string, StripeTransaction>();
+  const errors: string[] = [];
+  const add = (transaction: StripeTransaction | null) => {
+    if (!transaction) return;
+    const key = transaction.chargeId || transaction.paymentIntentId || transaction.transactionId;
+    if (key) candidates.set(key, transaction);
+  };
+
+  const chargeParams = stripeExpandParams(["data.customer"]);
+  chargeParams.set("limit", String(STRIPE_MAX_CANDIDATES));
+  chargeParams.set("created[gte]", String(window.startUnix));
+  chargeParams.set("created[lte]", String(window.endUnix));
+  const charges = await queryStripe("charges", chargeParams);
+  if (charges.error) errors.push(`charges: ${charges.error}`);
+  for (const charge of asArray(asRecord(charges.data).data)) add(parseStripeCharge(charge));
+
+  const intentParams = stripeExpandParams(["data.customer", "data.payment_method", "data.latest_charge"]);
+  intentParams.set("limit", String(STRIPE_MAX_CANDIDATES));
+  intentParams.set("created[gte]", String(window.startUnix));
+  intentParams.set("created[lte]", String(window.endUnix));
+  const intents = await queryStripe("payment_intents", intentParams);
+  if (intents.error) errors.push(`payment_intents: ${intents.error}`);
+  for (const intent of asArray(asRecord(intents.data).data)) add(parseStripePaymentIntent(intent));
+
+  return {
+    transactions: Array.from(candidates.values()),
+    candidatesCount: candidates.size,
+    error: errors.length ? errors.join("; ") : undefined,
+  };
 }
 
 function stripJsonBom(value: string) {
@@ -558,6 +845,102 @@ function candidateScore(transaction: MatchableTransaction, order: CustomerOrderH
   return null;
 }
 
+function verificationFromStripeTransaction(
+  order: CustomerOrderHistoryItem,
+  transaction: StripeTransaction,
+  options: {
+    confidence: GatewayVerification["confidence"];
+    matchedBy: string;
+    candidatesCount: number;
+    rawSummary: string;
+  }
+) {
+  return baseVerification(order, "stripe", {
+    matched: true,
+    confidence: options.confidence,
+    matchedBy: options.matchedBy,
+    transactionId: transaction.transactionId,
+    paymentIntentId: transaction.paymentIntentId,
+    chargeId: transaction.chargeId,
+    transactionStatus: transaction.status || "found",
+    amount: transaction.amount,
+    transactionDate: transaction.transactionDate,
+    stripeCustomerId: transaction.stripeCustomerId,
+    paymentMethodId: transaction.paymentMethodId,
+    last4: transaction.last4,
+    cardType: transaction.cardType,
+    candidatesCount: options.candidatesCount,
+    rawSummary: options.rawSummary,
+    configured: true,
+    notes: "Stripe transaction matched by server API.",
+  });
+}
+
+async function verifyStripeOrder(order: CustomerOrderHistoryItem): Promise<GatewayVerification> {
+  if (!stripeConfigured()) {
+    return baseVerification(order, "stripe", {
+      configured: false,
+      rawSummary: "Stripe verification was requested, but STRIPE_SECRET_KEY is not configured.",
+      notes: "Stripe verification not configured.",
+    });
+  }
+
+  if (order.transactionId) {
+    const result = await findStripeTransactionById(order.transactionId);
+    if (result.transaction) {
+      return verificationFromStripeTransaction(order, result.transaction, {
+        confidence: "exact",
+        matchedBy: "transactionId/paymentIntent/chargeId",
+        candidatesCount: result.candidatesCount,
+        rawSummary: "Stripe API checked WooCommerce transaction id as payment intent, charge, or checkout session and found a match.",
+      });
+    }
+
+    return baseVerification(order, "stripe", {
+      candidatesCount: result.candidatesCount,
+      rawSummary: result.error
+        ? `Stripe transaction id lookup failed: ${result.error}`
+        : "Stripe API checked WooCommerce transaction id as payment intent, charge, or checkout session and found no match.",
+      transactionStatus: "not_found",
+      configured: true,
+      notes: "No Stripe transaction found for WooCommerce transaction id.",
+    });
+  }
+
+  const window = stripeDateWindow(order);
+  const result = await collectStripeTransactionCandidates(order);
+  const orderTime = new Date(order.paidDate || order.attemptedDate || order.dateCreated).getTime();
+  const dateDistance = (transaction: StripeTransaction) => {
+    const transactionTime = new Date(transaction.transactionDate).getTime();
+    if (!Number.isFinite(orderTime) || !Number.isFinite(transactionTime)) return Number.MAX_SAFE_INTEGER;
+    return Math.abs(transactionTime - orderTime);
+  };
+  const scored = result.transactions
+    .map((transaction) => ({ transaction, score: candidateScore(transaction, order, window.start, window.end) }))
+    .filter((candidate): candidate is { transaction: StripeTransaction; score: NonNullable<ReturnType<typeof candidateScore>> } => Boolean(candidate.score))
+    .sort((a, b) => b.score.rank - a.score.rank || dateDistance(a.transaction) - dateDistance(b.transaction));
+  const best = scored[0];
+
+  if (best) {
+    return verificationFromStripeTransaction(order, best.transaction, {
+      confidence: best.score.confidence,
+      matchedBy: best.score.matchedBy,
+      candidatesCount: result.candidatesCount,
+      rawSummary: `Stripe API searched a +/- ${STRIPE_MATCH_WINDOW_DAYS} day date window; matched best transaction by ${best.score.matchedBy} among ${result.candidatesCount} candidate(s).`,
+    });
+  }
+
+  return baseVerification(order, "stripe", {
+    candidatesCount: result.candidatesCount,
+    rawSummary: result.error
+      ? `Stripe date-window lookup completed with errors: ${result.error}`
+      : `Stripe API searched a +/- ${STRIPE_MATCH_WINDOW_DAYS} day date window using amount plus email, phone, name, company, and address. No match found among ${result.candidatesCount} candidate(s).`,
+    transactionStatus: "not_found",
+    configured: true,
+    notes: "No Stripe transaction matched WooCommerce order details.",
+  });
+}
+
 function verificationFromNmiTransaction(
   order: CustomerOrderHistoryItem,
   transaction: NmiTransaction,
@@ -753,6 +1136,10 @@ export async function verifyOrderPayment(order: CustomerOrderHistoryItem, option
   const configured = providerConfigured(provider);
   const isCryptoHold = provider === "crypto" && order.status === "on-hold";
 
+  if (provider === "stripe" && options.verifyGateways) {
+    return verifyStripeOrder(order);
+  }
+
   if (provider === "authorize_net" && options.verifyGateways) {
     return verifyAuthorizeNetOrder(order);
   }
@@ -764,7 +1151,9 @@ export async function verifyOrderPayment(order: CustomerOrderHistoryItem, option
   return baseVerification(order, provider, {
     configured,
     transactionStatus: isCryptoHold ? "on_hold" : "not_verified",
-    rawSummary: provider === "authorize_net" && configured
+    rawSummary: provider === "stripe" && configured
+      ? "Stripe verification skipped. Run single customer sync with verifyGateways=true to check Stripe."
+      : provider === "authorize_net" && configured
       ? "Authorize.net verification skipped. Run single customer sync with verifyGateways=true to check Authorize.net."
       : provider === "nmi" && configured
       ? "NMI verification skipped. Run single customer sync with verifyGateways=true to check NMI Query API."
@@ -773,6 +1162,8 @@ export async function verifyOrderPayment(order: CustomerOrderHistoryItem, option
         : "Gateway verification not configured.",
     notes: isCryptoHold
       ? "Crypto order on hold. No completed payment verified."
+      : provider === "stripe" && configured
+        ? "Stripe verification was not requested for this sync."
       : provider === "authorize_net" && configured
         ? "Authorize.net verification was not requested for this sync."
       : provider === "nmi" && configured

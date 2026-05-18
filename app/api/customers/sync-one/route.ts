@@ -43,11 +43,16 @@ function getOrderTotal(order: WooCommerceOrder, lineItems = getLineItems(order))
   return lineItems.reduce((sum, item) => sum + item.total, 0);
 }
 
-function isNmiCliqOrder(order: Pick<CustomerOrderHistoryItem, "paymentMethod" | "paymentMethodTitle">) {
+function isStripeOrder(order: Pick<CustomerOrderHistoryItem, "paymentMethod" | "paymentMethodTitle">) {
   const method = (order.paymentMethod ?? "").toLowerCase();
   const title = (order.paymentMethodTitle ?? "").toLowerCase();
   const value = `${method} ${title}`;
-  return method.includes("nmi") ||
+  const stripeLike = value.includes("stripe") ||
+    value.includes("payment_intent") ||
+    value.includes("payment intent") ||
+    value.includes("checkout_session") ||
+    value.includes("checkout session");
+  const nmiLike = method.includes("nmi") ||
     method.includes("cliq") ||
     method.includes("gateway") ||
     title.includes("quick pay") ||
@@ -56,6 +61,19 @@ function isNmiCliqOrder(order: Pick<CustomerOrderHistoryItem, "paymentMethod" | 
     value.includes("cliq") ||
     value.includes("quick pay") ||
     value.includes("gateway");
+  const authorizeLike = value.includes("authorize_net") ||
+    value.includes("authorize.net") ||
+    value.includes("authorize") ||
+    value.includes("cim") ||
+    value.includes("credit card payment");
+  if (stripeLike) return true;
+  if (nmiLike || authorizeLike || value.includes("crypto")) return false;
+  return method === "card" ||
+    title === "card" ||
+    value.includes(" card") ||
+    value.includes("card ") ||
+    value.includes("credit card") ||
+    value.includes("checkout");
 }
 
 async function buildOrderHistoryItem(order: WooCommerceOrder, verifyGateways: boolean): Promise<CustomerOrderHistoryItem> {
@@ -110,6 +128,10 @@ async function buildOrderHistoryItem(order: WooCommerceOrder, verifyGateways: bo
       customerVaultId: "",
       paymentProfileId: "",
       customerProfileId: "",
+      paymentIntentId: "",
+      chargeId: "",
+      stripeCustomerId: "",
+      paymentMethodId: "",
       last4: "",
       cardType: "",
       candidatesCount: 0,
@@ -119,7 +141,7 @@ async function buildOrderHistoryItem(order: WooCommerceOrder, verifyGateways: bo
       notes: "",
     },
   };
-  item.gatewayVerification = await verifyOrderPayment(item, { verifyGateways: verifyGateways && isNmiCliqOrder(item) });
+  item.gatewayVerification = await verifyOrderPayment(item, { verifyGateways: verifyGateways && isStripeOrder(item) });
   return item;
 }
 
@@ -331,6 +353,10 @@ async function buildCustomerFromOrders(email: string, orders: WooCommerceOrder[]
       customerVaultId: "",
       paymentProfileId: "",
       customerProfileId: "",
+      paymentIntentId: "",
+      chargeId: "",
+      stripeCustomerId: "",
+      paymentMethodId: "",
       last4: "",
       cardType: "",
       candidatesCount: 0,
@@ -376,12 +402,17 @@ export async function POST(request: Request) {
   const products = unique(customer.orders.flatMap((order) => order.lineItems.map((item) => item.name)));
   const ordersWithZeroTotal = orders.filter((order) => parseMoney(order.total) <= 0).length;
   const ordersRecoveredFromLineItems = orders.filter((order) => parseMoney(order.total) <= 0 && getOrderTotal(order) > 0).length;
+  const gatewayConfiguration = getGatewayConfigurationSummary();
+  const stripeOrders = customer.orders.filter((order) => order.gatewayVerification.provider === "stripe");
+  const stripeMatchedOrders = stripeOrders.filter((order) => order.gatewayVerification.matched).length;
+  const stripeUnmatchedOrders = stripeOrders.filter((order) => !order.gatewayVerification.matched).length;
   const authorizeOrders = customer.orders.filter((order) => order.gatewayVerification.provider === "authorize_net");
   const authorizeMatchedOrders = authorizeOrders.filter((order) => order.gatewayVerification.matched).length;
   const authorizeUnmatchedOrders = authorizeOrders.filter((order) => !order.gatewayVerification.matched).length;
   const nmiOrders = customer.orders.filter((order) => order.gatewayVerification.provider === "nmi");
   const nmiMatchedOrders = nmiOrders.filter((order) => order.gatewayVerification.matched).length;
   const nmiUnmatchedOrders = nmiOrders.filter((order) => !order.gatewayVerification.matched).length;
+  const stripeWarning = verifyGateways && stripeOrders.length === 0 ? "No Stripe WooCommerce orders found for this customer." : "";
 
   return NextResponse.json({
     email,
@@ -410,21 +441,26 @@ export async function POST(request: Request) {
     pagesFetchedByStatus: result.pagesFetchedByStatus,
     failedRequests: result.failedRequests,
     partialSync: result.partialSync,
-    warning: [warning, result.warning].filter(Boolean).join(" "),
+    warning: [warning, result.warning, stripeWarning].filter(Boolean).join(" "),
     ordersWithZeroTotal,
     ordersRecoveredFromLineItems,
-    gatewayVerificationChecked: verifyGateways ? nmiOrders.length : 0,
+    gatewayVerificationChecked: verifyGateways ? stripeOrders.length : 0,
     gatewayVerificationConfigured: hasConfiguredGateway(),
-    gatewayConfiguration: getGatewayConfigurationSummary(),
+    gatewayConfiguration,
     verifyGateways,
+    stripeVerificationRequested: verifyGateways,
+    stripeVerificationConfigured: gatewayConfiguration.stripe,
+    stripeOrdersChecked: verifyGateways ? stripeOrders.length : 0,
+    stripeMatchedOrders,
+    stripeUnmatchedOrders,
     authorizeVerificationRequested: false,
-    authorizeVerificationConfigured: getGatewayConfigurationSummary().authorizeNet,
+    authorizeVerificationConfigured: gatewayConfiguration.authorizeNet,
     authorizeOrdersChecked: 0,
     authorizeMatchedOrders,
     authorizeUnmatchedOrders,
-    nmiVerificationRequested: verifyGateways,
-    nmiVerificationConfigured: getGatewayConfigurationSummary().nmi,
-    nmiOrdersChecked: verifyGateways ? nmiOrders.length : 0,
+    nmiVerificationRequested: false,
+    nmiVerificationConfigured: gatewayConfiguration.nmi,
+    nmiOrdersChecked: 0,
     nmiMatchedOrders,
     nmiUnmatchedOrders,
   });

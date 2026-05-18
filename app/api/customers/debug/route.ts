@@ -21,6 +21,10 @@ type DebugGatewayVerification = {
   customerVaultId?: string;
   paymentProfileId?: string;
   customerProfileId?: string;
+  paymentIntentId?: string;
+  chargeId?: string;
+  stripeCustomerId?: string;
+  paymentMethodId?: string;
   last4?: string;
   cardType?: string;
   candidatesCount?: number;
@@ -72,6 +76,9 @@ type DebugCustomer = {
   nmiMatchedOrders?: number;
   nmiUnmatchedOrders?: number;
   nmiLastCheckedAt?: string;
+  stripeMatchedOrders?: number;
+  stripeUnmatchedOrders?: number;
+  stripeLastCheckedAt?: string;
 };
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number) {
@@ -98,6 +105,10 @@ function gatewaySummary(verification?: DebugGatewayVerification) {
     customerVaultId: verification.customerVaultId ?? "",
     paymentProfileId: verification.paymentProfileId ?? "",
     customerProfileId: verification.customerProfileId ?? "",
+    paymentIntentId: verification.paymentIntentId ?? "",
+    chargeId: verification.chargeId ?? "",
+    stripeCustomerId: verification.stripeCustomerId ?? "",
+    paymentMethodId: verification.paymentMethodId ?? "",
     last4: verification.last4 ?? "",
     cardType: verification.cardType ?? "",
     candidatesCount: verification.matched ? Math.max(1, candidatesCount) : candidatesCount,
@@ -139,6 +150,71 @@ const debugProjection = {
   hasOrdersArray: { $isArray: "$orders" },
   ordersStoredCount: { $cond: [{ $isArray: "$orders" }, { $size: "$orders" }, 0] },
   productJourneyCount: { $cond: [{ $isArray: "$productJourney" }, { $size: "$productJourney" }, 0] },
+  stripeMatchedOrders: {
+    $cond: [
+      { $isArray: "$orders" },
+      {
+        $size: {
+          $filter: {
+            input: "$orders",
+            as: "order",
+            cond: {
+              $and: [
+                { $eq: ["$$order.gatewayVerification.provider", "stripe"] },
+                { $eq: ["$$order.gatewayVerification.matched", true] },
+              ],
+            },
+          },
+        },
+      },
+      0,
+    ],
+  },
+  stripeUnmatchedOrders: {
+    $cond: [
+      { $isArray: "$orders" },
+      {
+        $size: {
+          $filter: {
+            input: "$orders",
+            as: "order",
+            cond: {
+              $and: [
+                { $eq: ["$$order.gatewayVerification.provider", "stripe"] },
+                { $ne: ["$$order.gatewayVerification.matched", true] },
+              ],
+            },
+          },
+        },
+      },
+      0,
+    ],
+  },
+  stripeLastCheckedAt: {
+    $cond: [
+      { $isArray: "$orders" },
+      {
+        $reduce: {
+          input: {
+            $filter: {
+              input: "$orders",
+              as: "order",
+              cond: { $eq: ["$$order.gatewayVerification.provider", "stripe"] },
+            },
+          },
+          initialValue: "",
+          in: {
+            $cond: [
+              { $gt: [{ $ifNull: ["$$this.gatewayVerification.lastCheckedAt", ""] }, "$$value"] },
+              { $ifNull: ["$$this.gatewayVerification.lastCheckedAt", ""] },
+              "$$value",
+            ],
+          },
+        },
+      },
+      "",
+    ],
+  },
   authorizeMatchedOrders: {
     $cond: [
       { $isArray: "$orders" },
@@ -383,6 +459,10 @@ export async function GET(request: Request) {
     baseProductsPurchased: customer.baseProductsPurchased ?? [],
     boostProductsPurchased: customer.boostProductsPurchased ?? [],
     storedOrders,
+    stripeConfigured: Boolean(process.env.STRIPE_SECRET_KEY),
+    stripeLastCheckedAt: customer.stripeLastCheckedAt ?? "",
+    stripeMatchedOrders: customer.stripeMatchedOrders ?? 0,
+    stripeUnmatchedOrders: customer.stripeUnmatchedOrders ?? 0,
     authorizeConfigured: Boolean(process.env.AUTHORIZE_NET_API_LOGIN_ID && process.env.AUTHORIZE_NET_TRANSACTION_KEY),
     authorizeLastCheckedAt: customer.authorizeLastCheckedAt ?? "",
     authorizeMatchedOrders: customer.authorizeMatchedOrders ?? 0,
