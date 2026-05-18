@@ -9,7 +9,7 @@ import { isWooCommerceConfigured, type WooCommerceOrder } from "@/lib/woocommerc
 import { Customer, type CustomerDocument, type CustomerOrderHistoryItem, type CustomerOrderLineItem } from "@/models/Customer";
 
 const todayIso = new Date().toISOString();
-type SyncStatus = "success" | "success_with_warnings" | "failed" | "partial_timeout";
+type SyncStatus = "success" | "success_with_warnings" | "success_no_orders" | "failed" | "partial_timeout";
 
 const syncOneMaxPages = (requested?: unknown) => {
   const value = Number(requested ?? process.env.WC_SYNC_ONE_MAX_PAGES ?? 5);
@@ -54,6 +54,61 @@ function timeoutResponse(input: {
       : "sync-one reached its timeout before customer history could be saved.",
     warnings: input.warnings ?? ["sync-one route timeout reached."],
   });
+}
+
+function existingOrdersStoredCount(existing: CustomerDocument | null) {
+  return existing?.orders?.length ?? existing?.sourceCoverage?.ordersStored ?? existing?.sourceCoverage?.ordersStoredCount ?? 0;
+}
+
+function preservationResponse(input: {
+  email: string;
+  existing: CustomerDocument | null;
+  startedAt: number;
+  syncStatus: "partial_timeout" | "success_no_orders";
+  completedStrategies: string[];
+  skippedStrategies: string[];
+  timedOutStrategies: string[];
+  strategyTimings: Record<string, number>;
+  warnings: string[];
+  partialSync: boolean;
+  message: string;
+}) {
+  return NextResponse.json({
+    email: input.email,
+    saved: false,
+    syncStatus: input.syncStatus,
+    timeoutReached: input.syncStatus === "partial_timeout",
+    partialSync: input.partialSync,
+    existingDataPreserved: Boolean(input.existing),
+    existingOrdersStoredCount: existingOrdersStoredCount(input.existing),
+    existingPaidTotal: input.existing?.paidTotal ?? input.existing?.totalPaid ?? 0,
+    existingAttemptedTotal: input.existing?.attemptedTotal ?? 0,
+    totalSyncMs: Date.now() - input.startedAt,
+    completedStrategies: input.completedStrategies,
+    skippedStrategies: input.skippedStrategies,
+    timedOutStrategies: input.timedOutStrategies,
+    strategyTimings: input.strategyTimings,
+    ordersSaved: 0,
+    dedupedOrdersSaved: 0,
+    message: input.message,
+    warnings: input.warnings,
+  });
+}
+
+async function updatePartialSyncMetadata(existing: CustomerDocument | null, warning: string) {
+  const id = (existing as unknown as { _id?: unknown })?._id;
+  if (!id) return;
+  await Customer.updateOne(
+    { _id: id },
+    {
+      $set: {
+        normalizedEmail: existing?.email?.trim().toLowerCase() ?? "",
+        "sourceCoverage.lastAttemptedDeepSyncAt": todayIso,
+        "sourceCoverage.lastDeepSyncStatus": "partial_timeout",
+        "sourceCoverage.warningSummary": warning,
+      },
+    }
+  ).exec();
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number) {
@@ -366,6 +421,7 @@ async function buildCustomerFromOrders(
   return {
     name: latest?.billingName || existing?.name || input.customerName || email,
     email,
+    normalizedEmail: email.trim().toLowerCase(),
     phone: latest?.billingPhone || existing?.phone || input.phone || "",
     paidTotal,
     attemptedTotal,
@@ -439,6 +495,8 @@ async function buildCustomerFromOrders(
       paymentMethodCounts: audit.paymentMethodCounts,
       syncStatus: input.syncStatus,
       lastDeepSyncAt: input.deepWooSearch ? todayIso : "",
+      lastAttemptedDeepSyncAt: todayIso,
+      lastDeepSyncStatus: input.syncStatus,
       lastSyncedAt: todayIso,
       warningSummary: input.warningSummary,
       warnings: audit.warnings,
@@ -469,11 +527,13 @@ export async function POST(request: Request) {
     skipCompanySearch?: boolean;
     skipCustomerUserSearch?: boolean;
     skipAllOrdersScan?: boolean;
+    allowEmptyOverwrite?: boolean;
   };
   const email = body.email?.trim().toLowerCase();
   const verifyGateways = body.verifyGateways === true;
   const deepWooSearch = body.deepWooSearch === true;
   const fastMode = body.fastMode === true;
+  const allowEmptyOverwrite = body.allowEmptyOverwrite === true;
   const routeTimeoutMs = fastMode ? Math.min(syncOneRouteTimeoutMs(), 15000) : syncOneRouteTimeoutMs();
   const strategyTimeoutMs = fastMode ? Math.min(syncOneStrategyTimeoutMs(), 2500) : syncOneStrategyTimeoutMs();
   const routeController = new AbortController();
@@ -487,6 +547,36 @@ export async function POST(request: Request) {
     clearTimeout(routeTimeout);
     return NextResponse.json({ error: "email is required", syncStatus: "failed", totalSyncMs: Date.now() - startedAt }, { status: 400 });
   }
+
+  const remainingForInitialDbMs = Math.max(1, startedAt + routeTimeoutMs - Date.now());
+  const connectionResult = await withTimeout(connectToDatabase(), remainingForInitialDbMs);
+  if (connectionResult.timedOut || routeController.signal.aborted) {
+    clearTimeout(routeTimeout);
+    return timeoutResponse({
+      email,
+      startedAt,
+      warnings: ["MongoDB connection did not finish before sync-one timeout."],
+    });
+  }
+  if (!connectionResult.value) {
+    clearTimeout(routeTimeout);
+    return NextResponse.json({ error: "MongoDB is unavailable.", email, saved: false, ordersFetchedForEmail: 0, syncStatus: "failed", totalSyncMs: Date.now() - startedAt }, { status: 503 });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+  const existingResult = await withTimeout(
+    Customer.findOne({ $or: [{ normalizedEmail }, { email: normalizedEmail }] }).lean<CustomerDocument | null>().exec(),
+    Math.max(1, startedAt + routeTimeoutMs - Date.now())
+  );
+  if (existingResult.timedOut || routeController.signal.aborted) {
+    clearTimeout(routeTimeout);
+    return timeoutResponse({
+      email,
+      startedAt,
+      warnings: ["Existing customer lookup did not finish before sync-one timeout."],
+    });
+  }
+  const existing = existingResult.value;
 
   const matchResult = await fetchWooCustomerMatches({
     email,
@@ -508,15 +598,21 @@ export async function POST(request: Request) {
   });
   const { orders, audit } = matchResult;
   if (routeController.signal.aborted || matchResult.timeoutReached) {
+    const warning = warningSummary([...audit.warnings, "sync-one route timeout reached."]);
+    await withTimeout(updatePartialSyncMetadata(existing, warning), Math.max(1, Math.min(1000, startedAt + routeTimeoutMs - Date.now())));
     clearTimeout(routeTimeout);
-    return timeoutResponse({
+    return preservationResponse({
       email,
+      existing,
       startedAt,
+      syncStatus: "partial_timeout",
       completedStrategies: matchResult.completedStrategies,
       skippedStrategies: matchResult.skippedStrategies,
       timedOutStrategies: matchResult.timedOutStrategies,
       strategyTimings: matchResult.strategyTimings,
-      warnings: audit.warnings,
+      warnings: [...audit.warnings, "sync-one route timeout reached."],
+      partialSync: true,
+      message: "No matched orders were fetched before timeout. Existing customer data was preserved.",
     });
   }
   if (!orders) {
@@ -524,42 +620,46 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unable to fetch WooCommerce orders.", email, saved: false, syncStatus: "failed", totalSyncMs: Date.now() - startedAt }, { status: 502 });
   }
 
-  const remainingForDbMs = Math.max(1, startedAt + routeTimeoutMs - Date.now());
-  const connectionResult = await withTimeout(connectToDatabase(), remainingForDbMs);
-  if (connectionResult.timedOut || routeController.signal.aborted) {
-    clearTimeout(routeTimeout);
-    return timeoutResponse({
-      email,
-      startedAt,
-      completedStrategies: matchResult.completedStrategies,
-      skippedStrategies: matchResult.skippedStrategies,
-      timedOutStrategies: matchResult.timedOutStrategies,
-      strategyTimings: matchResult.strategyTimings,
-      warnings: [...audit.warnings, "MongoDB connection did not finish before sync-one timeout."],
-    });
-  }
-  if (!connectionResult.value) {
-    clearTimeout(routeTimeout);
-    return NextResponse.json({ error: "MongoDB is unavailable.", email, saved: false, ordersFetchedForEmail: orders.length, syncStatus: "failed", totalSyncMs: Date.now() - startedAt }, { status: 503 });
-  }
-
-  const existingResult = await withTimeout(Customer.findOne({ email }).lean<CustomerDocument | null>().exec(), Math.max(1, startedAt + routeTimeoutMs - Date.now()));
-  if (existingResult.timedOut || routeController.signal.aborted) {
-    clearTimeout(routeTimeout);
-    return timeoutResponse({
-      email,
-      startedAt,
-      completedStrategies: matchResult.completedStrategies,
-      skippedStrategies: matchResult.skippedStrategies,
-      timedOutStrategies: matchResult.timedOutStrategies,
-      strategyTimings: matchResult.strategyTimings,
-      warnings: [...audit.warnings, "Existing customer lookup did not finish before sync-one timeout."],
-    });
-  }
-  const existing = existingResult.value;
   const syncWarnings = warningSummary(audit.warnings);
   const partialSync = audit.warnings.length > 0 || matchResult.failedRequests.length > 0;
-  const syncStatus: SyncStatus = partialSync ? "success_with_warnings" : "success";
+  const zeroOrderUnsafe = orders.length === 0 && (matchResult.timeoutReached || partialSync || matchResult.timedOutStrategies.length > 0 || audit.warnings.length > 0);
+  if (zeroOrderUnsafe && !allowEmptyOverwrite) {
+    const warning = warningSummary(audit.warnings.length ? audit.warnings : ["No matched orders were fetched before timeout."]);
+    await withTimeout(updatePartialSyncMetadata(existing, warning), Math.max(1, Math.min(1000, startedAt + routeTimeoutMs - Date.now())));
+    clearTimeout(routeTimeout);
+    return preservationResponse({
+      email,
+      existing,
+      startedAt,
+      syncStatus: "partial_timeout",
+      completedStrategies: matchResult.completedStrategies,
+      skippedStrategies: matchResult.skippedStrategies,
+      timedOutStrategies: matchResult.timedOutStrategies,
+      strategyTimings: matchResult.strategyTimings,
+      warnings: audit.warnings,
+      partialSync: true,
+      message: "No matched orders were fetched before timeout. Existing customer data was preserved.",
+    });
+  }
+
+  if (orders.length === 0 && !allowEmptyOverwrite) {
+    clearTimeout(routeTimeout);
+    return preservationResponse({
+      email,
+      existing,
+      startedAt,
+      syncStatus: "success_no_orders",
+      completedStrategies: matchResult.completedStrategies,
+      skippedStrategies: matchResult.skippedStrategies,
+      timedOutStrategies: matchResult.timedOutStrategies,
+      strategyTimings: matchResult.strategyTimings,
+      warnings: audit.warnings,
+      partialSync: false,
+      message: "No matched orders were found. Existing customer data was preserved.",
+    });
+  }
+
+  const syncStatus: SyncStatus = orders.length === 0 ? "success_no_orders" : partialSync ? "success_with_warnings" : "success";
   const customerResult = await withTimeout(buildCustomerFromOrders(email, orders, existing, verifyGateways, audit, {
     phone: body.phone,
     customerName: body.customerName,
@@ -581,8 +681,8 @@ export async function POST(request: Request) {
   }
   const customer = customerResult.value;
   const saveResult = await withTimeout(Customer.findOneAndUpdate(
-    { email },
-    { $set: customer },
+    { $or: [{ normalizedEmail }, { email: normalizedEmail }] },
+    { $set: { ...customer, normalizedEmail } },
     { upsert: true, new: true, setDefaultsOnInsert: true }
   ).exec(), Math.max(1, startedAt + routeTimeoutMs - Date.now()));
   if (saveResult.timedOut || routeController.signal.aborted) {

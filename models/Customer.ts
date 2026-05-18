@@ -105,6 +105,7 @@ export interface CustomerProductJourneyItem {
 export interface CustomerDocument {
   name: string;
   email: string;
+  normalizedEmail: string;
   phone: string;
   totalPaid: number;
   paidTotal: number;
@@ -172,8 +173,10 @@ export interface CustomerSourceCoverage {
   matchReasonCounts: Record<string, number>;
   statusCounts: Record<string, number>;
   paymentMethodCounts: Record<string, number>;
-  syncStatus: "success" | "success_with_warnings" | "failed" | "";
+  syncStatus: "success" | "success_with_warnings" | "success_no_orders" | "failed" | "partial_timeout" | "";
   lastDeepSyncAt: string;
+  lastAttemptedDeepSyncAt: string;
+  lastDeepSyncStatus: "success" | "success_with_warnings" | "success_no_orders" | "failed" | "partial_timeout" | "";
   lastSyncedAt: string;
   warningSummary: string;
   warnings: string[];
@@ -288,8 +291,10 @@ const customerSourceCoverageSchema = new Schema<CustomerSourceCoverage>(
     matchReasonCounts: { type: Schema.Types.Mixed, default: () => ({}) },
     statusCounts: { type: Schema.Types.Mixed, default: () => ({}) },
     paymentMethodCounts: { type: Schema.Types.Mixed, default: () => ({}) },
-    syncStatus: { type: String, enum: ["success", "success_with_warnings", "failed", ""], default: "" },
+    syncStatus: { type: String, enum: ["success", "success_with_warnings", "success_no_orders", "failed", "partial_timeout", ""], default: "" },
     lastDeepSyncAt: { type: String, default: "" },
+    lastAttemptedDeepSyncAt: { type: String, default: "" },
+    lastDeepSyncStatus: { type: String, enum: ["success", "success_with_warnings", "success_no_orders", "failed", "partial_timeout", ""], default: "" },
     lastSyncedAt: { type: String, default: "" },
     warningSummary: { type: String, default: "" },
     warnings: { type: [String], default: [] },
@@ -316,6 +321,7 @@ const customerSchema = new Schema<CustomerDocument>(
   {
     name: { type: String, required: true },
     email: { type: String, required: true, unique: true },
+    normalizedEmail: { type: String, default: "" },
     phone: { type: String, required: true },
     totalPaid: { type: Number, required: true },
     paidTotal: { type: Number, required: true, default: 0 },
@@ -379,10 +385,13 @@ const customerSchema = new Schema<CustomerDocument>(
 );
 
 customerSchema.pre("validate", function () {
+  this.normalizedEmail = this.email?.trim().toLowerCase() ?? "";
   if (this.paidTotal === undefined || this.paidTotal === null) this.paidTotal = this.totalPaid ?? 0;
   if (this.totalPaid === undefined || this.totalPaid === null) this.totalPaid = this.paidTotal ?? 0;
   if (!this.score) this.score = calculateCustomerScore(this as unknown as CustomerDocument);
   if (!this.stars) this.stars = scoreToStars(this.score);
 });
+
+customerSchema.index({ normalizedEmail: 1 });
 
 export const Customer = mongoose.models.Customer || mongoose.model<CustomerDocument>("Customer", customerSchema);
