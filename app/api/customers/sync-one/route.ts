@@ -43,7 +43,16 @@ function getOrderTotal(order: WooCommerceOrder, lineItems = getLineItems(order))
   return lineItems.reduce((sum, item) => sum + item.total, 0);
 }
 
-async function buildOrderHistoryItem(order: WooCommerceOrder): Promise<CustomerOrderHistoryItem> {
+function isAuthorizeNetOrder(order: Pick<CustomerOrderHistoryItem, "paymentMethod" | "paymentMethodTitle">) {
+  const value = `${order.paymentMethod} ${order.paymentMethodTitle}`.toLowerCase();
+  return value.includes("authorize_net") ||
+    value.includes("authorize.net") ||
+    value.includes("authorize") ||
+    value.includes("cim") ||
+    value.includes("credit card payment");
+}
+
+async function buildOrderHistoryItem(order: WooCommerceOrder, verifyGateways: boolean): Promise<CustomerOrderHistoryItem> {
   const lineItems = getLineItems(order);
   const paid = isPaidOrder(order);
   const orderDate = order.date_created ?? todayIso;
@@ -93,13 +102,17 @@ async function buildOrderHistoryItem(order: WooCommerceOrder): Promise<CustomerO
       amount: getOrderTotal(order, lineItems),
       transactionDate: paid ? order.date_paid ?? orderDate : orderDate,
       paymentProfileId: "",
+      customerProfileId: "",
+      last4: "",
+      cardType: "",
+      candidatesCount: 0,
       rawSummary: "",
       lastCheckedAt: "",
       configured: false,
       notes: "",
     },
   };
-  item.gatewayVerification = await verifyOrderPayment(item);
+  item.gatewayVerification = await verifyOrderPayment(item, { verifyGateways: verifyGateways && isAuthorizeNetOrder(item) });
   return item;
 }
 
@@ -195,6 +208,21 @@ function buildRuleSummary(name: string, paidTotal: number, paidOrderCount: numbe
   };
 }
 
+function gatewayRank(verification?: CustomerOrderHistoryItem["gatewayVerification"]) {
+  if (!verification) return -1;
+  const confidenceRank: Record<string, number> = { exact: 5, high: 4, medium: 3, low: 2, not_found: 1 };
+  const matchedBonus = verification.matched ? 10 : 0;
+  const checkedBonus = verification.lastCheckedAt ? 1 : 0;
+  return matchedBonus + (confidenceRank[verification.confidence] ?? 0) + checkedBonus;
+}
+
+function chooseBestGatewayVerification(orders: CustomerOrderHistoryItem[]) {
+  return orders
+    .map((order) => order.gatewayVerification)
+    .filter(Boolean)
+    .sort((a, b) => gatewayRank(b) - gatewayRank(a) || new Date(b.lastCheckedAt || 0).getTime() - new Date(a.lastCheckedAt || 0).getTime())[0];
+}
+
 async function fetchOrdersForEmail(email: string) {
   const maxPages = syncOneMaxPages();
   const searched = await fetchWooCommerceOrders({ email, maxPages });
@@ -212,8 +240,8 @@ async function fetchOrdersForEmail(email: string) {
   };
 }
 
-async function buildCustomerFromOrders(email: string, orders: WooCommerceOrder[], existing: CustomerDocument | null) {
-  const orderHistory = (await Promise.all(orders.map(buildOrderHistoryItem)))
+async function buildCustomerFromOrders(email: string, orders: WooCommerceOrder[], existing: CustomerDocument | null, verifyGateways: boolean) {
+  const orderHistory = (await Promise.all(orders.map((order) => buildOrderHistoryItem(order, verifyGateways))))
     .sort((a, b) => new Date(b.dateCreated).getTime() - new Date(a.dateCreated).getTime());
   const productSummary = buildProductJourneySummary(orderHistory);
   const paidOrders = orderHistory.filter((order) => order.isPaid);
@@ -239,7 +267,7 @@ async function buildCustomerFromOrders(email: string, orders: WooCommerceOrder[]
   const { recommendedContactMethod, nextAction } = getNextAction(paidTotal, attemptedTotal, latest?.billingPhone ?? existing?.phone ?? "", leadUrgency);
   const productAwareNextAction = getProductAwareNextAction(paidTotal, attemptedTotal, nextAction, productSummary);
   const summary = buildRuleSummary(latest?.billingName || existing?.name || email, paidTotal, paidOrders.length, attemptedTotal);
-  const gatewayVerification = orderHistory.find((order) => order.gatewayVerification?.matched)?.gatewayVerification ?? latest?.gatewayVerification;
+  const gatewayVerification = chooseBestGatewayVerification(orderHistory) ?? latest?.gatewayVerification;
 
   return {
     name: latest?.billingName || existing?.name || email,
@@ -294,6 +322,10 @@ async function buildCustomerFromOrders(email: string, orders: WooCommerceOrder[]
       amount: 0,
       transactionDate: "",
       paymentProfileId: "",
+      customerProfileId: "",
+      last4: "",
+      cardType: "",
+      candidatesCount: 0,
       rawSummary: "",
       lastCheckedAt: "",
       configured: false,
@@ -309,8 +341,9 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "WooCommerce is not configured.", saved: false }, { status: 400 });
   }
 
-  const body = await request.json().catch(() => ({})) as { email?: string };
+  const body = await request.json().catch(() => ({})) as { email?: string; verifyGateways?: boolean };
   const email = body.email?.trim().toLowerCase();
+  const verifyGateways = body.verifyGateways === true;
   if (!email) return NextResponse.json({ error: "email is required" }, { status: 400 });
 
   const { result, orders, fetchedWithSearch, warning } = await fetchOrdersForEmail(email);
@@ -322,7 +355,7 @@ export async function POST(request: Request) {
   if (!connection) return NextResponse.json({ error: "MongoDB is unavailable.", email, saved: false, ordersFetchedForEmail: orders.length }, { status: 503 });
 
   const existing = await Customer.findOne({ email }).lean<CustomerDocument | null>();
-  const customer = await buildCustomerFromOrders(email, orders, existing);
+  const customer = await buildCustomerFromOrders(email, orders, existing, verifyGateways);
   await Customer.findOneAndUpdate(
     { email },
     { $set: customer },
@@ -335,6 +368,12 @@ export async function POST(request: Request) {
   const products = unique(customer.orders.flatMap((order) => order.lineItems.map((item) => item.name)));
   const ordersWithZeroTotal = orders.filter((order) => parseMoney(order.total) <= 0).length;
   const ordersRecoveredFromLineItems = orders.filter((order) => parseMoney(order.total) <= 0 && getOrderTotal(order) > 0).length;
+  const authorizeOrders = customer.orders.filter((order) => order.gatewayVerification.provider === "authorize_net");
+  const authorizeMatchedOrders = authorizeOrders.filter((order) => order.gatewayVerification.matched).length;
+  const authorizeUnmatchedOrders = authorizeOrders.filter((order) => !order.gatewayVerification.matched).length;
+  const nmiOrders = customer.orders.filter((order) => order.gatewayVerification.provider === "nmi");
+  const nmiMatchedOrders = nmiOrders.filter((order) => order.gatewayVerification.matched).length;
+  const nmiUnmatchedOrders = nmiOrders.filter((order) => !order.gatewayVerification.matched).length;
 
   return NextResponse.json({
     email,
@@ -366,8 +405,19 @@ export async function POST(request: Request) {
     warning: [warning, result.warning].filter(Boolean).join(" "),
     ordersWithZeroTotal,
     ordersRecoveredFromLineItems,
-    gatewayVerificationChecked: customer.orders.length,
+    gatewayVerificationChecked: verifyGateways ? authorizeOrders.length : 0,
     gatewayVerificationConfigured: hasConfiguredGateway(),
     gatewayConfiguration: getGatewayConfigurationSummary(),
+    verifyGateways,
+    authorizeVerificationRequested: verifyGateways,
+    authorizeVerificationConfigured: getGatewayConfigurationSummary().authorizeNet,
+    authorizeOrdersChecked: verifyGateways ? authorizeOrders.length : 0,
+    authorizeMatchedOrders,
+    authorizeUnmatchedOrders,
+    nmiVerificationRequested: false,
+    nmiVerificationConfigured: getGatewayConfigurationSummary().nmi,
+    nmiOrdersChecked: 0,
+    nmiMatchedOrders,
+    nmiUnmatchedOrders,
   });
 }

@@ -24,6 +24,10 @@ type GatewayVerification = {
   amount: number;
   transactionDate: string;
   paymentProfileId: string;
+  customerProfileId?: string;
+  last4?: string;
+  cardType?: string;
+  candidatesCount?: number;
   rawSummary: string;
   lastCheckedAt: string;
   configured: boolean;
@@ -195,6 +199,21 @@ function productCategoryBadgeClass(category?: string) {
   return "border-zinc-500/50 bg-zinc-500/15 text-zinc-200";
 }
 
+function verificationRank(verification?: GatewayVerification) {
+  if (!verification) return -1;
+  const confidenceRank: Record<string, number> = { exact: 5, high: 4, medium: 3, low: 2, not_found: 1 };
+  return (verification.matched ? 10 : 0) + (confidenceRank[verification.confidence] ?? 0) + (verification.lastCheckedAt ? 1 : 0);
+}
+
+function chooseBestVerification(customer: CustomerDetail, orders: OrderHistoryItem[]) {
+  return [
+    customer.gatewayVerification,
+    ...orders.map((order) => order.gatewayVerification),
+  ]
+    .filter((verification): verification is GatewayVerification => Boolean(verification))
+    .sort((a, b) => verificationRank(b) - verificationRank(a) || new Date(b.lastCheckedAt || 0).getTime() - new Date(a.lastCheckedAt || 0).getTime())[0];
+}
+
 function listOrDash(values: string[]) {
   return values.length ? values.join(", ") : "-";
 }
@@ -330,7 +349,7 @@ export default function CustomerDetailPage() {
   const templates = buildTemplates(customer, actualPaid, attempted, attemptedOrders);
   const isLead = actualPaid === 0 && attempted > 0;
   const latestRelevantOrder = attemptedOrders[0] ?? orders[0];
-  const verification = latestRelevantOrder?.gatewayVerification ?? customer.gatewayVerification;
+  const verification = chooseBestVerification(customer, orders);
   const productJourney = [...(customer.productJourney ?? [])].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
   const baseProductsPurchased = customer.baseProductsPurchased ?? [];
   const boostProductsPurchased = customer.boostProductsPurchased ?? [];
@@ -491,6 +510,9 @@ export default function CustomerDetailPage() {
           <div><p className="text-xs uppercase text-zinc-400">Gateway Status</p><p className="font-semibold">{verification?.matched ? "Payment verified" : verification?.transactionStatus || "Not verified"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Confidence</p><p className="font-semibold">{verification?.confidence || "not_found"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Matched By</p><p className="font-semibold">{verification?.matchedBy || "-"}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Transaction ID</p><p className="font-semibold">{verification?.transactionId || "-"}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Last 4</p><p className="font-semibold">{verification?.last4 || "-"}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Card Type</p><p className="font-semibold">{verification?.cardType || "-"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Last Checked</p><p className="font-semibold">{displayDateTime(verification?.lastCheckedAt)}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Recommended</p><p className="font-semibold">{verification?.matched ? "Payment verified" : "Manual follow-up"}</p></div>
         </div>
