@@ -48,6 +48,7 @@ export type WooCommerceCustomer = {
 export type WooCommerceOrder = {
   id: number;
   number?: string;
+  customer_id?: number;
   status?: string;
   total?: string;
   currency?: string;
@@ -79,6 +80,8 @@ export type WooCommerceFetchResult<T> = {
 
 type WooCommerceFetchOptions = {
   email?: string;
+  search?: string;
+  customerId?: number;
   statuses?: string[];
   maxPages?: number;
   perPage?: number;
@@ -156,6 +159,12 @@ async function fetchWooCommerceCollection<T>(resource: "customers" | "orders", o
       if (resource === "orders" && options.email) {
         url.searchParams.set("search", options.email);
       }
+      if (options.search) {
+        url.searchParams.set("search", options.search);
+      }
+      if (resource === "orders" && options.customerId) {
+        url.searchParams.set("customer", String(options.customerId));
+      }
 
       try {
         const response = await fetchWithTimeout(url, {
@@ -214,8 +223,8 @@ async function fetchWooCommerceCollection<T>(resource: "customers" | "orders", o
   };
 }
 
-export function fetchWooCommerceCustomers() {
-  return fetchWooCommerceCollection<WooCommerceCustomer>("customers");
+export function fetchWooCommerceCustomers(options: WooCommerceFetchOptions = {}) {
+  return fetchWooCommerceCollection<WooCommerceCustomer>("customers", options);
 }
 
 export function fetchWooCommerceOrders(options: WooCommerceFetchOptions = {}) {

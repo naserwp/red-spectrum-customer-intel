@@ -4,7 +4,8 @@ import { getOrderStatus, isPaidOrder, parseMoney } from "@/lib/businessMetrics";
 import { getGatewayConfigurationSummary, hasConfiguredGateway, verifyOrderPayment } from "@/lib/paymentGateways";
 import { connectToDatabase } from "@/lib/mongodb";
 import { buildProductJourneySummary, type ProductJourneySummary } from "@/lib/productClassification";
-import { fetchWooCommerceOrders, isWooCommerceConfigured, type WooCommerceOrder } from "@/lib/woocommerce";
+import { fetchWooCustomerMatches, type WooMatchedOrder, type WooSourceAudit } from "@/lib/wooCustomerMatching";
+import { isWooCommerceConfigured, type WooCommerceOrder } from "@/lib/woocommerce";
 import { Customer, type CustomerDocument, type CustomerOrderHistoryItem, type CustomerOrderLineItem } from "@/models/Customer";
 
 const todayIso = new Date().toISOString();
@@ -43,6 +44,19 @@ function getOrderTotal(order: WooCommerceOrder, lineItems = getLineItems(order))
   return lineItems.reduce((sum, item) => sum + item.total, 0);
 }
 
+function safeMetaValue(value: unknown) {
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value).slice(0, 120);
+  return "";
+}
+
+function getSafeMetaData(order: WooCommerceOrder) {
+  const sensitive = /(token|secret|password|pass|key|card|cc|cvv|nonce|auth|signature)/i;
+  return (order.meta_data ?? [])
+    .map((meta) => ({ key: String(meta.key ?? ""), value: safeMetaValue(meta.value) }))
+    .filter((meta) => meta.key && meta.value && !sensitive.test(meta.key))
+    .slice(0, 25);
+}
+
 function isStripeOrder(order: Pick<CustomerOrderHistoryItem, "paymentMethod" | "paymentMethodTitle">) {
   const method = (order.paymentMethod ?? "").toLowerCase();
   const title = (order.paymentMethodTitle ?? "").toLowerCase();
@@ -76,13 +90,14 @@ function isStripeOrder(order: Pick<CustomerOrderHistoryItem, "paymentMethod" | "
     value.includes("checkout");
 }
 
-async function buildOrderHistoryItem(order: WooCommerceOrder, verifyGateways: boolean): Promise<CustomerOrderHistoryItem> {
+async function buildOrderHistoryItem(order: WooMatchedOrder, verifyGateways: boolean): Promise<CustomerOrderHistoryItem> {
   const lineItems = getLineItems(order);
   const paid = isPaidOrder(order);
   const orderDate = order.date_created ?? todayIso;
   const item: CustomerOrderHistoryItem = {
     orderId: String(order.id),
     orderNumber: String(order.number ?? order.id),
+    customerId: Number(order.customer_id ?? 0),
     status: getOrderStatus(order) || "unknown",
     dateCreated: orderDate,
     dateModified: order.date_modified ?? "",
@@ -113,9 +128,12 @@ async function buildOrderHistoryItem(order: WooCommerceOrder, verifyGateways: bo
     products: lineItems,
     refundsCount: order.refunds?.length ?? (getOrderStatus(order) === "refunded" ? 1 : 0),
     refundsAmount: (order.refunds ?? []).reduce((sum, refund) => sum + Math.abs(parseMoney(refund.total)), 0),
+    metaData: getSafeMetaData(order),
     customerNote: order.customer_note ?? "",
     checkoutSource: "woocommerce",
     source: "woocommerce",
+    matchedBy: order.matchedBy ?? [],
+    matchConfidence: order.matchConfidence ?? "",
     gatewayVerification: {
       provider: "",
       matched: false,
@@ -252,24 +270,14 @@ function chooseBestGatewayVerification(orders: CustomerOrderHistoryItem[]) {
     .sort((a, b) => gatewayRank(b) - gatewayRank(a) || new Date(b.lastCheckedAt || 0).getTime() - new Date(a.lastCheckedAt || 0).getTime())[0];
 }
 
-async function fetchOrdersForEmail(email: string) {
-  const maxPages = syncOneMaxPages();
-  const searched = await fetchWooCommerceOrders({ email, maxPages });
-  const searchedOrders = searched?.items.filter((order) => getOrderEmail(order) === email) ?? [];
-  if (searchedOrders.length > 0 || !searched) {
-    return { result: searched, orders: searchedOrders, fetchedWithSearch: true };
-  }
-
-  const fallback = await fetchWooCommerceOrders({ maxPages });
-  return {
-    result: fallback,
-    orders: fallback?.items.filter((order) => getOrderEmail(order) === email) ?? [],
-    fetchedWithSearch: false,
-    warning: "WooCommerce email search returned no matching orders; used status-limited local filtering.",
-  };
-}
-
-async function buildCustomerFromOrders(email: string, orders: WooCommerceOrder[], existing: CustomerDocument | null, verifyGateways: boolean) {
+async function buildCustomerFromOrders(
+  email: string,
+  orders: WooMatchedOrder[],
+  existing: CustomerDocument | null,
+  verifyGateways: boolean,
+  audit: WooSourceAudit,
+  input: { phone?: string; customerName?: string; deepWooSearch: boolean }
+) {
   const orderHistory = (await Promise.all(orders.map((order) => buildOrderHistoryItem(order, verifyGateways))))
     .sort((a, b) => new Date(b.dateCreated).getTime() - new Date(a.dateCreated).getTime());
   const productSummary = buildProductJourneySummary(orderHistory);
@@ -299,9 +307,9 @@ async function buildCustomerFromOrders(email: string, orders: WooCommerceOrder[]
   const gatewayVerification = chooseBestGatewayVerification(orderHistory) ?? latest?.gatewayVerification;
 
   return {
-    name: latest?.billingName || existing?.name || email,
+    name: latest?.billingName || existing?.name || input.customerName || email,
     email,
-    phone: latest?.billingPhone || existing?.phone || "",
+    phone: latest?.billingPhone || existing?.phone || input.phone || "",
     paidTotal,
     attemptedTotal,
     totalPaid: paidTotal,
@@ -365,6 +373,15 @@ async function buildCustomerFromOrders(email: string, orders: WooCommerceOrder[]
       configured: false,
       notes: "No WooCommerce orders found for gateway verification.",
     },
+    sourceCoverage: {
+      deepWooSearch: input.deepWooSearch,
+      ordersStoredCount: orderHistory.length,
+      matchReasonCounts: audit.matchReasonCounts,
+      statusCounts: audit.statusCounts,
+      paymentMethodCounts: audit.paymentMethodCounts,
+      lastSyncedAt: todayIso,
+      warnings: audit.warnings,
+    },
     ...summary,
     recommendedAction: productAwareNextAction,
   };
@@ -375,13 +392,22 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "WooCommerce is not configured.", saved: false }, { status: 400 });
   }
 
-  const body = await request.json().catch(() => ({})) as { email?: string; verifyGateways?: boolean };
+  const body = await request.json().catch(() => ({})) as { email?: string; phone?: string; customerName?: string; company?: string; firstName?: string; lastName?: string; verifyGateways?: boolean; deepWooSearch?: boolean };
   const email = body.email?.trim().toLowerCase();
   const verifyGateways = body.verifyGateways === true;
+  const deepWooSearch = body.deepWooSearch === true;
   if (!email) return NextResponse.json({ error: "email is required" }, { status: 400 });
 
-  const { result, orders, fetchedWithSearch, warning } = await fetchOrdersForEmail(email);
-  if (!result) {
+  const matchResult = await fetchWooCustomerMatches({
+    email,
+    phone: body.phone,
+    firstName: body.firstName,
+    lastName: body.lastName,
+    customerName: body.customerName,
+    company: body.company,
+  }, { deepWooSearch, maxPages: syncOneMaxPages() });
+  const { orders, audit } = matchResult;
+  if (!orders) {
     return NextResponse.json({ error: "Unable to fetch WooCommerce orders.", email, saved: false }, { status: 502 });
   }
 
@@ -389,7 +415,7 @@ export async function POST(request: Request) {
   if (!connection) return NextResponse.json({ error: "MongoDB is unavailable.", email, saved: false, ordersFetchedForEmail: orders.length }, { status: 503 });
 
   const existing = await Customer.findOne({ email }).lean<CustomerDocument | null>();
-  const customer = await buildCustomerFromOrders(email, orders, existing, verifyGateways);
+  const customer = await buildCustomerFromOrders(email, orders, existing, verifyGateways, audit, { phone: body.phone, customerName: body.customerName, deepWooSearch });
   await Customer.findOneAndUpdate(
     { email },
     { $set: customer },
@@ -417,9 +443,16 @@ export async function POST(request: Request) {
   return NextResponse.json({
     email,
     saved: true,
-    fetchedWithSearch,
-    ordersFetchedForEmail: orders.length,
+    deepWooSearch,
+    ordersFetchedForEmail: audit.matches.byEmail.count,
+    ordersFetchedByEmail: audit.matches.byEmail.count,
+    ordersFetchedByPhone: audit.matches.byPhone.count,
+    ordersFetchedByName: audit.matches.byName.count,
+    ordersFetchedByCompany: audit.matches.byCompany.count,
+    ordersFetchedByCustomerUser: audit.matches.byCustomerUser.count,
+    dedupedOrdersSaved: customer.orders.length,
     ordersSaved: customer.orders.length,
+    paidTotal: customer.paidTotal,
     attemptedTotal: customer.attemptedTotal,
     attemptedOrderCount: customer.attemptedOrderCount,
     attemptedProducts: customer.attemptedProducts,
@@ -436,12 +469,14 @@ export async function POST(request: Request) {
     statuses,
     paymentMethods,
     products,
-    pagesFetched: result.pagesFetched,
-    fetchedByStatus: result.fetchedByStatus,
-    pagesFetchedByStatus: result.pagesFetchedByStatus,
-    failedRequests: result.failedRequests,
-    partialSync: result.partialSync,
-    warning: [warning, result.warning, stripeWarning].filter(Boolean).join(" "),
+    pagesFetched: matchResult.pagesFetched,
+    failedRequests: matchResult.failedRequests,
+    partialSync: audit.warnings.length > 0 || matchResult.failedRequests.length > 0,
+    matchReasonCounts: audit.matchReasonCounts,
+    statusCounts: audit.statusCounts,
+    paymentMethodCounts: audit.paymentMethodCounts,
+    sourceCoverage: customer.sourceCoverage,
+    warning: [...audit.warnings, stripeWarning].filter(Boolean).join(" "),
     ordersWithZeroTotal,
     ordersRecoveredFromLineItems,
     gatewayVerificationChecked: verifyGateways ? stripeOrders.length : 0,

@@ -54,6 +54,7 @@ type ProductJourneyItem = {
 type OrderHistoryItem = {
   orderId: string;
   orderNumber: string;
+  customerId?: number;
   status: string;
   dateCreated: string;
   dateModified: string;
@@ -79,7 +80,19 @@ type OrderHistoryItem = {
   customerNote: string;
   checkoutSource: string;
   source: string;
+  matchedBy?: string[];
+  matchConfidence?: string;
   gatewayVerification?: GatewayVerification;
+};
+
+type SourceCoverage = {
+  deepWooSearch?: boolean;
+  ordersStoredCount?: number;
+  matchReasonCounts?: Record<string, number>;
+  statusCounts?: Record<string, number>;
+  paymentMethodCounts?: Record<string, number>;
+  lastSyncedAt?: string;
+  warnings?: string[];
 };
 
 type CustomerDetail = {
@@ -120,6 +133,7 @@ type CustomerDetail = {
   lastAttemptedProduct?: string;
   productJourney?: ProductJourneyItem[];
   gatewayVerification?: GatewayVerification;
+  sourceCoverage?: SourceCoverage;
   orderCount: number;
   averageOrderValue: number;
   firstOrderDate: string;
@@ -422,6 +436,18 @@ export default function CustomerDetailPage() {
         <p className="font-semibold">Timeline not synced yet - run single customer sync</p>
         <p className="mt-1 text-sm text-amber-100/80">This customer has paid value and historical order count, but no saved WooCommerce order timeline on the selected record.</p>
       </div>}
+
+      <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+        <h2 className="text-xl font-semibold text-emerald-300">Data Source Coverage</h2>
+        <div className="mt-3 grid gap-3 md:grid-cols-4">
+          <div><p className="text-xs uppercase text-zinc-400">Orders Stored</p><p className="font-semibold">{customer.sourceCoverage?.ordersStoredCount ?? orders.length}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Match Methods Used</p><p className="font-semibold">{Object.keys(customer.sourceCoverage?.matchReasonCounts ?? {}).join(", ") || "-"}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Deep Woo Sync</p><p className="font-semibold">{customer.sourceCoverage?.deepWooSearch ? "Yes" : "No"}</p></div>
+          <div><p className="text-xs uppercase text-zinc-400">Last Synced</p><p className="font-semibold">{displayDateTime(customer.sourceCoverage?.lastSyncedAt || customer.lastSyncedAt)}</p></div>
+        </div>
+        {customer.sourceCoverage?.warnings?.length ? <p className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100">{customer.sourceCoverage.warnings.join(" ")}</p> : null}
+        {!customer.sourceCoverage?.deepWooSearch && <p className="mt-3 text-sm text-zinc-400">Suggested action: run deep WooCommerce sync if WooCommerce admin shows more orders than this timeline.</p>}
+      </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
         <h2 className="text-xl font-semibold text-sky-300">Customer Product Journey</h2>

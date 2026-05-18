@@ -15,6 +15,11 @@ export interface CustomerOrderLineItem {
   price: number;
 }
 
+export interface CustomerOrderMetaSummary {
+  key: string;
+  value: string;
+}
+
 export interface CustomerBillingAddress {
   address1: string;
   address2: string;
@@ -52,6 +57,7 @@ export interface GatewayVerification {
 export interface CustomerOrderHistoryItem {
   orderId: string;
   orderNumber: string;
+  customerId: number;
   status: string;
   dateCreated: string;
   dateModified: string;
@@ -75,9 +81,12 @@ export interface CustomerOrderHistoryItem {
   products: CustomerOrderLineItem[];
   refundsCount: number;
   refundsAmount: number;
+  metaData: CustomerOrderMetaSummary[];
   customerNote: string;
   checkoutSource: string;
   source: string;
+  matchedBy: string[];
+  matchConfidence: string;
   gatewayVerification: GatewayVerification;
 }
 
@@ -153,6 +162,17 @@ export interface CustomerDocument {
   recommendedContactMethod: string;
   nextAction: string;
   gatewayVerification: GatewayVerification;
+  sourceCoverage: CustomerSourceCoverage;
+}
+
+export interface CustomerSourceCoverage {
+  deepWooSearch: boolean;
+  ordersStoredCount: number;
+  matchReasonCounts: Record<string, number>;
+  statusCounts: Record<string, number>;
+  paymentMethodCounts: Record<string, number>;
+  lastSyncedAt: string;
+  warnings: string[];
 }
 
 const customerOrderLineItemSchema = new Schema<CustomerOrderLineItem>(
@@ -177,6 +197,14 @@ const customerBillingAddressSchema = new Schema<CustomerBillingAddress>(
     state: { type: String, default: "" },
     postcode: { type: String, default: "" },
     country: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
+const customerOrderMetaSummarySchema = new Schema<CustomerOrderMetaSummary>(
+  {
+    key: { type: String, default: "" },
+    value: { type: String, default: "" },
   },
   { _id: false }
 );
@@ -213,6 +241,7 @@ const customerOrderHistorySchema = new Schema<CustomerOrderHistoryItem>(
   {
     orderId: { type: String, default: "" },
     orderNumber: { type: String, default: "" },
+    customerId: { type: Number, default: 0 },
     status: { type: String, default: "" },
     dateCreated: { type: String, default: "" },
     dateModified: { type: String, default: "" },
@@ -236,10 +265,26 @@ const customerOrderHistorySchema = new Schema<CustomerOrderHistoryItem>(
     products: { type: [customerOrderLineItemSchema], default: [] },
     refundsCount: { type: Number, default: 0 },
     refundsAmount: { type: Number, default: 0 },
+    metaData: { type: [customerOrderMetaSummarySchema], default: [] },
     customerNote: { type: String, default: "" },
     checkoutSource: { type: String, default: "woocommerce" },
     source: { type: String, default: "woocommerce" },
+    matchedBy: { type: [String], default: [] },
+    matchConfidence: { type: String, default: "" },
     gatewayVerification: { type: gatewayVerificationSchema, default: () => ({}) },
+  },
+  { _id: false }
+);
+
+const customerSourceCoverageSchema = new Schema<CustomerSourceCoverage>(
+  {
+    deepWooSearch: { type: Boolean, default: false },
+    ordersStoredCount: { type: Number, default: 0 },
+    matchReasonCounts: { type: Schema.Types.Mixed, default: () => ({}) },
+    statusCounts: { type: Schema.Types.Mixed, default: () => ({}) },
+    paymentMethodCounts: { type: Schema.Types.Mixed, default: () => ({}) },
+    lastSyncedAt: { type: String, default: "" },
+    warnings: { type: [String], default: [] },
   },
   { _id: false }
 );
@@ -320,6 +365,7 @@ const customerSchema = new Schema<CustomerDocument>(
     recommendedContactMethod: { type: String, default: "email" },
     nextAction: { type: String, default: "Manual review" },
     gatewayVerification: { type: gatewayVerificationSchema, default: () => ({}) },
+    sourceCoverage: { type: customerSourceCoverageSchema, default: () => ({}) },
   },
   { timestamps: true }
 );

@@ -51,9 +51,18 @@ type SyncedCustomer = CustomerScoreInput & ProductJourneySummary & {
   recommendedContactMethod: string;
   nextAction: string;
   gatewayVerification: CustomerOrderHistoryItem["gatewayVerification"];
+  sourceCoverage: {
+    deepWooSearch: boolean;
+    ordersStoredCount: number;
+    matchReasonCounts: Record<string, number>;
+    statusCounts: Record<string, number>;
+    paymentMethodCounts: Record<string, number>;
+    lastSyncedAt: string;
+    warnings: string[];
+  };
 };
 
-type CustomerAccumulator = Omit<SyncedCustomer, "score" | "stars" | "tier" | "leadStatus" | "paymentStatus" | "aiSummary" | "aiSummaryPreview" | "riskExplanation" | "recommendedAction" | "averageOrderValue" | "estimatedCreditLimit" | "riskLevel" | "lastSyncedAt" | "leadUrgency" | "recommendedContactMethod" | "nextAction" | "gatewayVerification" | keyof ProductJourneySummary>;
+type CustomerAccumulator = Omit<SyncedCustomer, "score" | "stars" | "tier" | "leadStatus" | "paymentStatus" | "aiSummary" | "aiSummaryPreview" | "riskExplanation" | "recommendedAction" | "averageOrderValue" | "estimatedCreditLimit" | "riskLevel" | "lastSyncedAt" | "leadUrgency" | "recommendedContactMethod" | "nextAction" | "gatewayVerification" | "sourceCoverage" | keyof ProductJourneySummary>;
 type RuleSummaryCustomer = Omit<SyncedCustomer, "aiSummary" | "aiSummaryPreview" | "riskExplanation" | "recommendedAction">;
 
 const subscriptionStatuses: CustomerScoreInput["subscriptionStatus"][] = ["active", "inactive", "canceled", "past_due", "unknown"];
@@ -93,6 +102,14 @@ function getPaymentMethodLabel(order: WooCommerceOrder) {
   return order.payment_method_title || order.payment_method || "";
 }
 
+function countBy(values: string[]) {
+  return values.reduce<Record<string, number>>((acc, value) => {
+    const key = value || "unknown";
+    acc[key] = (acc[key] ?? 0) + 1;
+    return acc;
+  }, {});
+}
+
 async function buildOrderHistoryItem(order: WooCommerceOrder): Promise<CustomerOrderHistoryItem> {
   const lineItems = getLineItems(order);
   const paid = isPaidOrder(order);
@@ -100,6 +117,7 @@ async function buildOrderHistoryItem(order: WooCommerceOrder): Promise<CustomerO
   const item: CustomerOrderHistoryItem = {
     orderId: String(order.id),
     orderNumber: String(order.number ?? order.id),
+    customerId: Number(order.customer_id ?? 0),
     status: getOrderStatus(order) || "unknown",
     dateCreated: orderDate,
     dateModified: order.date_modified ?? "",
@@ -130,9 +148,12 @@ async function buildOrderHistoryItem(order: WooCommerceOrder): Promise<CustomerO
     products: lineItems,
     refundsCount: order.refunds?.length ?? (getOrderStatus(order) === "refunded" ? 1 : 0),
     refundsAmount: (order.refunds ?? []).reduce((sum, refund) => sum + Math.abs(parseMoney(refund.total)), 0),
+    metaData: [],
     customerNote: order.customer_note ?? "",
     checkoutSource: "woocommerce",
     source: "woocommerce",
+    matchedBy: getOrderEmail(order) ? ["email"] : [],
+    matchConfidence: getOrderEmail(order) ? "exact" : "",
     gatewayVerification: {
       provider: "",
       matched: false,
@@ -402,6 +423,15 @@ async function transformOrdersToCustomers(orders: WooCommerceOrder[]) {
         lastCheckedAt: "",
         configured: false,
         notes: "No WooCommerce orders found for gateway verification.",
+      },
+      sourceCoverage: {
+        deepWooSearch: false,
+        ordersStoredCount: sortedOrders.length,
+        matchReasonCounts: { email: sortedOrders.length },
+        statusCounts: countBy(sortedOrders.map((order) => order.status)),
+        paymentMethodCounts: countBy(sortedOrders.map((order) => order.paymentMethodTitle || order.paymentMethod || "unknown")),
+        lastSyncedAt: todayIso,
+        warnings: [],
       },
     };
     const aiSummary = buildRuleBasedSummary(baseCustomer);

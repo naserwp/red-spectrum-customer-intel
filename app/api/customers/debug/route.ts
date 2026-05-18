@@ -7,7 +7,7 @@ export const dynamic = "force-dynamic";
 const DEBUG_QUERY_TIMEOUT_MS = 2000;
 const DEBUG_ROUTE_TIMEOUT_MS = 2800;
 const DUPLICATE_LIMIT = 10;
-const ARRAY_LIMIT = 10;
+const ARRAY_LIMIT = 15;
 
 type DebugGatewayVerification = {
   provider?: string;
@@ -44,8 +44,20 @@ type DebugOrder = {
   total?: number;
   paymentMethod?: string;
   paymentMethodTitle?: string;
+  matchedBy?: string[];
+  matchConfidence?: string;
   lineItems?: DebugLineItem[];
   gatewayVerification?: DebugGatewayVerification;
+};
+
+type DebugSourceCoverage = {
+  deepWooSearch?: boolean;
+  ordersStoredCount?: number;
+  matchReasonCounts?: Record<string, number>;
+  statusCounts?: Record<string, number>;
+  paymentMethodCounts?: Record<string, number>;
+  lastSyncedAt?: string;
+  warnings?: string[];
 };
 
 type DebugCustomer = {
@@ -70,6 +82,7 @@ type DebugCustomer = {
   orders?: DebugOrder[];
   productJourney?: Array<Record<string, unknown>>;
   gatewayVerification?: DebugGatewayVerification;
+  sourceCoverage?: DebugSourceCoverage;
   authorizeMatchedOrders?: number;
   authorizeUnmatchedOrders?: number;
   authorizeLastCheckedAt?: string;
@@ -126,6 +139,8 @@ function orderSummary(order: DebugOrder) {
     amount: Number(order.total ?? 0),
     paymentMethod: order.paymentMethodTitle || order.paymentMethod || "",
     products: (order.lineItems ?? []).map((item) => item.name).filter(Boolean),
+    matchedBy: order.matchedBy ?? [],
+    matchConfidence: order.matchConfidence ?? "",
     gatewayVerification: gatewaySummary(order.gatewayVerification),
   };
 }
@@ -147,6 +162,7 @@ const debugProjection = {
   baseProductsPurchased: 1,
   boostProductsPurchased: 1,
   gatewayVerification: 1,
+  sourceCoverage: 1,
   hasOrdersArray: { $isArray: "$orders" },
   ordersStoredCount: { $cond: [{ $isArray: "$orders" }, { $size: "$orders" }, 0] },
   productJourneyCount: { $cond: [{ $isArray: "$productJourney" }, { $size: "$productJourney" }, 0] },
@@ -459,6 +475,10 @@ export async function GET(request: Request) {
     baseProductsPurchased: customer.baseProductsPurchased ?? [],
     boostProductsPurchased: customer.boostProductsPurchased ?? [],
     storedOrders,
+    matchReasonCounts: customer.sourceCoverage?.matchReasonCounts ?? {},
+    storedOrderStatusCounts: customer.sourceCoverage?.statusCounts ?? {},
+    paymentMethodCounts: customer.sourceCoverage?.paymentMethodCounts ?? {},
+    sourceCoverage: customer.sourceCoverage ?? null,
     stripeConfigured: Boolean(process.env.STRIPE_SECRET_KEY),
     stripeLastCheckedAt: customer.stripeLastCheckedAt ?? "",
     stripeMatchedOrders: customer.stripeMatchedOrders ?? 0,
