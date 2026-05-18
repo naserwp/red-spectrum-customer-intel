@@ -9,13 +9,61 @@ import { isWooCommerceConfigured, type WooCommerceOrder } from "@/lib/woocommerc
 import { Customer, type CustomerDocument, type CustomerOrderHistoryItem, type CustomerOrderLineItem } from "@/models/Customer";
 
 const todayIso = new Date().toISOString();
-type SyncStatus = "success" | "success_with_warnings" | "failed";
+type SyncStatus = "success" | "success_with_warnings" | "failed" | "partial_timeout";
 
 const syncOneMaxPages = (requested?: unknown) => {
   const value = Number(requested ?? process.env.WC_SYNC_ONE_MAX_PAGES ?? 5);
   if (!Number.isFinite(value) || value <= 0) return 5;
   return Math.min(25, Math.max(1, Math.floor(value)));
 };
+
+const numericEnv = (name: string, fallback: number) => {
+  const value = Number(process.env[name] ?? fallback);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+};
+
+const syncOneRouteTimeoutMs = () => numericEnv("WC_SYNC_ONE_ROUTE_TIMEOUT_MS", 30000);
+const syncOneStrategyTimeoutMs = () => numericEnv("WC_SYNC_ONE_STRATEGY_TIMEOUT_MS", 10000);
+
+function timeoutResponse(input: {
+  email?: string;
+  startedAt: number;
+  completedStrategies?: string[];
+  skippedStrategies?: string[];
+  timedOutStrategies?: string[];
+  strategyTimings?: Record<string, number>;
+  ordersSaved?: number;
+  warnings?: string[];
+}) {
+  const ordersSaved = input.ordersSaved ?? 0;
+  return NextResponse.json({
+    email: input.email,
+    saved: ordersSaved > 0,
+    syncStatus: "partial_timeout",
+    timeoutReached: true,
+    partialSync: true,
+    totalSyncMs: Date.now() - input.startedAt,
+    completedStrategies: input.completedStrategies ?? [],
+    skippedStrategies: input.skippedStrategies ?? [],
+    timedOutStrategies: input.timedOutStrategies ?? [],
+    strategyTimings: input.strategyTimings ?? {},
+    ordersSaved,
+    dedupedOrdersSaved: ordersSaved,
+    message: ordersSaved > 0
+      ? `Saved ${ordersSaved} matched order${ordersSaved === 1 ? "" : "s"} before sync-one reached its timeout.`
+      : "sync-one reached its timeout before customer history could be saved.",
+    warnings: input.warnings ?? ["sync-one route timeout reached."],
+  });
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number) {
+  return Promise.race([
+    promise.then((value) => ({ timedOut: false as const, value })),
+    new Promise<{ timedOut: true; value: null }>((resolve) => {
+      setTimeout(() => resolve({ timedOut: true, value: null }), timeoutMs);
+    }),
+  ]);
+}
 
 const getOrderEmail = (order: WooCommerceOrder) => order.billing?.email?.trim().toLowerCase() ?? "";
 const getOrderName = (order: WooCommerceOrder) => `${order.billing?.first_name?.trim() ?? ""} ${order.billing?.last_name?.trim() ?? ""}`.trim() || order.billing?.email || "WooCommerce Customer";
@@ -162,7 +210,9 @@ async function buildOrderHistoryItem(order: WooMatchedOrder, verifyGateways: boo
       notes: "",
     },
   };
-  item.gatewayVerification = await verifyOrderPayment(item, { verifyGateways: verifyGateways && isStripeOrder(item) });
+  if (verifyGateways && isStripeOrder(item)) {
+    item.gatewayVerification = await verifyOrderPayment(item, { verifyGateways: true });
+  }
   return item;
 }
 
@@ -414,12 +464,29 @@ export async function POST(request: Request) {
     verifyGateways?: boolean;
     deepWooSearch?: boolean;
     maxPagesPerStrategy?: number;
+    fastMode?: boolean;
+    skipBroadNameSearch?: boolean;
+    skipCompanySearch?: boolean;
+    skipCustomerUserSearch?: boolean;
+    skipAllOrdersScan?: boolean;
   };
   const email = body.email?.trim().toLowerCase();
   const verifyGateways = body.verifyGateways === true;
   const deepWooSearch = body.deepWooSearch === true;
-  const maxPagesPerStrategy = syncOneMaxPages(body.maxPagesPerStrategy);
-  if (!email) return NextResponse.json({ error: "email is required", syncStatus: "failed", totalSyncMs: Date.now() - startedAt }, { status: 400 });
+  const fastMode = body.fastMode === true;
+  const routeTimeoutMs = fastMode ? Math.min(syncOneRouteTimeoutMs(), 15000) : syncOneRouteTimeoutMs();
+  const strategyTimeoutMs = fastMode ? Math.min(syncOneStrategyTimeoutMs(), 2500) : syncOneStrategyTimeoutMs();
+  const routeController = new AbortController();
+  const routeTimeout = setTimeout(() => routeController.abort(), routeTimeoutMs);
+  const maxPagesPerStrategy = fastMode ? 1 : syncOneMaxPages(body.maxPagesPerStrategy);
+  const skipBroadNameSearch = fastMode || body.skipBroadNameSearch === true;
+  const skipCompanySearch = fastMode || body.skipCompanySearch === true;
+  const skipAllOrdersScan = fastMode || body.skipAllOrdersScan === true;
+  const skipCustomerUserSearch = body.skipCustomerUserSearch === true;
+  if (!email) {
+    clearTimeout(routeTimeout);
+    return NextResponse.json({ error: "email is required", syncStatus: "failed", totalSyncMs: Date.now() - startedAt }, { status: 400 });
+  }
 
   const matchResult = await fetchWooCustomerMatches({
     email,
@@ -428,31 +495,108 @@ export async function POST(request: Request) {
     lastName: body.lastName,
     customerName: body.customerName,
     company: body.company,
-  }, { deepWooSearch, maxPages: maxPagesPerStrategy });
+  }, {
+    deepWooSearch,
+    maxPages: maxPagesPerStrategy,
+    strategyTimeoutMs,
+    deadlineAt: startedAt + routeTimeoutMs,
+    signal: routeController.signal,
+    skipBroadNameSearch,
+    skipCompanySearch,
+    skipCustomerUserSearch,
+    skipAllOrdersScan,
+  });
   const { orders, audit } = matchResult;
+  if (routeController.signal.aborted || matchResult.timeoutReached) {
+    clearTimeout(routeTimeout);
+    return timeoutResponse({
+      email,
+      startedAt,
+      completedStrategies: matchResult.completedStrategies,
+      skippedStrategies: matchResult.skippedStrategies,
+      timedOutStrategies: matchResult.timedOutStrategies,
+      strategyTimings: matchResult.strategyTimings,
+      warnings: audit.warnings,
+    });
+  }
   if (!orders) {
+    clearTimeout(routeTimeout);
     return NextResponse.json({ error: "Unable to fetch WooCommerce orders.", email, saved: false, syncStatus: "failed", totalSyncMs: Date.now() - startedAt }, { status: 502 });
   }
 
-  const connection = await connectToDatabase();
-  if (!connection) return NextResponse.json({ error: "MongoDB is unavailable.", email, saved: false, ordersFetchedForEmail: orders.length, syncStatus: "failed", totalSyncMs: Date.now() - startedAt }, { status: 503 });
+  const remainingForDbMs = Math.max(1, startedAt + routeTimeoutMs - Date.now());
+  const connectionResult = await withTimeout(connectToDatabase(), remainingForDbMs);
+  if (connectionResult.timedOut || routeController.signal.aborted) {
+    clearTimeout(routeTimeout);
+    return timeoutResponse({
+      email,
+      startedAt,
+      completedStrategies: matchResult.completedStrategies,
+      skippedStrategies: matchResult.skippedStrategies,
+      timedOutStrategies: matchResult.timedOutStrategies,
+      strategyTimings: matchResult.strategyTimings,
+      warnings: [...audit.warnings, "MongoDB connection did not finish before sync-one timeout."],
+    });
+  }
+  if (!connectionResult.value) {
+    clearTimeout(routeTimeout);
+    return NextResponse.json({ error: "MongoDB is unavailable.", email, saved: false, ordersFetchedForEmail: orders.length, syncStatus: "failed", totalSyncMs: Date.now() - startedAt }, { status: 503 });
+  }
 
-  const existing = await Customer.findOne({ email }).lean<CustomerDocument | null>();
+  const existingResult = await withTimeout(Customer.findOne({ email }).lean<CustomerDocument | null>().exec(), Math.max(1, startedAt + routeTimeoutMs - Date.now()));
+  if (existingResult.timedOut || routeController.signal.aborted) {
+    clearTimeout(routeTimeout);
+    return timeoutResponse({
+      email,
+      startedAt,
+      completedStrategies: matchResult.completedStrategies,
+      skippedStrategies: matchResult.skippedStrategies,
+      timedOutStrategies: matchResult.timedOutStrategies,
+      strategyTimings: matchResult.strategyTimings,
+      warnings: [...audit.warnings, "Existing customer lookup did not finish before sync-one timeout."],
+    });
+  }
+  const existing = existingResult.value;
   const syncWarnings = warningSummary(audit.warnings);
   const partialSync = audit.warnings.length > 0 || matchResult.failedRequests.length > 0;
   const syncStatus: SyncStatus = partialSync ? "success_with_warnings" : "success";
-  const customer = await buildCustomerFromOrders(email, orders, existing, verifyGateways, audit, {
+  const customerResult = await withTimeout(buildCustomerFromOrders(email, orders, existing, verifyGateways, audit, {
     phone: body.phone,
     customerName: body.customerName,
     deepWooSearch,
     syncStatus,
     warningSummary: syncWarnings,
-  });
-  await Customer.findOneAndUpdate(
+  }), Math.max(1, startedAt + routeTimeoutMs - Date.now()));
+  if (customerResult.timedOut || routeController.signal.aborted) {
+    clearTimeout(routeTimeout);
+    return timeoutResponse({
+      email,
+      startedAt,
+      completedStrategies: matchResult.completedStrategies,
+      skippedStrategies: matchResult.skippedStrategies,
+      timedOutStrategies: matchResult.timedOutStrategies,
+      strategyTimings: matchResult.strategyTimings,
+      warnings: [...audit.warnings, "Customer transform did not finish before sync-one timeout."],
+    });
+  }
+  const customer = customerResult.value;
+  const saveResult = await withTimeout(Customer.findOneAndUpdate(
     { email },
     { $set: customer },
     { upsert: true, new: true, setDefaultsOnInsert: true }
-  );
+  ).exec(), Math.max(1, startedAt + routeTimeoutMs - Date.now()));
+  if (saveResult.timedOut || routeController.signal.aborted) {
+    clearTimeout(routeTimeout);
+    return timeoutResponse({
+      email,
+      startedAt,
+      completedStrategies: matchResult.completedStrategies,
+      skippedStrategies: matchResult.skippedStrategies,
+      timedOutStrategies: matchResult.timedOutStrategies,
+      strategyTimings: matchResult.strategyTimings,
+      warnings: [...audit.warnings, "Customer save did not finish before sync-one timeout."],
+    });
+  }
 
   const orderNumbers = customer.orders.map((order) => order.orderNumber);
   const statuses = unique(customer.orders.map((order) => order.status));
@@ -460,7 +604,7 @@ export async function POST(request: Request) {
   const products = unique(customer.orders.flatMap((order) => order.lineItems.map((item) => item.name)));
   const ordersWithZeroTotal = orders.filter((order) => parseMoney(order.total) <= 0).length;
   const ordersRecoveredFromLineItems = orders.filter((order) => parseMoney(order.total) <= 0 && getOrderTotal(order) > 0).length;
-  const gatewayConfiguration = getGatewayConfigurationSummary();
+  const gatewayConfiguration = verifyGateways ? getGatewayConfigurationSummary() : { stripe: false, nmi: false, authorizeNet: false };
   const stripeOrders = customer.orders.filter((order) => order.gatewayVerification.provider === "stripe");
   const stripeMatchedOrders = stripeOrders.filter((order) => order.gatewayVerification.matched).length;
   const stripeUnmatchedOrders = stripeOrders.filter((order) => !order.gatewayVerification.matched).length;
@@ -476,12 +620,15 @@ export async function POST(request: Request) {
     ? `Saved ${customer.orders.length} matched orders. Some broad search sources reached page limits, but matched customer history was saved.`
     : `Saved ${customer.orders.length} matched order${customer.orders.length === 1 ? "" : "s"}.`;
 
+  clearTimeout(routeTimeout);
   return NextResponse.json({
     email,
     saved: true,
     syncStatus,
+    timeoutReached: false,
     message,
     deepWooSearch,
+    fastMode,
     maxPagesPerStrategy,
     ordersFetchedForEmail: audit.matches.byEmail.count,
     ordersFetchedByEmail: audit.matches.byEmail.count,
@@ -511,6 +658,9 @@ export async function POST(request: Request) {
     pagesFetched: matchResult.pagesFetched,
     totalSyncMs,
     strategyTimings: matchResult.strategyTimings,
+    completedStrategies: matchResult.completedStrategies,
+    skippedStrategies: matchResult.skippedStrategies,
+    timedOutStrategies: matchResult.timedOutStrategies,
     failedRequests: matchResult.failedRequests,
     partialSync,
     matchReasonCounts: audit.matchReasonCounts,
@@ -518,10 +668,11 @@ export async function POST(request: Request) {
     paymentMethodCounts: audit.paymentMethodCounts,
     sourceCoverage: customer.sourceCoverage,
     warning: [...audit.warnings, stripeWarning].filter(Boolean).join(" "),
+    warnings: [...audit.warnings, stripeWarning].filter(Boolean),
     ordersWithZeroTotal,
     ordersRecoveredFromLineItems,
     gatewayVerificationChecked: verifyGateways ? stripeOrders.length : 0,
-    gatewayVerificationConfigured: hasConfiguredGateway(),
+    gatewayVerificationConfigured: verifyGateways ? hasConfiguredGateway() : false,
     gatewayConfiguration,
     verifyGateways,
     stripeVerificationRequested: verifyGateways,

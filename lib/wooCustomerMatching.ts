@@ -69,9 +69,25 @@ export type WooCustomerMatchResult = {
   pagesFetched: number;
   failedRequests: Array<{ status: string; page: number; message: string }>;
   strategyTimings: Record<WooSearchStrategy, number>;
+  completedStrategies: WooSearchStrategy[];
+  skippedStrategies: WooSearchStrategy[];
+  timedOutStrategies: WooSearchStrategy[];
+  timeoutReached: boolean;
 };
 
 export type WooSearchStrategy = "email" | "phone" | "name" | "company" | "customer_user" | "all_orders_scan";
+
+export type WooCustomerMatchOptions = {
+  deepWooSearch?: boolean;
+  maxPages?: number;
+  strategyTimeoutMs?: number;
+  deadlineAt?: number;
+  signal?: AbortSignal;
+  skipBroadNameSearch?: boolean;
+  skipCompanySearch?: boolean;
+  skipCustomerUserSearch?: boolean;
+  skipAllOrdersScan?: boolean;
+};
 
 function normalizeText(value?: string) {
   return (value ?? "")
@@ -222,6 +238,10 @@ function collectFetchWarning(source: string, result: WooCommerceFetchResult<unkn
   return result.pagesFetched;
 }
 
+function pushUnique<T extends string>(values: T[], value: T) {
+  if (!values.includes(value)) values.push(value);
+}
+
 function addCandidates(
   result: WooCommerceFetchResult<WooCommerceOrder> | null,
   source: string,
@@ -246,12 +266,38 @@ function emptyStrategyTimings(): Record<WooSearchStrategy, number> {
   };
 }
 
-async function timeStrategy<T>(strategy: WooSearchStrategy, timings: Record<WooSearchStrategy, number>, work: () => Promise<T>) {
+async function timeStrategy<T>(
+  strategy: WooSearchStrategy,
+  timings: Record<WooSearchStrategy, number>,
+  options: Required<Pick<WooCustomerMatchOptions, "strategyTimeoutMs">> & Pick<WooCustomerMatchOptions, "deadlineAt" | "signal">,
+  timedOutStrategies: WooSearchStrategy[],
+  warnings: string[],
+  work: (signal: AbortSignal) => Promise<T>
+) {
   const startedAt = Date.now();
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (options.signal?.aborted) controller.abort();
+  options.signal?.addEventListener("abort", abort, { once: true });
+
+  const remainingRouteMs = options.deadlineAt ? Math.max(1, options.deadlineAt - Date.now()) : options.strategyTimeoutMs;
+  const timeoutMs = Math.max(1, Math.min(options.strategyTimeoutMs, remainingRouteMs));
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await work();
+    return await Promise.race([
+      work(controller.signal),
+      new Promise<null>((resolve) => {
+        controller.signal.addEventListener("abort", () => resolve(null), { once: true });
+      }),
+    ]);
   } finally {
     timings[strategy] += Date.now() - startedAt;
+    clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abort);
+    if (controller.signal.aborted) {
+      pushUnique(timedOutStrategies, strategy);
+      warnings.push(`${strategy}: timed out after ${timeoutMs}ms.`);
+    }
   }
 }
 
@@ -302,9 +348,26 @@ function auditFor(input: WooCustomerMatchInput, normalizedInput: NormalizedInput
   };
 }
 
-export async function fetchWooCustomerMatches(input: WooCustomerMatchInput, options: { deepWooSearch?: boolean; maxPages?: number } = {}): Promise<WooCustomerMatchResult> {
+function deadlineReached(options: Pick<WooCustomerMatchOptions, "deadlineAt" | "signal">) {
+  return Boolean(options.signal?.aborted || (options.deadlineAt && Date.now() >= options.deadlineAt));
+}
+
+function shouldSkipStrategy(strategy: WooSearchStrategy, options: WooCustomerMatchOptions) {
+  if (strategy === "name") return options.skipBroadNameSearch === true;
+  if (strategy === "company") return options.skipCompanySearch === true;
+  if (strategy === "customer_user") return options.skipCustomerUserSearch === true;
+  if (strategy === "all_orders_scan") return options.skipAllOrdersScan === true;
+  return false;
+}
+
+function skipStrategy(strategy: WooSearchStrategy, skippedStrategies: WooSearchStrategy[]) {
+  pushUnique(skippedStrategies, strategy);
+}
+
+export async function fetchWooCustomerMatches(input: WooCustomerMatchInput, options: WooCustomerMatchOptions = {}): Promise<WooCustomerMatchResult> {
   const normalizedInput = normalizeCustomerMatchInput(input);
   const maxPages = options.maxPages ?? 25;
+  const strategyTimeoutMs = Math.max(1, options.strategyTimeoutMs ?? 10000);
   const deepWooSearch = options.deepWooSearch === true;
   const candidates = new Map<number, WooCommerceOrder>();
   const customerIds = new Set<number>();
@@ -312,40 +375,88 @@ export async function fetchWooCustomerMatches(input: WooCustomerMatchInput, opti
   const failedRequests: WooCustomerMatchResult["failedRequests"] = [];
   const fetchedBySource: Record<string, number> = {};
   const strategyTimings = emptyStrategyTimings();
+  const completedStrategies: WooSearchStrategy[] = [];
+  const skippedStrategies: WooSearchStrategy[] = [];
+  const timedOutStrategies: WooSearchStrategy[] = [];
   let pagesFetched = 0;
 
-  const emailResult = await timeStrategy("email", strategyTimings, () => fetchWooCommerceOrders({ email: normalizedInput.email, maxPages }));
-  pagesFetched += collectFetchWarning("email", emailResult, warnings, failedRequests);
-  addCandidates(emailResult, "email", candidates, fetchedBySource);
+  if (options.skipBroadNameSearch) skipStrategy("name", skippedStrategies);
+  if (options.skipCompanySearch) skipStrategy("company", skippedStrategies);
+  if (options.skipCustomerUserSearch) skipStrategy("customer_user", skippedStrategies);
+  if (options.skipAllOrdersScan) skipStrategy("all_orders_scan", skippedStrategies);
+
+  const emailResult = await timeStrategy("email", strategyTimings, { strategyTimeoutMs, deadlineAt: options.deadlineAt, signal: options.signal }, timedOutStrategies, warnings, (signal) => fetchWooCommerceOrders({ email: normalizedInput.email, maxPages, signal }));
+  if (emailResult) {
+    pushUnique(completedStrategies, "email");
+    pagesFetched += collectFetchWarning("email", emailResult, warnings, failedRequests);
+    addCandidates(emailResult, "email", candidates, fetchedBySource);
+  }
 
   if (deepWooSearch) {
     const customerSearches = Array.from(new Set([normalizedInput.email, normalizedInput.phone, input.customerName, input.company].map((value) => value?.trim()).filter(Boolean) as string[]));
     for (const search of customerSearches) {
       const strategy = strategyForSearch(search, input, normalizedInput);
-      const customerResult = await timeStrategy(strategy, strategyTimings, () => fetchWooCommerceCustomers({ search, maxPages: Math.min(5, maxPages) }));
+      if (shouldSkipStrategy(strategy, options)) {
+        skipStrategy(strategy, skippedStrategies);
+        continue;
+      }
+      if (deadlineReached(options)) {
+        skipStrategy(strategy, skippedStrategies);
+        break;
+      }
+      const customerResult = await timeStrategy(strategy, strategyTimings, { strategyTimeoutMs, deadlineAt: options.deadlineAt, signal: options.signal }, timedOutStrategies, warnings, (signal) => fetchWooCommerceCustomers({ search, maxPages: Math.min(5, maxPages), signal }));
+      if (!customerResult) continue;
+      pushUnique(completedStrategies, strategy);
       pagesFetched += collectFetchWarning(`customer:${search}`, customerResult, warnings, failedRequests);
       for (const customer of customerResult?.items ?? []) {
         if (matchCustomer(customer, normalizedInput)) customerIds.add(customer.id);
       }
     }
 
-    for (const customerId of customerIds) {
-      const customerOrderResult = await timeStrategy("customer_user", strategyTimings, () => fetchWooCommerceOrders({ customerId, maxPages }));
-      pagesFetched += collectFetchWarning(`customer_id:${customerId}`, customerOrderResult, warnings, failedRequests);
-      addCandidates(customerOrderResult, "customer_id", candidates, fetchedBySource);
+    if (shouldSkipStrategy("customer_user", options)) {
+      skipStrategy("customer_user", skippedStrategies);
+    } else {
+      for (const customerId of customerIds) {
+        if (deadlineReached(options)) {
+          skipStrategy("customer_user", skippedStrategies);
+          break;
+        }
+        const customerOrderResult = await timeStrategy("customer_user", strategyTimings, { strategyTimeoutMs, deadlineAt: options.deadlineAt, signal: options.signal }, timedOutStrategies, warnings, (signal) => fetchWooCommerceOrders({ customerId, maxPages, signal }));
+        if (!customerOrderResult) continue;
+        pushUnique(completedStrategies, "customer_user");
+        pagesFetched += collectFetchWarning(`customer_id:${customerId}`, customerOrderResult, warnings, failedRequests);
+        addCandidates(customerOrderResult, "customer_id", candidates, fetchedBySource);
+      }
     }
 
     const orderSearches = Array.from(new Set([normalizedInput.email, normalizedInput.phone, input.customerName, input.company].map((value) => value?.trim()).filter(Boolean) as string[]));
     for (const search of orderSearches) {
       const strategy = strategyForSearch(search, input, normalizedInput);
-      const orderResult = await timeStrategy(strategy, strategyTimings, () => fetchWooCommerceOrders({ search, maxPages }));
+      if (shouldSkipStrategy(strategy, options)) {
+        skipStrategy(strategy, skippedStrategies);
+        continue;
+      }
+      if (deadlineReached(options)) {
+        skipStrategy(strategy, skippedStrategies);
+        break;
+      }
+      const orderResult = await timeStrategy(strategy, strategyTimings, { strategyTimeoutMs, deadlineAt: options.deadlineAt, signal: options.signal }, timedOutStrategies, warnings, (signal) => fetchWooCommerceOrders({ search, maxPages, signal }));
+      if (!orderResult) continue;
+      pushUnique(completedStrategies, strategy);
       pagesFetched += collectFetchWarning(`order_search:${search}`, orderResult, warnings, failedRequests);
       addCandidates(orderResult, "search", candidates, fetchedBySource);
     }
 
-    const allOrdersResult = await timeStrategy("all_orders_scan", strategyTimings, () => fetchWooCommerceOrders({ maxPages }));
-    pagesFetched += collectFetchWarning("all_orders_scan", allOrdersResult, warnings, failedRequests);
-    addCandidates(allOrdersResult, "all_orders_scan", candidates, fetchedBySource);
+    if (shouldSkipStrategy("all_orders_scan", options) || deadlineReached(options)) {
+      skipStrategy("all_orders_scan", skippedStrategies);
+    } else {
+      const allOrdersResult = await timeStrategy("all_orders_scan", strategyTimings, { strategyTimeoutMs, deadlineAt: options.deadlineAt, signal: options.signal }, timedOutStrategies, warnings, (signal) => fetchWooCommerceOrders({ maxPages, signal }));
+      if (allOrdersResult) {
+        pushUnique(completedStrategies, "all_orders_scan");
+        pagesFetched += collectFetchWarning("all_orders_scan", allOrdersResult, warnings, failedRequests);
+        addCandidates(allOrdersResult, "all_orders_scan", candidates, fetchedBySource);
+      }
+    }
   }
 
   const matchedOrders = Array.from(candidates.values())
@@ -362,5 +473,9 @@ export async function fetchWooCustomerMatches(input: WooCustomerMatchInput, opti
     pagesFetched,
     failedRequests,
     strategyTimings,
+    completedStrategies,
+    skippedStrategies,
+    timedOutStrategies,
+    timeoutReached: deadlineReached(options),
   };
 }

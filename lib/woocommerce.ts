@@ -85,6 +85,7 @@ type WooCommerceFetchOptions = {
   statuses?: string[];
   maxPages?: number;
   perPage?: number;
+  signal?: AbortSignal;
 };
 
 export const wooCommerceOrderStatuses = ["completed", "processing", "pending", "failed", "cancelled", "on-hold", "checkout-draft", "refunded"];
@@ -113,9 +114,12 @@ function getNumericEnv(name: string, fallback: number) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
-async function fetchWithTimeout(url: URL, headers: HeadersInit, timeoutMs: number) {
+async function fetchWithTimeout(url: URL, headers: HeadersInit, timeoutMs: number, signal?: AbortSignal) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const abort = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
   try {
     return await fetch(url, {
       headers,
@@ -124,6 +128,7 @@ async function fetchWithTimeout(url: URL, headers: HeadersInit, timeoutMs: numbe
     });
   } finally {
     clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
   }
 }
 
@@ -146,10 +151,12 @@ async function fetchWooCommerceCollection<T>(resource: "customers" | "orders", o
   let partialSync = false;
 
   for (const status of statuses) {
+    if (options.signal?.aborted) break;
     fetchedByStatus[status || "all"] = 0;
     pagesFetchedByStatus[status || "all"] = 0;
 
     for (let page = 1; page <= maxPages; page += 1) {
+      if (options.signal?.aborted) break;
       const url = new URL(`${config.storeUrl}/wp-json/wc/v3/${resource}`);
       url.searchParams.set("per_page", String(perPage));
       url.searchParams.set("page", String(page));
@@ -170,7 +177,7 @@ async function fetchWooCommerceCollection<T>(resource: "customers" | "orders", o
         const response = await fetchWithTimeout(url, {
           Authorization: `Basic ${auth}`,
           Accept: "application/json",
-        }, timeoutMs);
+        }, timeoutMs, options.signal);
 
         if (!response.ok) {
           const message = `${response.status} ${response.statusText}`;
@@ -198,6 +205,10 @@ async function fetchWooCommerceCollection<T>(resource: "customers" | "orders", o
           partialSync = true;
         }
       } catch (error) {
+        if (options.signal?.aborted) {
+          partialSync = true;
+          break;
+        }
         const message = error instanceof Error ? error.message : "Unknown WooCommerce request error.";
         failedRequests.push({ status: status || "all", page, message });
         partialSync = true;
