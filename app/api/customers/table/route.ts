@@ -4,6 +4,46 @@ import { Customer, type CustomerDocument } from "@/models/Customer";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 
 const attemptedStatuses = ["failed", "pending", "pending payment", "on-hold", "checkout-draft", "payment_pending", "crypto_pending"];
+const customerProjection = {
+  name: 1,
+  email: 1,
+  normalizedEmail: 1,
+  emailNormalized: 1,
+  phone: 1,
+  phoneNormalized: 1,
+  totalPaid: 1,
+  paidTotal: 1,
+  attemptedTotal: 1,
+  paidOrderCount: 1,
+  attemptedOrderCount: 1,
+  leadStatus: 1,
+  paymentStatus: 1,
+  lastPaidDate: 1,
+  lastAttemptDate: 1,
+  lastPaymentMethod: 1,
+  lastAttemptPaymentMethod: 1,
+  activeSubscriptions: 1,
+  failedPayments: 1,
+  chargebacks: 1,
+  estimatedCreditLimit: 1,
+  tier: 1,
+  riskLevel: 1,
+  score: 1,
+  stars: 1,
+  aiSummaryPreview: 1,
+  aiSummary: 1,
+  subscriptionStatus: 1,
+  orderCount: 1,
+  averageOrderValue: 1,
+  firstOrderDate: 1,
+  lastOrderDate: 1,
+  refunds: 1,
+  riskExplanation: 1,
+  recommendedAction: 1,
+  attemptedProducts: 1,
+  lastAttemptedProduct: 1,
+} as const;
+
 type LeanCustomer = CustomerDocument & { _id: unknown };
 type HotLeadRow = Record<string, unknown> & {
   name?: string;
@@ -42,9 +82,27 @@ function escapeRegex(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function phoneDigits(value: string) {
+  return value.replace(/\D/g, "");
+}
+
+function timed<T>(promise: Promise<T>, ms: number): Promise<T | "timeout"> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve("timeout"), ms);
+    promise.then((value) => {
+      clearTimeout(timer);
+      resolve(value);
+    }).catch(() => {
+      clearTimeout(timer);
+      resolve("timeout");
+    });
+  });
+}
+
 export async function GET(request: Request) {
   const started = Date.now();
   await connectToDatabase();
+  const dbStarted = Date.now();
   const { searchParams } = new URL(request.url);
   const page = Math.max(1, Number(searchParams.get("page") ?? 1));
   const limit = Math.min(100, Math.max(1, Number(searchParams.get("limit") ?? 20)));
@@ -115,27 +173,45 @@ export async function GET(request: Request) {
       .sort((a, b) => Number(b.attemptedTotal ?? 0) - Number(a.attemptedTotal ?? 0) || String(b.lastAttemptDate ?? "").localeCompare(String(a.lastAttemptDate ?? "")));
     const start = (page - 1) * limit;
     const payload = { page, limit, total: rows.length, rows: rows.slice(start, start + limit) };
-    console.log(`[api] customers-table durationMs=${Date.now() - started} mongoMs=${Date.now() - started} cache=none responseBytes=${JSON.stringify(payload).length}`);
+    console.log(`[api] customers-table dbMs=${Date.now() - dbStarted} totalMs=${Date.now() - started} recordsScanned=${rows.length} recordsReturned=${payload.rows.length} kind=hot-leads responseBytes=${JSON.stringify(payload).length}`);
     return NextResponse.json(payload);
   }
-  const and: Record<string, unknown>[] = [
-    { $or: [{ name: { $type: "string", $ne: "" } }, { email: { $type: "string", $ne: "" } }] },
-  ];
+  const and: Record<string, unknown>[] = [];
   if (risk) and.push({ riskLevel: risk });
   if (q) {
     const normalizedQuery = q.toLowerCase();
     const looksLikeExactEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedQuery);
-    and.push(looksLikeExactEmail
-      ? { $or: [{ normalizedEmail: normalizedQuery }, { email: normalizedQuery }, { email: q }] }
-      : { $or: [{ name: { $regex: escapeRegex(q), $options: "i" } }, { email: { $regex: escapeRegex(q), $options: "i" } }, { phone: { $regex: escapeRegex(q), $options: "i" } }] });
+    const digits = phoneDigits(q);
+    if (looksLikeExactEmail) {
+      and.push({ $or: [{ normalizedEmail: normalizedQuery }, { emailNormalized: normalizedQuery }, { email: normalizedQuery }, { email: q }] });
+    } else if (digits.length >= 7) {
+      and.push({ $or: [{ phoneNormalized: digits }, { phoneNormalized: { $regex: `${escapeRegex(digits)}$` } }, { phone: { $regex: escapeRegex(digits.slice(-7)), $options: "i" } }] });
+    } else {
+      const safe = escapeRegex(q).slice(0, 80);
+      and.push({ $or: [{ name: { $regex: `^${safe}`, $options: "i" } }, { email: { $regex: `^${safe}`, $options: "i" } }] });
+    }
   }
-  const query: Record<string, unknown> = { $and: and };
+  const query: Record<string, unknown> = and.length ? { $and: and } : {};
   const sort: Record<string, 1 | -1> = { paidTotal: -1, attemptedTotal: -1 };
-  const [total, rows] = await Promise.all([
-    Customer.countDocuments(query),
-    Customer.find(query).sort(sort).skip((page - 1) * limit).limit(limit).lean(),
-  ]);
-  const payload = { page, limit, total, rows };
-  console.log(`[api] customers-table durationMs=${Date.now() - started} mongoMs=${Date.now() - started} cache=none responseBytes=${JSON.stringify(payload).length}`);
+  const queryPromise = (async () => {
+    const rowsPromise = Customer.find(query, customerProjection).sort(sort).skip((page - 1) * limit).limit(limit).maxTimeMS(7500).lean();
+    if (q) {
+      const rows = await rowsPromise;
+      return { total: rows.length < limit ? (page - 1) * limit + rows.length : page * limit + 1, rows, recordsScanned: rows.length };
+    }
+    const [total, rows] = await Promise.all([
+      Customer.countDocuments(query).maxTimeMS(7500),
+      rowsPromise,
+    ]);
+    return { total, rows, recordsScanned: total };
+  })();
+  const result = await timed(queryPromise, 8000);
+  if (result === "timeout") {
+    const payload = { page, limit, total: 0, rows: [], partial: true, warning: "Customer search exceeded 8 seconds. Returning partial results." };
+    console.log(`[api] customers-table dbMs=${Date.now() - dbStarted} totalMs=${Date.now() - started} recordsScanned=0 recordsReturned=0 timeout=true responseBytes=${JSON.stringify(payload).length}`);
+    return NextResponse.json(payload);
+  }
+  const payload = { page, limit, total: result.total, rows: result.rows, partial: false };
+  console.log(`[api] customers-table dbMs=${Date.now() - dbStarted} totalMs=${Date.now() - started} recordsScanned=${result.recordsScanned} recordsReturned=${result.rows.length} timeout=false responseBytes=${JSON.stringify(payload).length}`);
   return NextResponse.json(payload);
 }

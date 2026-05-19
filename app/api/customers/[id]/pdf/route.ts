@@ -13,6 +13,21 @@ function productNames(order: Record<string, unknown>, fallback: string[]) {
   return names.length ? names.join(", ") : fallback.length ? fallback.join(", ") : "the selected product";
 }
 
+function profileLine(profile: Record<string, unknown>, customer: Record<string, unknown>) {
+  return [
+    `Company: ${text(profile.company || "-")}`,
+    `EIN: ${text(profile.ein || "-")}`,
+    `Phone: ${text(profile.phone || customer.phone || "-")}`,
+    `Address: ${[profile.address1, profile.address2].map(text).filter(Boolean).join(", ") || "-"}`,
+    `City/State/ZIP: ${[profile.city, profile.state, profile.zip].map(text).filter(Boolean).join(", ") || "-"}`,
+    `Country: ${text(profile.country || "-")}`,
+    `Credit Limit: ${money(profile.creditLimit || customer.actualCreditLimit || 0)}`,
+    `Potential Credit Limit: ${money(profile.potentialCreditLimit || customer.estimatedCreditLimit || 0)}`,
+    `Last Credit Update: ${text(profile.creditLimitLastUpdated || "-")}`,
+    `Net 30 Status: ${text(profile.net30Status || profile.accountStatus || "-")}`,
+  ].join("\n");
+}
+
 function buildTemplates(customer: Record<string, unknown>, attemptedOrders: Array<Record<string, unknown>>) {
   const name = text(customer.name).trim().split(/\s+/)[0] || text(customer.name);
   const actualPaid = Number(customer.paidTotal ?? customer.totalPaid ?? 0);
@@ -43,7 +58,8 @@ function buildTemplates(customer: Record<string, unknown>, attemptedOrders: Arra
 async function findCustomerByIdOrEmail(rawId: string) {
   const id = decodeURIComponent(rawId).trim();
   if (mongoose.isValidObjectId(id)) return Customer.findById(id).lean<Record<string, unknown> | null>();
-  return Customer.findOne({ email: id.toLowerCase() }).lean<Record<string, unknown> | null>();
+  const email = id.toLowerCase();
+  return Customer.findOne({ $or: [{ normalizedEmail: email }, { email }] }).lean<Record<string, unknown> | null>();
 }
 
 export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -62,6 +78,10 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
   const templates = buildTemplates(customer, attemptedOrders);
   const latestRelevantOrder = attemptedOrders[0] ?? orders[0] ?? {};
   const verification = (latestRelevantOrder.gatewayVerification ?? customer.gatewayVerification ?? {}) as Record<string, unknown>;
+  const gatewayPayments = Array.isArray(customer.gatewayPayments) ? customer.gatewayPayments as Array<Record<string, unknown>> : [];
+  const profile = (customer.businessProfile ?? {}) as Record<string, unknown>;
+  const paidProducts = Array.isArray(customer.paidProducts) ? customer.paidProducts.map(String) : [];
+  const productJourney = Array.isArray(customer.productJourney) ? customer.productJourney as Array<Record<string, unknown>> : [];
 
   const doc = new jsPDF();
   let y = 14;
@@ -83,6 +103,8 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
   line("Name", text(customer.name));
   line("Email", text(customer.email));
   line("Phone", text(customer.phone));
+  line("Business/Company", text(profile.company || "-"));
+  line("Address", [profile.address1, profile.address2, profile.city, profile.state, profile.zip].map(text).filter(Boolean).join(", ") || "-");
   line("Actual Paid Amount", money(customer.paidTotal ?? customer.totalPaid));
   line("Attempted Amount", money(customer.attemptedTotal));
   line("Paid Order Count", text(customer.paidOrderCount ?? 0));
@@ -94,8 +116,14 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
   line("Subscription Status", text(customer.subscriptionStatus));
   line("Risk", text(customer.riskLevel));
   line("Tier", Number(customer.paidTotal ?? customer.totalPaid ?? 0) > 0 ? text(customer.tier) : "Lead");
+  line("Credit Limit", money(profile.creditLimit || customer.actualCreditLimit || 0));
+  line("Potential Credit Limit", money(profile.potentialCreditLimit || customer.estimatedCreditLimit || 0));
 
+  para("Customer Profile", Object.keys(profile).length ? profileLine(profile, customer) : "No WordPress profile data imported yet.");
+  para("Customer Product Journey", productJourney.slice(0, 20).map((item) => `${text(item.date)} | #${text(item.orderNumber)} | ${text(item.productName || "Authorize.net Payment")} | ${money(item.amount)} | ${text(item.type)} | ${text(item.status)}`).join("\n") || paidProducts.join(", ") || "No product journey has been synced.");
   para("Order/Product Timeline", orders.slice(0, 10).map((order) => `${text(order.dateCreated)} | #${text(order.orderNumber)} | ${text(order.status)} | ${text(order.paymentMethodTitle || order.paymentMethod)} | ${productNames(order, [])} | ${money(order.total)} | ${order.isPaid ? "Paid" : "Attempted"}`).join("\n") || "No WooCommerce order timeline synced.");
+  para("Gateway Payment History", gatewayPayments.slice(0, 20).map((payment) => `${text(payment.date)} | ${text(payment.provider)} | ${text(payment.transactionId)} | Invoice ${text(payment.invoiceNumber)} | ${text(payment.status)} | ${money(payment.amount)} | ${text(payment.cardType)} ${text(payment.cardLast4)} | ${text(payment.source)}`).join("\n") || "No gateway payment history has been reconciled.");
+  para("Authorize.net-Only Payments", orders.filter((order) => text(order.source) === "authorize_net_only").map((order) => `${text(order.dateCreated)} | ${text(order.transactionId)} | Invoice ${text(order.orderNumber)} | ${money(order.total)} | ${productNames(order, ["Authorize.net Payment"])}`).join("\n") || "No Authorize.net-only payments attached.");
   para("Attempted Products", attemptedProducts.join(", ") || "No attempted products found.");
   para("Payment Verification", `WooCommerce: ${text(latestRelevantOrder.status || customer.lastAttemptStatus)}\nMethod: ${text(latestRelevantOrder.paymentMethodTitle || latestRelevantOrder.paymentMethod || customer.lastAttemptPaymentMethod)}\nGateway provider: ${text(verification.provider)}\nGateway status: ${text(verification.transactionStatus || "Not verified")}\nConfidence: ${text(verification.confidence || "not_found")}\nMatched by: ${text(verification.matchedBy || "-")}\nTransaction ID: ${text(verification.transactionId || "-")}\nPayment Intent ID: ${text(verification.paymentIntentId || "-")}\nCharge ID: ${text(verification.chargeId || "-")}\nStripe Customer ID: ${text(verification.stripeCustomerId || "-")}\nLast checked: ${text(verification.lastCheckedAt || "-")}\nNotes: ${text(verification.notes || "Manual verification required")}`);
   para("Sales Executive Follow-Up Plan", text(customer.nextAction || "Manual review"));
@@ -103,6 +131,7 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
   para("SMS Template", templates.sms);
   para("Call Script", templates.call);
   para("Internal CRM Note", templates.note);
+  para("Internal Notes", text(customer.notes || ""));
 
   const bytes = doc.output("arraybuffer");
   return new NextResponse(bytes, { headers: { "Content-Type": "application/pdf", "Content-Disposition": `inline; filename="customer-${id}.pdf"` } });

@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import Image from "next/image";
 import { useParams } from "next/navigation";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -134,6 +135,28 @@ type GatewayPayment = {
   customerPaymentProfileId?: string;
 };
 
+type BusinessProfile = {
+  firstName?: string;
+  lastName?: string;
+  company?: string;
+  phone?: string;
+  address1?: string;
+  address2?: string;
+  city?: string;
+  state?: string;
+  zip?: string;
+  country?: string;
+  ein?: string;
+  potentialCreditLimit?: number;
+  creditLimit?: number;
+  creditLimitLastUpdated?: string;
+  net30Status?: string;
+  accountStatus?: string;
+  businessType?: string;
+  source?: string;
+  importedAt?: string;
+};
+
 type CustomerDetail = {
   _id: string;
   name: string;
@@ -174,6 +197,7 @@ type CustomerDetail = {
   gatewayVerification?: GatewayVerification;
   gatewayPayments?: GatewayPayment[];
   sourceCoverage?: SourceCoverage;
+  businessProfile?: BusinessProfile;
   orderCount: number;
   averageOrderValue: number;
   firstOrderDate: string;
@@ -312,9 +336,12 @@ function DetailShell({ children }: { children: ReactNode }) {
   return <main className="min-h-screen bg-black p-4 text-base text-zinc-100 md:p-8">
     <div className="mx-auto max-w-6xl space-y-5">
       <header className="flex flex-col gap-3 border-b border-zinc-900 pb-4 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Red Spectrum Customer Intelligence</p>
-          <h1 className="mt-1 text-2xl font-bold text-zinc-100 md:text-3xl">Customer Details</h1>
+        <div className="flex items-center gap-4">
+          <Image src="/Images/the-red-spectrum-full-logo-1.svg" alt="Red Spectrum" width={180} height={48} className="h-12 w-auto" priority />
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Red Spectrum Customer Intelligence</p>
+            <h1 className="mt-1 text-2xl font-bold text-zinc-100 md:text-3xl">Customer Details</h1>
+          </div>
         </div>
         <Link href="/admin?tab=customers" className="w-fit rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-semibold text-zinc-100 hover:border-red-500/60 hover:bg-zinc-800">
           Back to Customer List
@@ -450,6 +477,28 @@ export default function CustomerDetailPage() {
     window.location.href = "/admin?tab=customers";
   };
 
+  const downloadPdf = () => {
+    const safeId = encodeURIComponent(params.id);
+    window.open(`/api/customers/${safeId}/pdf`, "_blank", "noopener,noreferrer");
+  };
+
+  const repairGatewayPayments = async () => {
+    setMessage("Repairing gateway payments...");
+    try {
+      const response = await fetch("/api/authorize-net/repair-customer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: customer?.email, customerId: customer?._id }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Gateway repair failed.");
+      setMessage(data.message || "Gateway repair complete.");
+      await loadCustomer();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Gateway repair failed.");
+    }
+  };
+
   const attemptedProductRows = useMemo(() => {
     const rows = new Map<string, { name: string; quantity: number; amount: number; lastAttemptDate: string; status: string; paymentMethod: string }>();
     for (const order of customer?.orders?.filter((item) => item.isAttempted) ?? []) {
@@ -531,6 +580,8 @@ export default function CustomerDetailPage() {
   const classifiedAttemptedProducts = [...attemptedBaseProducts, ...attemptedBoostProducts, ...attemptedAddOnProducts];
   const attemptedProductSummary = classifiedAttemptedProducts.length ? classifiedAttemptedProducts : customer.attemptedProducts ?? [];
   const requiresProductReview = isLead && attemptedBoostProducts.length > 0 && baseProductsPurchased.length === 0;
+  const profile = customer.businessProfile ?? {};
+  const hasProfileData = Boolean(profile.source || profile.company || profile.ein || profile.creditLimit || profile.potentialCreditLimit || profile.address1);
   const missingUnattachedRecords = Math.max(
     Number(customer.sourceCoverage?.missingUnattachedRecords ?? 0),
     sourceCompare ? Math.max(0, sourceCompare.wooCommerceOrderRecordsCount - sourceCompare.customerOrdersCount) : 0
@@ -601,13 +652,18 @@ export default function CustomerDetailPage() {
   return <main className="min-h-screen bg-black p-4 text-base text-zinc-100 md:p-8">
     <div className="mx-auto max-w-6xl space-y-5">
       <header className="flex flex-col gap-3 border-b border-zinc-900 pb-4 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="text-3xl font-bold text-red-400">{customer.name}</h1>
-          <p className="text-zinc-400">{customer.email} - {customer.phone || "N/A"}</p>
+        <div className="flex items-center gap-4">
+          <Image src="/Images/the-red-spectrum-full-logo-1.svg" alt="Red Spectrum" width={180} height={48} className="h-12 w-auto" priority />
+          <div>
+            <h1 className="text-3xl font-bold text-red-400">{customer.name}</h1>
+            <p className="text-zinc-400">{customer.email} - {customer.phone || "N/A"}</p>
+          </div>
         </div>
-        <button onClick={backToCustomerList} className="w-fit rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-semibold text-zinc-100 hover:border-red-500/60 hover:bg-zinc-800">
-          Back to Customer List
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button onClick={backToCustomerList} className="w-fit rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-semibold text-zinc-100 hover:border-red-500/60 hover:bg-zinc-800">Back to Customer List</button>
+          <button onClick={downloadPdf} className="w-fit rounded border border-orange-500/50 bg-orange-600/20 px-4 py-2 text-sm font-semibold text-orange-100 hover:bg-orange-600/30">Download Customer PDF</button>
+          <button onClick={repairGatewayPayments} className="w-fit rounded bg-red-700 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600">Repair Gateway Payments</button>
+        </div>
       </header>
 
       <section className="grid gap-3 md:grid-cols-4">
@@ -631,6 +687,29 @@ export default function CustomerDetailPage() {
         <p className="font-semibold">Timeline not synced yet - run single customer sync</p>
         <p className="mt-1 text-sm text-amber-100/80">This customer has paid value and historical order count, but no saved WooCommerce order timeline on the selected record.</p>
       </div>}
+
+      <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+        <h2 className="text-xl font-semibold text-orange-300">Customer Profile</h2>
+        {hasProfileData ? <div className="mt-3 grid gap-3 md:grid-cols-4">
+          {[
+            ["Name", `${profile.firstName || ""} ${profile.lastName || ""}`.trim() || customer.name],
+            ["Email", customer.email],
+            ["Phone", profile.phone || customer.phone || "-"],
+            ["Company", profile.company || "-"],
+            ["EIN", profile.ein || "-"],
+            ["Address", [profile.address1, profile.address2].filter(Boolean).join(", ") || "-"],
+            ["City/State/ZIP", [profile.city, profile.state, profile.zip].filter(Boolean).join(", ") || "-"],
+            ["Country", profile.country || "-"],
+            ["Credit Limit", profile.creditLimit ? money(Number(profile.creditLimit)) : customer.actualCreditLimit ? money(Number(customer.actualCreditLimit)) : "-"],
+            ["Potential Credit Limit", profile.potentialCreditLimit ? money(Number(profile.potentialCreditLimit)) : money(Number(customer.estimatedCreditLimit ?? 0))],
+            ["Last credit update", displayDate(profile.creditLimitLastUpdated)],
+            ["Net 30 status", displayStatus(profile.net30Status || profile.accountStatus)],
+          ].map(([label, value]) => <div key={label} className="rounded border border-zinc-700 bg-zinc-950 p-3">
+            <p className="text-xs font-semibold uppercase text-zinc-400">{label}</p>
+            <p className="mt-2 text-sm font-semibold text-zinc-100">{value}</p>
+          </div>)}
+        </div> : <p className="mt-3 rounded border border-zinc-700 bg-zinc-950 p-3 text-zinc-400">No WordPress profile data imported yet.</p>}
+      </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
         <h2 className="text-xl font-semibold text-emerald-300">Data Source Coverage</h2>

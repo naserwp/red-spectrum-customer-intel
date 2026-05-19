@@ -118,11 +118,35 @@ export interface CustomerGatewayPayment {
   customerPaymentProfileId: string;
 }
 
+export interface CustomerBusinessProfile {
+  firstName: string;
+  lastName: string;
+  company: string;
+  phone: string;
+  address1: string;
+  address2: string;
+  city: string;
+  state: string;
+  zip: string;
+  country: string;
+  ein: string;
+  potentialCreditLimit: number;
+  creditLimit: number;
+  creditLimitLastUpdated: string;
+  net30Status: string;
+  accountStatus: string;
+  businessType: string;
+  source: string;
+  importedAt: string;
+}
+
 export interface CustomerDocument {
   name: string;
   email: string;
   normalizedEmail: string;
+  emailNormalized: string;
   phone: string;
+  phoneNormalized: string;
   totalPaid: number;
   paidTotal: number;
   attemptedTotal: number;
@@ -181,6 +205,7 @@ export interface CustomerDocument {
   gatewayVerification: GatewayVerification;
   gatewayPayments: CustomerGatewayPayment[];
   sourceCoverage: CustomerSourceCoverage;
+  businessProfile: CustomerBusinessProfile;
   externalCustomerKey: string;
 }
 
@@ -376,12 +401,39 @@ const customerGatewayPaymentSchema = new Schema<CustomerGatewayPayment>(
   { _id: false }
 );
 
+const customerBusinessProfileSchema = new Schema<CustomerBusinessProfile>(
+  {
+    firstName: { type: String, default: "" },
+    lastName: { type: String, default: "" },
+    company: { type: String, default: "" },
+    phone: { type: String, default: "" },
+    address1: { type: String, default: "" },
+    address2: { type: String, default: "" },
+    city: { type: String, default: "" },
+    state: { type: String, default: "" },
+    zip: { type: String, default: "" },
+    country: { type: String, default: "" },
+    ein: { type: String, default: "" },
+    potentialCreditLimit: { type: Number, default: 0 },
+    creditLimit: { type: Number, default: 0 },
+    creditLimitLastUpdated: { type: String, default: "" },
+    net30Status: { type: String, default: "" },
+    accountStatus: { type: String, default: "" },
+    businessType: { type: String, default: "" },
+    source: { type: String, default: "" },
+    importedAt: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
 const customerSchema = new Schema<CustomerDocument>(
   {
     name: { type: String, required: true },
     email: { type: String, required: true, unique: true },
     normalizedEmail: { type: String, default: "" },
+    emailNormalized: { type: String, default: "" },
     phone: { type: String, required: true },
+    phoneNormalized: { type: String, default: "" },
     totalPaid: { type: Number, required: true },
     paidTotal: { type: Number, required: true, default: 0 },
     attemptedTotal: { type: Number, required: true, default: 0 },
@@ -440,6 +492,7 @@ const customerSchema = new Schema<CustomerDocument>(
     gatewayVerification: { type: gatewayVerificationSchema, default: () => ({}) },
     gatewayPayments: { type: [customerGatewayPaymentSchema], default: [] },
     sourceCoverage: { type: customerSourceCoverageSchema, default: () => ({}) },
+    businessProfile: { type: customerBusinessProfileSchema, default: () => ({}) },
     externalCustomerKey: { type: String, default: "", index: true },
   },
   { timestamps: true }
@@ -447,6 +500,8 @@ const customerSchema = new Schema<CustomerDocument>(
 
 customerSchema.pre("validate", function () {
   this.normalizedEmail = this.email?.trim().toLowerCase() ?? "";
+  this.emailNormalized = this.normalizedEmail;
+  this.phoneNormalized = this.phone?.replace(/\D/g, "") ?? "";
   if (this.paidTotal === undefined || this.paidTotal === null) this.paidTotal = this.totalPaid ?? 0;
   if (this.totalPaid === undefined || this.totalPaid === null) this.totalPaid = this.paidTotal ?? 0;
   if (!this.score) this.score = calculateCustomerScore(this as unknown as CustomerDocument);
@@ -454,5 +509,12 @@ customerSchema.pre("validate", function () {
 });
 
 customerSchema.index({ normalizedEmail: 1 });
+customerSchema.index({ phoneNormalized: 1 });
+customerSchema.index({ "orders.transactionId": 1 });
+customerSchema.index({ "orders.orderNumber": 1 });
+customerSchema.index({ "orders.gatewayVerification.customerProfileId": 1 });
+customerSchema.index({ "gatewayPayments.transactionId": 1 });
+customerSchema.index({ "gatewayPayments.invoiceNumber": 1 });
+customerSchema.index({ "gatewayPayments.customerProfileId": 1 });
 
 export const Customer = mongoose.models.Customer || mongoose.model<CustomerDocument>("Customer", customerSchema);

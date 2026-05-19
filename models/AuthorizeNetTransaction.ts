@@ -13,6 +13,7 @@ export interface AuthorizeNetTransactionDocument {
   settledAt: string;
   customerEmail: string;
   normalizedEmail: string;
+  emailNormalized: string;
   customerName: string;
   billingFirstName: string;
   billingLastName: string;
@@ -55,6 +56,7 @@ const authorizeNetTransactionSchema = new Schema<AuthorizeNetTransactionDocument
     settledAt: { type: String, default: "", index: true },
     customerEmail: { type: String, default: "" },
     normalizedEmail: { type: String, default: "", index: true },
+    emailNormalized: { type: String, default: "", index: true },
     customerName: { type: String, default: "" },
     billingFirstName: { type: String, default: "" },
     billingLastName: { type: String, default: "" },

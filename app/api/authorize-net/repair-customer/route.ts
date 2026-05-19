@@ -62,6 +62,7 @@ function manualToStored(transaction: ManualTransaction, fallbackEmail: string, f
     settledAt,
     customerEmail: email,
     normalizedEmail: email,
+    emailNormalized: email,
     customerName: String(transaction.customerName ?? "").replace(/\s+/g, " ").trim(),
     billingFirstName: "",
     billingLastName: "",

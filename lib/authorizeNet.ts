@@ -157,6 +157,7 @@ export function normalizeAuthorizeNetTransaction(transaction: AuthNetObject, imp
     settledAt: asString(transaction.settleTimeUTC || transaction.settleTimeLocal || (asString(transaction.transactionStatus).toLowerCase().includes("settled") ? submittedAt : "")),
     customerEmail: email,
     normalizedEmail: email,
+    emailNormalized: email,
     customerName: normalizedName(firstName, lastName) || normalizedName(customer.firstName, customer.lastName) || asString(customer.id),
     billingFirstName: firstName,
     billingLastName: lastName,

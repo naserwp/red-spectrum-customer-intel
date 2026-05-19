@@ -8,6 +8,10 @@ export const metadata: Metadata = {
     index: false,
     follow: false,
   },
+  icons: {
+    icon: "/Images/the-red-spectrum-favicon-1.ico",
+    shortcut: "/Images/the-red-spectrum-favicon-1.ico",
+  },
 };
 
 export default function RootLayout({

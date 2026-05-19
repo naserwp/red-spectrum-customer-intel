@@ -2,6 +2,7 @@
 
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
+import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -600,6 +601,8 @@ export default function AdminPage() {
   const [search, setSearch] = useState("");
   const [appliedSearch, setAppliedSearch] = useState("");
   const requestControllers = useRef(new Map<string, { controller: AbortController; key: string }>());
+  const searchDebounceRef = useRef<number | null>(null);
+  const appliedSearchRef = useRef("");
   const stopSyncRef = useRef(false);
 
   const fetchJson = useCallback(async (scope: string, url: string, init?: RequestInit) => {
@@ -634,11 +637,16 @@ export default function AdminPage() {
   }, []);
 
   useEffect(() => () => {
+    if (searchDebounceRef.current) window.clearTimeout(searchDebounceRef.current);
     requestControllers.current.forEach(({ controller }) => controller.abort());
     requestControllers.current.clear();
   }, []);
 
-  const loadCustomers = useCallback(async (nextPage = 1, query = appliedSearch, nextPageSize = pageSize) => {
+  useEffect(() => {
+    appliedSearchRef.current = appliedSearch;
+  }, [appliedSearch]);
+
+  const loadCustomers = useCallback(async (nextPage = 1, query = appliedSearchRef.current, nextPageSize = pageSize) => {
     const params = new URLSearchParams({ page: String(nextPage), limit: String(nextPageSize) });
     if (query.trim()) params.set("q", query.trim());
     const data = await fetchJson("customers-table", `/api/customers/table?${params.toString()}`);
@@ -646,15 +654,15 @@ export default function AdminPage() {
     setCustomers(data.rows || []);
     setTotal(data.total || 0);
     setPage(data.page || nextPage);
-  }, [appliedSearch, fetchJson, pageSize]);
+  }, [fetchJson, pageSize]);
 
-  const loadHotLeads = useCallback(async (query = appliedSearch) => {
+  const loadHotLeads = useCallback(async (query = appliedSearchRef.current) => {
     const params = new URLSearchParams({ kind: "hot-leads", limit: "100" });
     if (query.trim()) params.set("q", query.trim());
     const data = await fetchJson("hot-leads", `/api/customers/table?${params.toString()}`);
     if (!data) return;
     setHotLeadRows(data.rows || []);
-  }, [appliedSearch, fetchJson]);
+  }, [fetchJson]);
 
   const loadSummary = useCallback(async () => {
     const summaryData = await fetchJson("summary", "/api/customers/summary");
@@ -741,7 +749,7 @@ export default function AdminPage() {
 
   const loadActiveTab = useCallback(async (activeTab: (typeof tabs)[number], options?: { page?: number; query?: string; pageSize?: (typeof pageSizes)[number] }) => {
     const nextPage = options?.page ?? 1;
-    const query = options?.query ?? appliedSearch;
+    const query = options?.query ?? appliedSearchRef.current;
     const nextPageSize = options?.pageSize ?? pageSize;
     setTabLoading((current) => ({ ...current, [activeTab]: true }));
     try {
@@ -760,12 +768,18 @@ export default function AdminPage() {
     } finally {
       setTabLoading((current) => ({ ...current, [activeTab]: false }));
     }
-  }, [appliedSearch, loadCustomers, loadGatewayData, loadHotLeads, loadRiskRows, loadSalesHistory, loadSubscriptions, loadSummary, loadUpcomingBills, pageSize]);
+  }, [loadCustomers, loadGatewayData, loadHotLeads, loadRiskRows, loadSalesHistory, loadSubscriptions, loadSummary, loadUpcomingBills, pageSize]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    loadActiveTab(tab, { page: 1, query: appliedSearch }).catch(() => setError("Unable to load dashboard data."));
-  }, [tab, loadActiveTab, appliedSearch]);
+    loadActiveTab(tab, { page: 1, query: appliedSearchRef.current }).catch(() => setError("Unable to load dashboard data."));
+  }, [tab, loadActiveTab]);
+
+  const runCustomerSearchOnly = useCallback((query: string) => {
+    requestControllers.current.get("customers-table")?.controller.abort();
+    setAppliedSearch(query);
+    appliedSearchRef.current = query;
+    loadCustomers(1, query, pageSize).catch(() => setError("Unable to load customer search results."));
+  }, [loadCustomers, pageSize]);
 
   const handleApplySearch = () => {
     const query = search.trim();
@@ -773,11 +787,20 @@ export default function AdminPage() {
     setRequestWarning("");
     setError("");
     setPage(1);
-    if (query === appliedSearch) {
-      loadActiveTab(tab, { page: 1, query }).catch(() => setError("Unable to load dashboard data."));
-      return;
-    }
-    setAppliedSearch(query);
+    if (searchDebounceRef.current) window.clearTimeout(searchDebounceRef.current);
+    runCustomerSearchOnly(query);
+  };
+
+  const handleSearchChange = (value: string) => {
+    setSearch(value);
+    setPage(1);
+    setMessage("");
+    setRequestWarning("");
+    requestControllers.current.get("customers-table")?.controller.abort();
+    if (searchDebounceRef.current) window.clearTimeout(searchDebounceRef.current);
+    searchDebounceRef.current = window.setTimeout(() => {
+      runCustomerSearchOnly(value.trim());
+    }, 400);
   };
 
   const handleTabChange = (nextTab: (typeof tabs)[number]) => {
@@ -1079,11 +1102,14 @@ export default function AdminPage() {
     <div className="mx-auto max-w-7xl space-y-5">
       <header className="rounded-2xl border border-red-950/60 bg-zinc-950/90 p-5 shadow-xl shadow-black/30">
         <div className="flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-red-400">Red Spectrum</p>
-            <h1 className="mt-2 text-3xl font-bold text-white md:text-4xl">Customer Intelligence</h1>
-            <p className="mt-1 text-sm text-zinc-400">Paid revenue, subscription status, checkout pipeline, and customer risk.</p>
-            <p className="mt-2 text-xs text-zinc-500">{syncStatus?.lastSyncAt ? `Last synced: ${displayDateTime(syncStatus.lastSyncAt)}` : syncStatus?.dataFreshness || "Data sync needed"}</p>
+          <div className="flex items-center gap-4">
+            <Image src="/Images/the-red-spectrum-full-logo-1.svg" alt="Red Spectrum" width={180} height={48} className="h-12 w-auto" priority />
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.22em] text-red-400">Red Spectrum</p>
+              <h1 className="mt-2 text-3xl font-bold text-white md:text-4xl">Customer Intelligence</h1>
+              <p className="mt-1 text-sm text-zinc-400">Paid revenue, subscription status, checkout pipeline, and customer risk.</p>
+              <p className="mt-2 text-xs text-zinc-500">{syncStatus?.lastSyncAt ? `Last synced: ${displayDateTime(syncStatus.lastSyncAt)}` : syncStatus?.dataFreshness || "Data sync needed"}</p>
+            </div>
           </div>
           <div className="flex flex-wrap gap-2">
             <button onClick={() => handleTabChange("Sync Center")} className="rounded-lg bg-red-600 px-5 py-3 font-semibold text-white shadow-lg shadow-red-950/30 transition hover:bg-red-500">Sync Center</button>
@@ -1093,7 +1119,7 @@ export default function AdminPage() {
       </header>
       <nav className="sticky top-0 z-10 flex gap-2 overflow-auto rounded-xl border border-red-950/40 bg-zinc-950/95 p-3 shadow-lg shadow-black/30 backdrop-blur">{tabs.map((t) => <button key={t} onClick={() => handleTabChange(t)} className={`whitespace-nowrap rounded-lg px-4 py-2 text-sm font-semibold transition ${tab === t ? "bg-red-600 text-white shadow-lg shadow-red-950/50 ring-1 ring-red-400/30" : "border border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-red-900 hover:bg-zinc-800 hover:text-white"}`}>{t}</button>)}</nav>
       <div className="flex flex-wrap items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-950/80 p-3">
-        <input value={search} onChange={(e) => { setSearch(e.target.value); setPage(1); }} onKeyDown={(e) => { if (e.key === "Enter") handleApplySearch(); }} className="min-w-64 rounded bg-zinc-950 px-3 py-2 text-sm outline-none ring-1 ring-zinc-800" placeholder="Search customers by name, email, phone" />
+        <input value={search} onChange={(e) => handleSearchChange(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") handleApplySearch(); }} className="min-w-64 rounded bg-zinc-950 px-3 py-2 text-sm outline-none ring-1 ring-zinc-800" placeholder="Search customers by name, email, phone" />
         <select value={pageSize} onChange={(e) => { setPageSize(Number(e.target.value) as (typeof pageSizes)[number]); setPage(1); }} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">{pageSizes.map((size) => <option key={size} value={size}>{size} rows</option>)}</select>
         <button onClick={handleApplySearch} className="rounded bg-zinc-700 px-4 py-2 text-sm font-semibold">Apply</button>
       </div>
