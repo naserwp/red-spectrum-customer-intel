@@ -4,6 +4,8 @@ import { adminSessionCookieName, verifyAdminSession } from "@/lib/adminAuth";
 const protectedApiPaths = [
   "/api/woocommerce/backfill-orders",
   "/api/woocommerce/backfill-subscriptions",
+  "/api/authorize-net/backfill-transactions",
+  "/api/authorize-net/reconcile-customers",
   "/api/customers/rebuild-from-orders",
   "/api/customers/sync-one",
   "/api/customers/compare-source",
@@ -31,5 +33,5 @@ export async function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/admin/:path*", "/api/woocommerce/backfill-orders", "/api/woocommerce/backfill-subscriptions", "/api/customers/rebuild-from-orders", "/api/customers/sync-one", "/api/customers/compare-source"],
+  matcher: ["/admin/:path*", "/api/woocommerce/backfill-orders", "/api/woocommerce/backfill-subscriptions", "/api/authorize-net/backfill-transactions", "/api/authorize-net/reconcile-customers", "/api/customers/rebuild-from-orders", "/api/customers/sync-one", "/api/customers/compare-source"],
 };

@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
+import { isDeclinedOrFailed, isSettledSuccessful } from "@/lib/authorizeNet";
 import { connectToDatabase } from "@/lib/mongodb";
+import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer, type CustomerDocument, type CustomerOrderHistoryItem } from "@/models/Customer";
 
 export const dynamic = "force-dynamic";
@@ -156,6 +158,19 @@ function includeStatus(order: CustomerOrderHistoryItem, status: StatusFilter) {
   return true;
 }
 
+function includeTransactionStatus(transaction: AuthorizeNetTransactionDocument, status: StatusFilter) {
+  const paid = isSettledSuccessful(transaction.transactionStatus);
+  const failed = isDeclinedOrFailed(transaction.transactionStatus);
+  if (status === "all") return true;
+  if (status === "paid") return paid;
+  if (status === "attempted") return !paid;
+  if (status === "failed") return failed;
+  if (status === "refunded") return transaction.transactionStatus.toLowerCase().includes("refund");
+  if (status === "verified") return Boolean(transaction.matchedCustomerId);
+  if (status === "not_verified") return !transaction.matchedCustomerId;
+  return true;
+}
+
 function latestDate(a: string, b: string) {
   if (!a) return b;
   if (!b) return a;
@@ -193,6 +208,33 @@ function applyOrder(metric: Metric, order: CustomerOrderHistoryItem) {
   else metric.unmatchedOrders += 1;
   if (provider === "unknown" || confidence === "low" || confidence === "not_found" || !matched) metric.manualReviewRevenue += amount;
   metric.lastTransactionDate = latestDate(metric.lastTransactionDate, transactionDate);
+}
+
+function applyAuthorizeNetTransaction(metric: Metric, transaction: AuthorizeNetTransactionDocument) {
+  const amount = money(transaction.amount);
+  const paid = isSettledSuccessful(transaction.transactionStatus);
+  const failed = isDeclinedOrFailed(transaction.transactionStatus);
+  const refunded = transaction.transactionStatus.toLowerCase().includes("refund");
+  metric.totalOrders += 1;
+  if (paid) {
+    metric.paidRevenue += amount;
+    metric.paidOrders += 1;
+    metric.verifiedRevenue += amount;
+  } else {
+    metric.attemptedPipeline += amount;
+    metric.attemptedOrders += 1;
+  }
+  if (failed) {
+    metric.failedAmount += amount;
+    metric.failedOrders += 1;
+  }
+  if (refunded) metric.refundedAmount += amount;
+  if (transaction.matchedCustomerId) metric.matchedOrders += 1;
+  else {
+    metric.unmatchedOrders += 1;
+    metric.manualReviewRevenue += amount;
+  }
+  metric.lastTransactionDate = latestDate(metric.lastTransactionDate, transaction.settledAt || transaction.submittedAt);
 }
 
 function addSummary(target: Metric, source: Metric) {
@@ -241,7 +283,10 @@ export async function GET(request: Request) {
   const requestedProvider = providerParam === "all" || defaultProviders.includes(providerParam as Provider) ? providerParam as Provider | "all" : "all";
   const status = statusFilters.includes(statusParam as StatusFilter) ? statusParam as StatusFilter : "all";
 
-  const customers = await Customer.find({}, { name: 1, email: 1, orders: 1 }).lean<Pick<CustomerDocument, "name" | "email" | "orders">[]>();
+  const [customers, authorizeNetTransactions] = await Promise.all([
+    Customer.find({}, { name: 1, email: 1, orders: 1 }).lean<Pick<CustomerDocument, "name" | "email" | "orders">[]>(),
+    AuthorizeNetTransaction.find({}).lean<AuthorizeNetTransactionDocument[]>(),
+  ]);
   const providerMetrics = new Map<Provider, Metric>();
   const timelineMetrics = new Map<string, Metric>();
   const customerMetrics = new Map<string, CustomerGatewayMetric>();
@@ -253,6 +298,7 @@ export async function GET(request: Request) {
       const date = orderDate(order);
       if (!date || date < from || date > to) continue;
       const provider = normalizeProvider(order);
+      if (provider === "authorize_net" && authorizeNetTransactions.length > 0) continue;
       if (requestedProvider !== "all" && provider !== requestedProvider) continue;
       if (!includeStatus(order, status)) continue;
 
@@ -282,6 +328,39 @@ export async function GET(request: Request) {
       customerMetric.lastOrderDate = latestDate(customerMetric.lastOrderDate, order.dateCreated);
       customerMetrics.set(customerKey, customerMetric);
     }
+  }
+
+  for (const transaction of authorizeNetTransactions) {
+    const date = new Date(transaction.settledAt || transaction.submittedAt || "");
+    if (Number.isNaN(date.getTime()) || date < from || date > to) continue;
+    if (requestedProvider !== "all" && requestedProvider !== "authorize_net") continue;
+    if (!includeTransactionStatus(transaction, status)) continue;
+
+    const providerMetric = providerMetrics.get("authorize_net") ?? emptyMetric();
+    applyAuthorizeNetTransaction(providerMetric, transaction);
+    providerMetrics.set("authorize_net", providerMetric);
+
+    const period = periodFor(date, interval);
+    const timelineKey = `${period}:authorize_net`;
+    const timelineMetric = timelineMetrics.get(timelineKey) ?? emptyMetric();
+    applyAuthorizeNetTransaction(timelineMetric, transaction);
+    timelineMetrics.set(timelineKey, timelineMetric);
+
+    const customerKey = `authorize_net:${transaction.normalizedEmail || transaction.transactionId}`;
+    const customerMetric = customerMetrics.get(customerKey) ?? {
+      provider: "authorize_net" as const,
+      customerName: transaction.customerName || transaction.normalizedEmail,
+      email: transaction.normalizedEmail || transaction.customerEmail,
+      paidRevenue: 0,
+      attemptedPipeline: 0,
+      orderCount: 0,
+      lastOrderDate: "",
+    };
+    if (isSettledSuccessful(transaction.transactionStatus)) customerMetric.paidRevenue += money(transaction.amount);
+    else customerMetric.attemptedPipeline += money(transaction.amount);
+    customerMetric.orderCount += 1;
+    customerMetric.lastOrderDate = latestDate(customerMetric.lastOrderDate, transaction.settledAt || transaction.submittedAt);
+    customerMetrics.set(customerKey, customerMetric);
   }
 
   const byProvider = Array.from(providerMetrics.entries())

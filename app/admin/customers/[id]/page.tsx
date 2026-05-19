@@ -109,6 +109,19 @@ type SourceCompare = {
   recommendation: string;
 };
 
+type GatewayPayment = {
+  date: string;
+  provider: string;
+  transactionId: string;
+  invoiceNumber: string;
+  status: string;
+  amount: number;
+  cardLast4: string;
+  matchedBy: string;
+  matchConfidence: string;
+  source: string;
+};
+
 type CustomerDetail = {
   _id: string;
   name: string;
@@ -147,6 +160,7 @@ type CustomerDetail = {
   lastAttemptedProduct?: string;
   productJourney?: ProductJourneyItem[];
   gatewayVerification?: GatewayVerification;
+  gatewayPayments?: GatewayPayment[];
   sourceCoverage?: SourceCoverage;
   orderCount: number;
   averageOrderValue: number;
@@ -574,6 +588,28 @@ export default function CustomerDetailPage() {
           <div><p className="text-xs uppercase text-zinc-400">Recommended</p><p className="font-semibold">{verification?.matched ? "Payment verified" : "Manual follow-up"}</p></div>
         </div>
         <p className="mt-3 text-zinc-300">{verification?.notes || "Manual verification required."}</p>
+      </section>
+
+      <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+        <h2 className="text-xl font-semibold text-emerald-300">Gateway Payment History</h2>
+        <div className="mt-3 overflow-x-auto rounded border border-zinc-800">
+          <table className="min-w-[1050px] text-sm">
+            <thead className="bg-zinc-950"><tr>{["Date", "Provider", "Transaction ID", "Invoice #", "Status", "Amount", "Card Last4", "Match Method", "Confidence", "Source"].map((h) => <th key={h} className="px-3 py-2 text-left text-xs uppercase text-zinc-400">{h}</th>)}</tr></thead>
+            <tbody>{(customer.gatewayPayments ?? []).map((payment) => <tr key={payment.transactionId} className={`border-t border-zinc-800 ${payment.source === "authorize_net_only" ? "bg-emerald-500/5" : ""}`}>
+              <td className="px-3 py-3">{displayDateTime(payment.date)}</td>
+              <td className="px-3 py-3">{displayStatus(payment.provider)}</td>
+              <td className="px-3 py-3">{payment.transactionId}</td>
+              <td className="px-3 py-3">{payment.invoiceNumber || "-"}</td>
+              <td className="px-3 py-3">{displayStatus(payment.status)}</td>
+              <td className="px-3 py-3">{money(payment.amount)}</td>
+              <td className="px-3 py-3">{payment.cardLast4 || "-"}</td>
+              <td className="px-3 py-3">{displayStatus(payment.matchedBy)}</td>
+              <td className="px-3 py-3">{displayStatus(payment.matchConfidence)}</td>
+              <td className="px-3 py-3">{payment.source === "authorize_net_only" ? "Authorize.net only" : displayStatus(payment.source)}</td>
+            </tr>)}</tbody>
+          </table>
+          {(customer.gatewayPayments ?? []).length === 0 && <p className="p-3 text-zinc-400">No gateway payment history has been reconciled for this customer yet.</p>}
+        </div>
       </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">

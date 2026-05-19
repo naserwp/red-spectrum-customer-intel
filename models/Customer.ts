@@ -102,6 +102,19 @@ export interface CustomerProductJourneyItem {
   type: "paid" | "attempted";
 }
 
+export interface CustomerGatewayPayment {
+  date: string;
+  provider: string;
+  transactionId: string;
+  invoiceNumber: string;
+  status: string;
+  amount: number;
+  cardLast4: string;
+  matchedBy: string;
+  matchConfidence: string;
+  source: string;
+}
+
 export interface CustomerDocument {
   name: string;
   email: string;
@@ -163,6 +176,7 @@ export interface CustomerDocument {
   recommendedContactMethod: string;
   nextAction: string;
   gatewayVerification: GatewayVerification;
+  gatewayPayments: CustomerGatewayPayment[];
   sourceCoverage: CustomerSourceCoverage;
   externalCustomerKey: string;
 }
@@ -326,6 +340,22 @@ const customerProductJourneySchema = new Schema<CustomerProductJourneyItem>(
   { _id: false }
 );
 
+const customerGatewayPaymentSchema = new Schema<CustomerGatewayPayment>(
+  {
+    date: { type: String, default: "" },
+    provider: { type: String, default: "" },
+    transactionId: { type: String, default: "" },
+    invoiceNumber: { type: String, default: "" },
+    status: { type: String, default: "" },
+    amount: { type: Number, default: 0 },
+    cardLast4: { type: String, default: "" },
+    matchedBy: { type: String, default: "" },
+    matchConfidence: { type: String, default: "" },
+    source: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
 const customerSchema = new Schema<CustomerDocument>(
   {
     name: { type: String, required: true },
@@ -388,6 +418,7 @@ const customerSchema = new Schema<CustomerDocument>(
     recommendedContactMethod: { type: String, default: "email" },
     nextAction: { type: String, default: "Manual review" },
     gatewayVerification: { type: gatewayVerificationSchema, default: () => ({}) },
+    gatewayPayments: { type: [customerGatewayPaymentSchema], default: [] },
     sourceCoverage: { type: customerSourceCoverageSchema, default: () => ({}) },
     externalCustomerKey: { type: String, default: "", index: true },
   },

@@ -77,6 +77,11 @@ type SyncRunResult = {
   ordersUpserted?: number;
   subscriptionsFetched?: number;
   subscriptionsUpserted?: number;
+  transactionsFetched?: number;
+  transactionsUpserted?: number;
+  transactionsProcessed?: number;
+  transactionsMatched?: number;
+  customersUpdated?: number;
   customersProcessed?: number;
   customersRebuilt?: number;
   dryRunCustomersMatched?: number;
@@ -94,6 +99,7 @@ type SyncLastRun = {
   ordersImported: number;
   subscriptionsImported?: number;
   customersUpdated: number;
+  gatewayTransactionsImported?: number;
   warnings: string[];
   lastRunTime: string;
 };
@@ -102,6 +108,12 @@ type RebuildBatchState = {
   hasMore: boolean;
   nextOffset: number;
   dryRun: boolean;
+};
+
+type AuthNetBatchState = {
+  hasMore: boolean;
+  nextOffset: number;
+  action: "import" | "reconcile";
 };
 
 const tabs = ["Overview", "Customers", "Subscriptions", "Upcoming Bills", "High Value", "Hot Leads", "Risk Review", "Gateway Analytics", "5-Year Sales", "Sync Center"] as const;
@@ -543,6 +555,7 @@ export default function AdminPage() {
   const [syncResult, setSyncResult] = useState<SyncRunResult | null>(null);
   const [syncLastRun, setSyncLastRun] = useState<SyncLastRun | null>(null);
   const [rebuildBatch, setRebuildBatch] = useState<RebuildBatchState | null>(null);
+  const [authNetBatch, setAuthNetBatch] = useState<AuthNetBatchState | null>(null);
   const [importedOrdersCount, setImportedOrdersCount] = useState(0);
   const [tab, setTab] = useState<(typeof tabs)[number]>("Overview");
   const [page, setPage] = useState(1);
@@ -718,6 +731,68 @@ export default function AdminPage() {
       warnings: data.warnings ?? [],
       lastRunTime: new Date().toLocaleString(),
     });
+    await loadDashboardData();
+  };
+
+  const runAuthorizeNetImport = async (offset = 0) => {
+    setError("");
+    setMessage("Importing Authorize.net transactions...");
+    const res = await fetch("/api/authorize-net/backfill-transactions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        from: "2024-01-01",
+        to: dateInput(new Date()),
+        limit: 50,
+        offset,
+        dryRun: false,
+      }),
+    });
+    const data = await res.json();
+    setSyncResult(data);
+    if (!res.ok) return setError(data.error || "Authorize.net import failed");
+    const imported = Number(data.transactionsUpserted ?? 0);
+    setMessage(data.hasMore ? `Imported ${imported} Authorize.net transactions. Continue import to process next batch.` : `Imported ${imported} Authorize.net transactions.`);
+    setAuthNetBatch(data.hasMore ? { hasMore: true, nextOffset: Number(data.nextOffset ?? offset + 50), action: "import" } : null);
+    setSyncLastRun({
+      action: "Import Authorize.net Transactions",
+      status: data.warnings?.length ? "Completed with warnings" : "Completed",
+      ordersImported: 0,
+      customersUpdated: 0,
+      gatewayTransactionsImported: imported,
+      warnings: data.warnings ?? [],
+      lastRunTime: new Date().toLocaleString(),
+    });
+    await loadDashboardData();
+  };
+
+  const runAuthorizeNetReconcile = async (offset = 0) => {
+    setError("");
+    setMessage("Reconciling Authorize.net payments...");
+    const res = await fetch("/api/authorize-net/reconcile-customers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        limit: 50,
+        offset,
+        dryRun: false,
+      }),
+    });
+    const data = await res.json();
+    setSyncResult(data);
+    if (!res.ok) return setError(data.error || "Authorize.net reconciliation failed");
+    const updated = Number(data.customersUpdated ?? 0);
+    setMessage(String(data.message || `Updated ${updated} customer payment records.`));
+    setAuthNetBatch(data.hasMore ? { hasMore: true, nextOffset: Number(data.nextOffset ?? offset + 50), action: "reconcile" } : null);
+    setSyncLastRun({
+      action: "Reconcile Authorize.net Payments",
+      status: data.warnings?.length ? "Completed with warnings" : "Completed",
+      ordersImported: 0,
+      customersUpdated: updated,
+      warnings: data.warnings ?? [],
+      lastRunTime: new Date().toLocaleString(),
+    });
+    await loadCustomers(1);
     await loadDashboardData();
   };
 
@@ -920,12 +995,22 @@ export default function AdminPage() {
           <button onClick={() => runSubscriptionBackfill(false)} className="rounded bg-red-700 px-5 py-3 font-semibold hover:bg-red-600">Import WooCommerce Subscriptions</button>
           <button onClick={syncWooCommerce} className="rounded bg-zinc-800 px-5 py-3 font-semibold text-zinc-200 hover:bg-zinc-700">Single Customer Repair Sync</button>
         </div>
+        <div className="rounded-xl border border-red-950/40 bg-zinc-950 p-4">
+          <h3 className="font-semibold text-red-300">Advanced Tools</h3>
+          <p className="mt-1 text-sm text-zinc-400">Authorize.net reconciliation cross-checks real card transactions against WooCommerce orders and customer profiles.</p>
+          <div className="mt-3 flex flex-wrap gap-3">
+            <button onClick={() => runAuthorizeNetImport()} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Import Authorize.net Transactions</button>
+            <button onClick={() => runAuthorizeNetReconcile()} className="rounded bg-red-800 px-5 py-3 font-semibold hover:bg-red-700">Reconcile Authorize.net Payments</button>
+            {authNetBatch?.hasMore && <button onClick={() => authNetBatch.action === "import" ? runAuthorizeNetImport(authNetBatch.nextOffset) : runAuthorizeNetReconcile(authNetBatch.nextOffset)} className="rounded bg-zinc-800 px-5 py-3 font-semibold hover:bg-zinc-700">Continue Authorize.net {authNetBatch.action === "import" ? "Import" : "Reconcile"}</button>}
+          </div>
+        </div>
         {importedOrdersCount === 0 && <p className="text-sm text-zinc-400">Update Customer Profiles is disabled until this page has imported WooCommerce orders. Run Import WooCommerce Orders first.</p>}
-        <div className="grid gap-3 md:grid-cols-4">
+        <div className="grid gap-3 md:grid-cols-5">
           <Card label="Last Action" value={syncLastRun?.action ?? "None"} />
           <Card label="Job Status" value={syncLastRun?.status ?? "Idle"} />
           <Card label="Orders Imported" value={syncLastRun?.ordersImported ?? 0} />
           <Card label="Subscriptions Imported" value={syncLastRun?.subscriptionsImported ?? 0} />
+          <Card label="Gateway Transactions" value={syncLastRun?.gatewayTransactionsImported ?? 0} />
           <Card label="Customers Updated" value={syncLastRun?.customersUpdated ?? 0} />
         </div>
         <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 text-sm text-zinc-300">
