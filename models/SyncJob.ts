@@ -1,6 +1,6 @@
 import mongoose, { Schema } from "mongoose";
 
-export type SyncJobType = "woocommerce_backfill_orders" | "woocommerce_backfill_subscriptions" | "rebuild_customers";
+export type SyncJobType = "woocommerce_backfill_orders" | "woocommerce_backfill_subscriptions" | "rebuild_customers" | "automatic_batch_sync";
 export type SyncJobStatus = "running" | "completed" | "failed" | "partial";
 
 export interface SyncJobDocument {
@@ -22,7 +22,7 @@ export interface SyncJobDocument {
 
 const syncJobSchema = new Schema<SyncJobDocument>(
   {
-    jobType: { type: String, enum: ["woocommerce_backfill_orders", "woocommerce_backfill_subscriptions", "rebuild_customers"], required: true, index: true },
+    jobType: { type: String, enum: ["woocommerce_backfill_orders", "woocommerce_backfill_subscriptions", "rebuild_customers", "automatic_batch_sync"], required: true, index: true },
     status: { type: String, enum: ["running", "completed", "failed", "partial"], required: true, index: true },
     startedAt: { type: String, required: true },
     finishedAt: { type: String, default: "" },

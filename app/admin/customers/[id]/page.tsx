@@ -302,25 +302,44 @@ export default function CustomerDetailPage() {
   const [notes, setNotes] = useState("");
   const [tags, setTags] = useState("");
   const [message, setMessage] = useState("");
+  const [loadError, setLoadError] = useState("");
   const [subscriptions, setSubscriptions] = useState<Array<Record<string, string | number>>>([]);
   const [sourceCompare, setSourceCompare] = useState<SourceCompare | null>(null);
 
   useEffect(() => {
-    fetch(`/api/customers/${params.id}`).then((r) => r.json()).then((d) => {
-      const nextCustomer = d.customer;
-      setCustomer(nextCustomer);
-      setNotes(nextCustomer?.notes ?? "");
-      setTags((nextCustomer?.tags ?? []).join(", "));
-      const email = String(nextCustomer?.email ?? "").toLowerCase();
-      if (email && !email.endsWith("@woocommerce.local")) {
-        fetch(`/api/customers/compare-source?email=${encodeURIComponent(email)}`).then((r3) => r3.json()).then((compare) => {
-          if (!compare.error) setSourceCompare(compare);
-        }).catch(() => setSourceCompare(null));
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 15000);
+    const load = async () => {
+      setLoadError("");
+      try {
+        const safeId = encodeURIComponent(decodeURIComponent(params.id));
+        const response = await fetch(`/api/customers/${safeId}`, { signal: controller.signal, cache: "no-store" });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Customer not found.");
+        const nextCustomer = data.customer;
+        setCustomer(nextCustomer);
+        setNotes(nextCustomer?.notes ?? "");
+        setTags((nextCustomer?.tags ?? []).join(", "));
+        const email = String(nextCustomer?.email ?? "").toLowerCase();
+        if (email && !email.endsWith("@woocommerce.local")) {
+          fetch(`/api/customers/compare-source?email=${encodeURIComponent(email)}`, { signal: controller.signal, cache: "no-store" }).then((r3) => r3.json()).then((compare) => {
+            if (!compare.error) setSourceCompare(compare);
+          }).catch(() => setSourceCompare(null));
+          fetch(`/api/subscriptions?kind=all-real-data&limit=25&q=${encodeURIComponent(email)}`, { signal: controller.signal, cache: "no-store" }).then((r2) => r2.json()).then((subs) => {
+            setSubscriptions((subs.rows ?? []).filter((row: Record<string, string | number>) => String(row.customerEmail ?? "").toLowerCase() === email));
+          }).catch(() => setSubscriptions([]));
+        }
+      } catch (error) {
+        setLoadError(controller.signal.aborted ? "Customer detail request took too long. Try again or open from the customer table." : error instanceof Error ? error.message : "Unable to load customer details.");
+      } finally {
+        window.clearTimeout(timeout);
       }
-      fetch("/api/subscriptions?kind=all-real-data&limit=100").then((r2) => r2.json()).then((subs) => {
-        setSubscriptions((subs.rows ?? []).filter((row: Record<string, string | number>) => String(row.customerEmail ?? "").toLowerCase() === email));
-      });
-    });
+    };
+    load();
+    return () => {
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
   }, [params.id]);
 
   const save = async () => {
@@ -390,7 +409,7 @@ export default function CustomerDetailPage() {
     return Array.from(rows.values()).sort((a, b) => new Date(b.lastPaidDate).getTime() - new Date(a.lastPaidDate).getTime());
   }, [customer]);
 
-  if (!customer) return <main className="min-h-screen bg-black p-8 text-zinc-300">Loading customer details...</main>;
+  if (!customer) return <main className="min-h-screen bg-black p-8 text-zinc-300">{loadError || "Loading customer details..."}</main>;
 
   const orders = [...(customer.orders ?? [])].sort((a, b) => new Date(b.dateCreated).getTime() - new Date(a.dateCreated).getTime());
   const attemptedOrders = orders.filter((order) => order.isAttempted);

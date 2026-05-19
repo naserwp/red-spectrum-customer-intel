@@ -113,6 +113,7 @@ type WooCommerceFetchOptions = {
   signal?: AbortSignal;
   after?: string;
   before?: string;
+  page?: number;
 };
 
 export const wooCommerceOrderStatuses = ["completed", "processing", "pending", "failed", "cancelled", "on-hold", "checkout-draft", "refunded"];
@@ -183,7 +184,9 @@ async function fetchWooCommerceCollection<T>(resource: "customers" | "orders" | 
     fetchedByStatus[status || "all"] = 0;
     pagesFetchedByStatus[status || "all"] = 0;
 
-    for (let page = 1; page <= maxPages; page += 1) {
+    const startPage = Math.max(1, options.page ?? 1);
+    const endPage = startPage + maxPages - 1;
+    for (let page = startPage; page <= endPage; page += 1) {
       if (options.signal?.aborted) break;
       const url = new URL(`${config.storeUrl}/wp-json/wc/v3/${resource}`);
       url.searchParams.set("per_page", String(perPage));
@@ -234,7 +237,7 @@ async function fetchWooCommerceCollection<T>(resource: "customers" | "orders" | 
         }
 
         if (pageResults.length < perPage) break;
-        if (page === maxPages) {
+        if (page === endPage) {
           reachedPageLimit = true;
           partialSync = true;
         }

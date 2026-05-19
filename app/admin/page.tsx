@@ -116,6 +116,24 @@ type AuthNetBatchState = {
   action: "import" | "reconcile";
 };
 
+type SyncStepResult = {
+  hasMore: boolean;
+  nextCursor?: Record<string, unknown>;
+  progressLabel?: string;
+  ordersImported?: number;
+  customersUpdated?: number;
+  subscriptionsImported?: number;
+  authorizeNetTransactionsImported?: number;
+  authorizeNetPaymentsReconciled?: number;
+  warnings?: string[];
+};
+
+type SyncStatus = {
+  lastSyncAt?: string;
+  dataFreshness?: string;
+  counts?: { customers?: number; wooOrders?: number; wooSubscriptions?: number; authorizeNetTransactions?: number };
+};
+
 const tabs = ["Overview", "Customers", "Subscriptions", "Upcoming Bills", "High Value", "Hot Leads", "Risk Review", "Gateway Analytics", "5-Year Sales", "Sync Center"] as const;
 const pageSizes = [25, 50, 100] as const;
 const rebuildBatchSize = 50;
@@ -130,6 +148,11 @@ const displayDate = (value?: string) => {
   if (!value) return "-";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "-" : date.toLocaleDateString();
+};
+const displayDateTime = (value?: string) => {
+  if (!value) return "-";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "-" : date.toLocaleString();
 };
 const dateInput = (date: Date) => date.toISOString().slice(0, 10);
 const monthSpan = (start?: string) => {
@@ -555,6 +578,9 @@ export default function AdminPage() {
   const [message, setMessage] = useState("");
   const [requestWarning, setRequestWarning] = useState("");
   const [tabLoading, setTabLoading] = useState<Record<string, boolean>>({});
+  const [syncRunning, setSyncRunning] = useState(false);
+  const [advancedToolsOpen, setAdvancedToolsOpen] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const [syncResult, setSyncResult] = useState<SyncRunResult | null>(null);
   const [syncLastRun, setSyncLastRun] = useState<SyncLastRun | null>(null);
   const [rebuildBatch, setRebuildBatch] = useState<RebuildBatchState | null>(null);
@@ -562,11 +588,12 @@ export default function AdminPage() {
   const [importedOrdersCount, setImportedOrdersCount] = useState(0);
   const [tab, setTab] = useState<(typeof tabs)[number]>("Overview");
   const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState<(typeof pageSizes)[number]>(25);
+  const [pageSize, setPageSize] = useState<(typeof pageSizes)[number]>(50);
   const [total, setTotal] = useState(0);
   const [search, setSearch] = useState("");
   const [appliedSearch, setAppliedSearch] = useState("");
   const requestControllers = useRef(new Map<string, { controller: AbortController; key: string }>());
+  const stopSyncRef = useRef(false);
 
   const fetchJson = useCallback(async (scope: string, url: string, init?: RequestInit) => {
     const key = `${init?.method ?? "GET"}:${url}:${typeof init?.body === "string" ? init.body : ""}`;
@@ -626,6 +653,12 @@ export default function AdminPage() {
     const summaryData = await fetchJson("summary", "/api/analytics/summary");
     if (!summaryData) return;
     setSummary(summaryData || {});
+  }, [fetchJson]);
+
+  const loadSyncStatus = useCallback(async () => {
+    const statusData = await fetchJson("sync-status", "/api/sync/status");
+    if (!statusData) return;
+    setSyncStatus(statusData);
   }, [fetchJson]);
 
   const loadSubscriptions = useCallback(async () => {
@@ -723,6 +756,11 @@ export default function AdminPage() {
     loadActiveTab(tab, { page: 1, query: appliedSearch }).catch(() => setError("Unable to load dashboard data."));
   }, [tab, loadActiveTab, appliedSearch]);
 
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadSyncStatus().catch(() => undefined);
+  }, [loadSyncStatus]);
+
   const handleApplySearch = () => {
     const query = search.trim();
     setMessage("");
@@ -740,6 +778,68 @@ export default function AdminPage() {
     setMessage("");
     setRequestWarning("");
     setTab(nextTab);
+  };
+
+  const runSyncNow = async () => {
+    setError("");
+    setMessage("Starting sync...");
+    setSyncRunning(true);
+    stopSyncRef.current = false;
+    let cursor: Record<string, unknown> | undefined;
+    const totals = { ordersImported: 0, customersUpdated: 0, subscriptionsImported: 0, authorizeNetTransactionsImported: 0, authorizeNetPaymentsReconciled: 0 };
+    const warnings: string[] = [];
+    try {
+      for (let step = 0; step < 250; step += 1) {
+        if (stopSyncRef.current) {
+          setMessage("Sync stopped.");
+          break;
+        }
+        const data = await fetchJson("sync-run-step", "/api/sync/run-step", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cursor }),
+        }) as SyncStepResult | null;
+        if (!data) {
+          warnings.push("Sync step did not return a response.");
+          break;
+        }
+        totals.ordersImported += Number(data.ordersImported ?? 0);
+        totals.customersUpdated += Number(data.customersUpdated ?? 0);
+        totals.subscriptionsImported += Number(data.subscriptionsImported ?? 0);
+        totals.authorizeNetTransactionsImported += Number(data.authorizeNetTransactionsImported ?? 0);
+        totals.authorizeNetPaymentsReconciled += Number(data.authorizeNetPaymentsReconciled ?? 0);
+        warnings.push(...(data.warnings ?? []).filter(Boolean));
+        cursor = data.nextCursor;
+        setMessage(data.progressLabel || "Sync step complete.");
+        if (!data.hasMore) {
+          setMessage(`Sync complete. Orders: ${totals.ordersImported}. Customers updated: ${totals.customersUpdated}. Subscriptions: ${totals.subscriptionsImported}. Authorize.net transactions: ${totals.authorizeNetTransactionsImported}.`);
+          break;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+      }
+      setSyncLastRun({
+        action: "Sync Now",
+        status: warnings.length ? "Completed with warnings" : "Completed",
+        ordersImported: totals.ordersImported,
+        subscriptionsImported: totals.subscriptionsImported,
+        gatewayTransactionsImported: totals.authorizeNetTransactionsImported,
+        customersUpdated: totals.customersUpdated,
+        warnings,
+        lastRunTime: new Date().toLocaleString(),
+      });
+      await Promise.all([loadSyncStatus(), loadActiveTab(tab, { page: 1, query: appliedSearch })]);
+    } catch (syncError) {
+      setError(syncError instanceof Error ? syncError.message : "Sync failed.");
+    } finally {
+      setSyncRunning(false);
+      stopSyncRef.current = false;
+    }
+  };
+
+  const stopSyncNow = () => {
+    stopSyncRef.current = true;
+    requestControllers.current.get("sync-run-step")?.controller.abort();
+    setSyncRunning(false);
   };
 
   const syncWooCommerce = async () => {
@@ -767,8 +867,8 @@ export default function AdminPage() {
       body: JSON.stringify({
         from: "2019-01-01",
         to: dateInput(new Date()),
-        perPage: 100,
-        maxPages: 500,
+        perPage: 25,
+        maxPages: 1,
         dryRun,
       }),
     });
@@ -799,8 +899,8 @@ export default function AdminPage() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        perPage: 100,
-        maxPages: 100,
+        perPage: 25,
+        maxPages: 1,
         dryRun,
       }),
     });
@@ -969,6 +1069,7 @@ export default function AdminPage() {
             <p className="text-xs font-semibold uppercase tracking-[0.22em] text-red-400">Red Spectrum</p>
             <h1 className="mt-2 text-3xl font-bold text-white md:text-4xl">Customer Intelligence</h1>
             <p className="mt-1 text-sm text-zinc-400">Paid revenue, subscription status, checkout pipeline, and customer risk.</p>
+            <p className="mt-2 text-xs text-zinc-500">{syncStatus?.lastSyncAt ? `Last synced: ${displayDateTime(syncStatus.lastSyncAt)}` : syncStatus?.dataFreshness || "Data sync needed"}</p>
           </div>
           <div className="flex flex-wrap gap-2">
             <button onClick={() => handleTabChange("Sync Center")} className="rounded-lg bg-red-600 px-5 py-3 font-semibold text-white shadow-lg shadow-red-950/30 transition hover:bg-red-500">Sync Center</button>
@@ -1049,51 +1150,30 @@ export default function AdminPage() {
       {tab === "Sync Center" && <section className="space-y-4 rounded-xl border border-zinc-800 bg-zinc-900/70 p-5">
         <div>
           <h2 className="mb-2 text-xl font-semibold text-red-300">Sync Center</h2>
-          <p className="text-sm text-zinc-400">Use this workflow to bring WooCommerce orders and subscriptions into Red Spectrum before reviewing customer reporting.</p>
-        </div>
-        <div className="grid gap-3 md:grid-cols-4">
-          <div className="rounded-xl border border-red-950/50 bg-zinc-950 p-4">
-            <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Step 1</p>
-            <h3 className="mt-2 font-semibold text-white">Import WooCommerce Orders</h3>
-            <p className="mt-2 text-sm text-zinc-400">Imports WooCommerce order history into the internal database for customer reporting.</p>
-          </div>
-          <div className="rounded-xl border border-red-950/50 bg-zinc-950 p-4">
-            <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Step 2</p>
-            <h3 className="mt-2 font-semibold text-white">Update Customer Profiles</h3>
-            <p className="mt-2 text-sm text-zinc-400">Rebuilds paid revenue, attempted checkout pipeline, hot leads, and product history from imported orders.</p>
-          </div>
-          <div className="rounded-xl border border-red-950/50 bg-zinc-950 p-4">
-            <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Step 3</p>
-            <h3 className="mt-2 font-semibold text-white">Import WooCommerce Subscriptions</h3>
-            <p className="mt-2 text-sm text-zinc-400">Imports real WooCommerce Subscriptions records, including active status and next payment dates.</p>
-          </div>
-          <div className="rounded-xl border border-red-950/50 bg-zinc-950 p-4">
-            <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Step 4</p>
-            <h3 className="mt-2 font-semibold text-white">Review Dashboard</h3>
-            <p className="mt-2 text-sm text-zinc-400">Review Overview, Hot Leads, Subscriptions, and Upcoming Bills after imports finish.</p>
-          </div>
-        </div>
-        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-100">
-          <p>Use Test buttons first when checking connections. Run Import WooCommerce Orders before Update Customer Profiles. Run Import WooCommerce Subscriptions before reviewing Active Subscriptions and Upcoming Bills. Single Customer Repair Sync is only for debugging one customer, not for full database updates.</p>
+          <p className="text-sm text-zinc-400">Imports new WooCommerce orders, updates customers, imports subscriptions, and reconciles Authorize.net payments in safe batches.</p>
         </div>
         <div className="flex flex-wrap gap-3">
-          <button onClick={() => runOrderBackfill(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Test WooCommerce Order Import</button>
-          <button onClick={() => runOrderBackfill(false)} className="rounded bg-red-600 px-5 py-3 font-semibold hover:bg-red-500">Import WooCommerce Orders</button>
-          <button onClick={() => runCustomerRebuild(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Preview Customer Profile Update</button>
-          <button disabled={importedOrdersCount === 0} onClick={() => runCustomerRebuild(false)} className="rounded bg-emerald-700 px-5 py-3 font-semibold hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50">Update Customer Profiles</button>
-          {rebuildBatch?.hasMore && <button onClick={() => runCustomerRebuild(rebuildBatch.dryRun, rebuildBatch.nextOffset)} className="rounded bg-emerald-800 px-5 py-3 font-semibold hover:bg-emerald-700">Continue Customer Profile {rebuildBatch.dryRun ? "Preview" : "Update"}</button>}
-          <button onClick={() => runSubscriptionBackfill(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Test WooCommerce Subscription Import</button>
-          <button onClick={() => runSubscriptionBackfill(false)} className="rounded bg-red-700 px-5 py-3 font-semibold hover:bg-red-600">Import WooCommerce Subscriptions</button>
-          <button onClick={syncWooCommerce} className="rounded bg-zinc-800 px-5 py-3 font-semibold text-zinc-200 hover:bg-zinc-700">Single Customer Repair Sync</button>
+          <button disabled={syncRunning} onClick={runSyncNow} className="rounded bg-red-600 px-6 py-3 font-semibold text-white hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-60">Sync Now</button>
+          {syncRunning && <button onClick={stopSyncNow} className="rounded bg-zinc-700 px-6 py-3 font-semibold hover:bg-zinc-600">Stop Sync</button>}
         </div>
         <div className="rounded-xl border border-red-950/40 bg-zinc-950 p-4">
-          <h3 className="font-semibold text-red-300">Advanced Tools</h3>
-          <p className="mt-1 text-sm text-zinc-400">Authorize.net reconciliation cross-checks real card transactions against WooCommerce orders and customer profiles.</p>
-          <div className="mt-3 flex flex-wrap gap-3">
-            <button onClick={() => runAuthorizeNetImport()} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Import Authorize.net Transactions</button>
-            <button onClick={() => runAuthorizeNetReconcile()} className="rounded bg-red-800 px-5 py-3 font-semibold hover:bg-red-700">Reconcile Authorize.net Payments</button>
-            {authNetBatch?.hasMore && <button onClick={() => authNetBatch.action === "import" ? runAuthorizeNetImport(authNetBatch.nextOffset) : runAuthorizeNetReconcile(authNetBatch.nextOffset)} className="rounded bg-zinc-800 px-5 py-3 font-semibold hover:bg-zinc-700">Continue Authorize.net {authNetBatch.action === "import" ? "Import" : "Reconcile"}</button>}
-          </div>
+          <button onClick={() => setAdvancedToolsOpen((open) => !open)} className="font-semibold text-red-300">{advancedToolsOpen ? "Hide" : "Show"} Advanced Tools</button>
+          {advancedToolsOpen && <div className="mt-3 space-y-3">
+            <p className="text-sm text-zinc-400">Technical one-step tools for debugging. Sync Now is the normal workflow.</p>
+            <div className="flex flex-wrap gap-3">
+              <button onClick={() => runOrderBackfill(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Test WooCommerce Order Import</button>
+              <button onClick={() => runOrderBackfill(false)} className="rounded bg-red-600 px-5 py-3 font-semibold hover:bg-red-500">Import WooCommerce Orders</button>
+              <button onClick={() => runCustomerRebuild(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Preview Customer Profile Update</button>
+              <button disabled={importedOrdersCount === 0} onClick={() => runCustomerRebuild(false)} className="rounded bg-emerald-700 px-5 py-3 font-semibold hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50">Update Customer Profiles</button>
+              {rebuildBatch?.hasMore && <button onClick={() => runCustomerRebuild(rebuildBatch.dryRun, rebuildBatch.nextOffset)} className="rounded bg-emerald-800 px-5 py-3 font-semibold hover:bg-emerald-700">Continue Customer Profile {rebuildBatch.dryRun ? "Preview" : "Update"}</button>}
+              <button onClick={() => runSubscriptionBackfill(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Test WooCommerce Subscription Import</button>
+              <button onClick={() => runSubscriptionBackfill(false)} className="rounded bg-red-700 px-5 py-3 font-semibold hover:bg-red-600">Import WooCommerce Subscriptions</button>
+              <button onClick={syncWooCommerce} className="rounded bg-zinc-800 px-5 py-3 font-semibold text-zinc-200 hover:bg-zinc-700">Single Customer Repair Sync</button>
+              <button onClick={() => runAuthorizeNetImport()} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Import Authorize.net Transactions</button>
+              <button onClick={() => runAuthorizeNetReconcile()} className="rounded bg-red-800 px-5 py-3 font-semibold hover:bg-red-700">Reconcile Authorize.net Payments</button>
+              {authNetBatch?.hasMore && <button onClick={() => authNetBatch.action === "import" ? runAuthorizeNetImport(authNetBatch.nextOffset) : runAuthorizeNetReconcile(authNetBatch.nextOffset)} className="rounded bg-zinc-800 px-5 py-3 font-semibold hover:bg-zinc-700">Continue Authorize.net {authNetBatch.action === "import" ? "Import" : "Reconcile"}</button>}
+            </div>
+          </div>}
         </div>
         {importedOrdersCount === 0 && <p className="text-sm text-zinc-400">Update Customer Profiles is disabled until this page has imported WooCommerce orders. Run Import WooCommerce Orders first.</p>}
         <div className="grid gap-3 md:grid-cols-5">
