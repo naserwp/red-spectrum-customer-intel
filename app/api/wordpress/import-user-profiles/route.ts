@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { fetchProfileUsersWithFallback, fetchWordPressProfileUsers, isWooCommerceCustomerFallbackConfigured, isWordPressProfileImportConfigured } from "@/lib/wordpressProfiles";
+import { fetchProfileUsersWithFallback, fetchWordPressProfileUsers, isWooCommerceCustomerFallbackConfigured, isWordPressProfileImportConfigured, ProfileTimeoutError } from "@/lib/wordpressProfiles";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 
@@ -40,7 +40,7 @@ async function findCustomerForProfile(user: Awaited<ReturnType<typeof fetchWordP
 
 export async function POST(request: Request) {
   const body = await request.json().catch(() => ({})) as { limit?: number; offset?: number; dryRun?: boolean };
-  const limit = safeNumber(body.limit, 50, 50);
+  const limit = safeNumber(body.limit, 25, 25);
   const offset = safeNumber(body.offset, 0, 1000000);
   const dryRun = body.dryRun === true;
   const warnings: string[] = dryRun ? ["Dry run: no Customer profile records were written."] : [];
@@ -60,7 +60,6 @@ export async function POST(request: Request) {
 
   await connectToDatabase();
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 7000);
   try {
     const { users, total, sourceUsed, warnings: sourceWarnings } = await fetchProfileUsersWithFallback({ limit, offset, signal: controller.signal });
     warnings.push(...sourceWarnings);
@@ -94,6 +93,7 @@ export async function POST(request: Request) {
     }
 
     const nextOffset = offset + users.length;
+    console.log(`[wordpress-profile-import] source=${sourceUsed} page=${Math.floor(offset / limit) + 1} fetched=${users.length} matched=${matchedCustomers} updated=${dryRun ? 0 : updatedProfiles} skipped=${missingCustomers}`);
     return NextResponse.json({
       processed: users.length,
       sourceUsed,
@@ -105,6 +105,10 @@ export async function POST(request: Request) {
       warnings,
     });
   } catch (error) {
+    const timeoutWarning = error instanceof ProfileTimeoutError || (error instanceof Error && error.name === "AbortError")
+      ? "Request timed out during batch fetch"
+      : error instanceof Error ? error.message : "WordPress profile import failed.";
+    console.log(`[wordpress-profile-import] source=unknown page=${Math.floor(offset / limit) + 1} fetched=0 matched=0 updated=0 skipped=0 warning="${timeoutWarning}"`);
     return NextResponse.json({
       sourceUsed: "",
       processed: 0,
@@ -113,9 +117,7 @@ export async function POST(request: Request) {
       missingCustomers: 0,
       hasMore: false,
       nextOffset: offset,
-      warnings: [error instanceof Error ? error.message : "WordPress profile import failed."],
+      warnings: [timeoutWarning],
     });
-  } finally {
-    clearTimeout(timeout);
   }
 }

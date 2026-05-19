@@ -21,7 +21,7 @@ const subscriptionPerPage = 25;
 const rebuildLimit = 50;
 const authNetLimit = 10;
 const reconcileLimit = 50;
-const wordpressProfileLimit = 50;
+const wordpressProfileLimit = 25;
 
 type SyncCursor = {
   phase?: "orders" | "customers" | "subscriptions" | "wordpress_profiles" | "authorize_net_import" | "authorize_net_reconcile" | "done";
@@ -222,7 +222,17 @@ async function importSubscriptionStep(cursor: SyncCursor) {
 async function importWordPressProfilesStep(cursor: SyncCursor) {
   if (!isWordPressProfileImportConfigured() && !isWooCommerceCustomerFallbackConfigured()) return { cursor: nextCursor(cursor, { phase: "authorize_net_import", completedSteps: ["wordpress_profiles"] }), warning: "WordPress and WooCommerce customer profile import are not configured." };
   const offset = cursor.wordpressProfileOffset ?? 0;
-  const { users, total, warnings } = await fetchProfileUsersWithFallback({ limit: wordpressProfileLimit, offset });
+  let fetched;
+  try {
+    fetched = await fetchProfileUsersWithFallback({ limit: wordpressProfileLimit, offset });
+  } catch (error) {
+    const warning = error instanceof Error && (error.name === "AbortError" || error.message.includes("timed out"))
+      ? "Request timed out during batch fetch"
+      : error instanceof Error ? error.message : "WordPress profile import failed.";
+    console.log(`[wordpress-profile-import] source=unknown page=${Math.floor(offset / wordpressProfileLimit) + 1} fetched=0 matched=0 updated=0 skipped=0 warning="${warning}"`);
+    return { cursor: nextCursor(cursor, { phase: "authorize_net_import", completedSteps: ["wordpress_profiles"] }), wordpressProfilesImported: 0, label: "WordPress customer profile import skipped.", warning };
+  }
+  const { users, total, warnings, sourceUsed } = fetched;
   const importedAt = new Date().toISOString();
   let wordpressProfilesImported = 0;
   for (const user of users) {
@@ -250,6 +260,7 @@ async function importWordPressProfilesStep(cursor: SyncCursor) {
   }
   const nextOffset = offset + users.length;
   const hasMore = users.length === wordpressProfileLimit && (total === 0 || nextOffset < total);
+  console.log(`[wordpress-profile-import] source=${sourceUsed} page=${Math.floor(offset / wordpressProfileLimit) + 1} fetched=${users.length} matched=${wordpressProfilesImported} updated=${wordpressProfilesImported} skipped=${users.length - wordpressProfilesImported}`);
   return {
     cursor: hasMore ? nextCursor(cursor, { phase: "wordpress_profiles", wordpressProfileOffset: nextOffset }) : nextCursor(cursor, { phase: "authorize_net_import", completedSteps: ["wordpress_profiles"] }),
     wordpressProfilesImported,

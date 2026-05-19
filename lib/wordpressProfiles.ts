@@ -10,6 +10,8 @@ const wcConsumerSecret = process.env.WC_CONSUMER_SECRET ?? "";
 
 type WpRecord = Record<string, unknown>;
 type ProfileSource = "wordpress_users" | "woocommerce_customers";
+const profileFetchTimeoutMs = 60000;
+const wooRequestDelayMs = 200;
 
 export type WordPressProfileUser = {
   id: number;
@@ -25,6 +27,12 @@ export class ProfileSourceError extends Error {
   constructor(message: string, status: number) {
     super(message);
     this.status = status;
+  }
+}
+
+export class ProfileTimeoutError extends Error {
+  constructor() {
+    super("Request timed out during batch fetch");
   }
 }
 
@@ -75,11 +83,41 @@ function metaDataObject(value: unknown) {
   return result;
 }
 
-async function fetchJsonWithStatus(url: string, headers: HeadersInit, signal?: AbortSignal) {
-  const response = await fetch(url, { headers, cache: "no-store", signal });
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchJsonWithStatus(url: string, headers: HeadersInit, signal?: AbortSignal, timeoutMs = profileFetchTimeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const abort = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  let response: Response;
+  try {
+    response = await fetch(url, { headers, cache: "no-store", signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) throw new ProfileTimeoutError();
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
+  }
   if (!response.ok) throw new ProfileSourceError(`${response.status} ${response.statusText}`, response.status);
   const data = await response.json() as unknown[];
   return { data, total: Number(response.headers.get("x-wp-total") ?? 0), status: response.status };
+}
+
+async function fetchJsonWithRetry(url: string, headers: HeadersInit, signal?: AbortSignal, delayBeforeFetch = 0) {
+  if (delayBeforeFetch > 0) await delay(delayBeforeFetch);
+  try {
+    return await fetchJsonWithStatus(url, headers, signal);
+  } catch (error) {
+    if (error instanceof ProfileTimeoutError) {
+      return fetchJsonWithStatus(url, headers, signal);
+    }
+    throw error;
+  }
 }
 
 export function isWordPressProfileImportConfigured() {
@@ -166,12 +204,14 @@ export function normalizeWooCommerceProfileCustomer(customer: WpRecord, imported
 
 export async function fetchWordPressProfileUsers({ limit, offset, signal }: { limit: number; offset: number; signal?: AbortSignal }) {
   if (!isWordPressProfileImportConfigured()) throw new Error("WordPress profile import is not configured.");
+  const safeLimit = Math.min(25, Math.max(1, limit));
   const base = wpStoreUrl.replace(/\/+$/, "");
   const url = new URL(`${base}/wp-json/wp/v2/users`);
   url.searchParams.set("context", "edit");
-  url.searchParams.set("per_page", String(limit));
+  url.searchParams.set("per_page", String(safeLimit));
   url.searchParams.set("offset", String(offset));
-  const { data: users, total } = await fetchJsonWithStatus(url.toString(), { Authorization: authHeader(), Accept: "application/json" }, signal);
+  url.searchParams.set("_fields", "id,name,email,first_name,last_name,meta,acf,billing");
+  const { data: users, total } = await fetchJsonWithRetry(url.toString(), { Authorization: authHeader(), Accept: "application/json" }, signal);
   return {
     users: users.map((user) => normalizeWordPressProfileUser(asRecord(user))).filter((user) => user.id || user.email),
     total,
@@ -181,12 +221,14 @@ export async function fetchWordPressProfileUsers({ limit, offset, signal }: { li
 
 export async function fetchWooCommerceProfileCustomers({ limit, offset, signal }: { limit: number; offset: number; signal?: AbortSignal }) {
   if (!isWooCommerceCustomerFallbackConfigured()) throw new Error("WooCommerce customer fallback is not configured.");
+  const safeLimit = Math.min(25, Math.max(1, limit));
   const base = (wcStoreUrl || wpStoreUrl).replace(/\/+$/, "");
-  const page = Math.floor(offset / limit) + 1;
+  const page = Math.floor(offset / safeLimit) + 1;
   const url = new URL(`${base}/wp-json/wc/v3/customers`);
-  url.searchParams.set("per_page", String(limit));
+  url.searchParams.set("per_page", String(safeLimit));
   url.searchParams.set("page", String(page));
-  const { data: customers, total } = await fetchJsonWithStatus(url.toString(), { Authorization: wooAuthHeader(), Accept: "application/json" }, signal);
+  url.searchParams.set("_fields", "id,email,username,first_name,last_name,billing,meta_data,meta,acf");
+  const { data: customers, total } = await fetchJsonWithRetry(url.toString(), { Authorization: wooAuthHeader(), Accept: "application/json" }, signal, wooRequestDelayMs);
   return {
     users: customers.map((customer) => normalizeWooCommerceProfileCustomer(asRecord(customer))).filter((user) => user.id || user.email),
     total,
