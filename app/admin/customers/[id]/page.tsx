@@ -337,7 +337,7 @@ function DetailShell({ children }: { children: ReactNode }) {
     <div className="mx-auto max-w-6xl space-y-5">
       <header className="flex flex-col gap-3 border-b border-zinc-900 pb-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-4">
-          <Image src="/Images/the-red-spectrum-full-logo-1.svg" alt="Red Spectrum" width={180} height={48} className="h-12 w-auto" priority />
+          <Image src="/Images/the-red-spectrum-full-logo-1.svg" alt="Red Spectrum" width={180} height={48} className="h-12 w-auto" style={{ width: "auto", height: "auto" }} priority />
           <div>
             <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Red Spectrum Customer Intelligence</p>
             <h1 className="mt-1 text-2xl font-bold text-zinc-100 md:text-3xl">Customer Details</h1>
@@ -653,7 +653,7 @@ export default function CustomerDetailPage() {
     <div className="mx-auto max-w-6xl space-y-5">
       <header className="flex flex-col gap-3 border-b border-zinc-900 pb-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-4">
-          <Image src="/Images/the-red-spectrum-full-logo-1.svg" alt="Red Spectrum" width={180} height={48} className="h-12 w-auto" priority />
+          <Image src="/Images/the-red-spectrum-full-logo-1.svg" alt="Red Spectrum" width={180} height={48} className="h-12 w-auto" style={{ width: "auto", height: "auto" }} priority />
           <div>
             <h1 className="text-3xl font-bold text-red-400">{customer.name}</h1>
             <p className="text-zinc-400">{customer.email} - {customer.phone || "N/A"}</p>

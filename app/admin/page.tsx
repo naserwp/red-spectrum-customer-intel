@@ -135,6 +135,10 @@ type SyncStatus = {
   counts?: { customers?: number; wooOrders?: number; wooSubscriptions?: number; authorizeNetTransactions?: number };
 };
 
+type DashboardRequestInit = RequestInit & {
+  timeoutMs?: number;
+};
+
 const tabs = ["Overview", "Customers", "Subscriptions", "Upcoming Bills", "High Value", "Hot Leads", "Risk Review", "Gateway Analytics", "5-Year Sales", "Sync Center"] as const;
 const pageSizes = [25, 50, 100] as const;
 const rebuildBatchSize = 50;
@@ -603,9 +607,19 @@ export default function AdminPage() {
   const requestControllers = useRef(new Map<string, { controller: AbortController; key: string }>());
   const searchDebounceRef = useRef<number | null>(null);
   const appliedSearchRef = useRef("");
+  const loadActiveTabRef = useRef<((activeTab: (typeof tabs)[number], options?: { page?: number; query?: string; pageSize?: (typeof pageSizes)[number] }) => Promise<void>) | null>(null);
   const stopSyncRef = useRef(false);
 
-  const fetchJson = useCallback(async (scope: string, url: string, init?: RequestInit) => {
+  const abortRequests = useCallback((keepScopes: string[] = []) => {
+    for (const [scope, { controller }] of requestControllers.current.entries()) {
+      if (!keepScopes.includes(scope)) {
+        controller.abort();
+        requestControllers.current.delete(scope);
+      }
+    }
+  }, []);
+
+  const fetchJson = useCallback(async (scope: string, url: string, init?: DashboardRequestInit) => {
     const key = `${init?.method ?? "GET"}:${url}:${typeof init?.body === "string" ? init.body : ""}`;
     const existing = requestControllers.current.get(scope);
     if (existing?.key === key) return null;
@@ -617,9 +631,11 @@ export default function AdminPage() {
     const timeout = window.setTimeout(() => {
       timedOut = true;
       controller.abort();
-    }, 15000);
+    }, init?.timeoutMs ?? 15000);
     try {
-      const response = await fetch(url, { ...init, cache: "no-store", signal: controller.signal });
+      const { timeoutMs: _timeoutMs, ...fetchInit } = init ?? {};
+      void _timeoutMs;
+      const response = await fetch(url, { ...fetchInit, cache: "no-store", signal: controller.signal });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Request failed.");
       return data;
@@ -771,15 +787,19 @@ export default function AdminPage() {
   }, [loadCustomers, loadGatewayData, loadHotLeads, loadRiskRows, loadSalesHistory, loadSubscriptions, loadSummary, loadUpcomingBills, pageSize]);
 
   useEffect(() => {
-    loadActiveTab(tab, { page: 1, query: appliedSearchRef.current }).catch(() => setError("Unable to load dashboard data."));
-  }, [tab, loadActiveTab]);
+    loadActiveTabRef.current = loadActiveTab;
+  }, [loadActiveTab]);
+
+  useEffect(() => {
+    loadActiveTabRef.current?.(tab, { page: 1, query: appliedSearchRef.current }).catch(() => setError("Unable to load dashboard data."));
+  }, [tab]);
 
   const runCustomerSearchOnly = useCallback((query: string) => {
-    requestControllers.current.get("customers-table")?.controller.abort();
+    abortRequests(["sync-run-step"]);
     setAppliedSearch(query);
     appliedSearchRef.current = query;
     loadCustomers(1, query, pageSize).catch(() => setError("Unable to load customer search results."));
-  }, [loadCustomers, pageSize]);
+  }, [abortRequests, loadCustomers, pageSize]);
 
   const handleApplySearch = () => {
     const query = search.trim();
@@ -796,7 +816,7 @@ export default function AdminPage() {
     setPage(1);
     setMessage("");
     setRequestWarning("");
-    requestControllers.current.get("customers-table")?.controller.abort();
+    abortRequests(["sync-run-step"]);
     if (searchDebounceRef.current) window.clearTimeout(searchDebounceRef.current);
     searchDebounceRef.current = window.setTimeout(() => {
       runCustomerSearchOnly(value.trim());
@@ -806,6 +826,7 @@ export default function AdminPage() {
   const handleTabChange = (nextTab: (typeof tabs)[number]) => {
     setMessage("");
     setRequestWarning("");
+    abortRequests(["sync-run-step"]);
     setTab(nextTab);
   };
 
@@ -827,6 +848,7 @@ export default function AdminPage() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ cursor }),
+          timeoutMs: 45000,
         }) as SyncStepResult | null;
         if (!data) {
           warnings.push("Sync step did not return a response.");
@@ -1103,7 +1125,7 @@ export default function AdminPage() {
       <header className="rounded-2xl border border-red-950/60 bg-zinc-950/90 p-5 shadow-xl shadow-black/30">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-4">
-            <Image src="/Images/the-red-spectrum-full-logo-1.svg" alt="Red Spectrum" width={180} height={48} className="h-12 w-auto" priority />
+            <Image src="/Images/the-red-spectrum-full-logo-1.svg" alt="Red Spectrum" width={180} height={48} className="h-12 w-auto" style={{ width: "auto", height: "auto" }} priority />
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.22em] text-red-400">Red Spectrum</p>
               <h1 className="mt-2 text-3xl font-bold text-white md:text-4xl">Customer Intelligence</h1>
