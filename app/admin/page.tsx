@@ -77,9 +77,12 @@ type SyncRunResult = {
   ordersUpserted?: number;
   subscriptionsFetched?: number;
   subscriptionsUpserted?: number;
+  customersProcessed?: number;
   customersRebuilt?: number;
   dryRunCustomersMatched?: number;
   customersSkippedSmallerHistory?: number;
+  hasMore?: boolean;
+  nextOffset?: number;
   warnings?: string[];
   failedRequests?: Array<{ status: string; page: number; message: string }>;
   message?: string;
@@ -95,8 +98,15 @@ type SyncLastRun = {
   lastRunTime: string;
 };
 
+type RebuildBatchState = {
+  hasMore: boolean;
+  nextOffset: number;
+  dryRun: boolean;
+};
+
 const tabs = ["Overview", "Customers", "Subscriptions", "Upcoming Bills", "High Value", "Hot Leads", "Risk Review", "Gateway Analytics", "5-Year Sales", "Sync Center"] as const;
 const pageSizes = [25, 50, 100] as const;
+const rebuildBatchSize = 50;
 const highValueThreshold = 2000;
 const money = (n: number) => `$${n.toFixed(2)}`;
 const paidAmount = (c: Customer) => Number(c.paidTotal ?? c.totalPaid ?? 0);
@@ -532,6 +542,7 @@ export default function AdminPage() {
   const [message, setMessage] = useState("");
   const [syncResult, setSyncResult] = useState<SyncRunResult | null>(null);
   const [syncLastRun, setSyncLastRun] = useState<SyncLastRun | null>(null);
+  const [rebuildBatch, setRebuildBatch] = useState<RebuildBatchState | null>(null);
   const [importedOrdersCount, setImportedOrdersCount] = useState(0);
   const [tab, setTab] = useState<(typeof tabs)[number]>("Overview");
   const [page, setPage] = useState(1);
@@ -710,7 +721,7 @@ export default function AdminPage() {
     await loadDashboardData();
   };
 
-  const runCustomerRebuild = async (dryRun: boolean) => {
+  const runCustomerRebuild = async (dryRun: boolean, offset = 0) => {
     setError("");
     if (!dryRun && importedOrdersCount === 0) {
       setError("Run Import WooCommerce Orders before updating customer profiles. If this is a new browser session, run Test WooCommerce Order Import first to confirm available orders.");
@@ -723,8 +734,8 @@ export default function AdminPage() {
       body: JSON.stringify({
         from: "2019-01-01",
         to: dateInput(new Date()),
-        limit: 1000,
-        offset: 0,
+        limit: rebuildBatchSize,
+        offset,
         dryRun,
       }),
     });
@@ -732,12 +743,10 @@ export default function AdminPage() {
     setSyncResult(data);
     if (!res.ok) return setError(data.error || "Customer rebuild failed");
     const customersUpdated = Number(data.customersRebuilt ?? data.dryRunCustomersMatched ?? 0);
-    const successMessage = dryRun
-      ? `Preview complete. ${customersUpdated} customer profiles can be updated.`
-      : customersUpdated === 0
-        ? "Updated 0 customer profiles. This usually means no WooCommerce orders were imported yet."
-        : `Updated ${customersUpdated} customer profiles.`;
+    const processed = Number(data.customersProcessed ?? 0);
+    const successMessage = String(data.message || (data.hasMore ? `Processed ${processed} customers. Continue update to process next batch.` : `Processed ${processed} customers.`));
     setMessage(successMessage);
+    setRebuildBatch(data.hasMore ? { hasMore: true, nextOffset: Number(data.nextOffset ?? offset + processed), dryRun } : null);
     setSyncLastRun({
       action: dryRun ? "Preview Customer Profile Update" : "Update Customer Profiles",
       status: data.partialSync ? "Completed with warnings" : "Completed",
@@ -906,6 +915,7 @@ export default function AdminPage() {
           <button onClick={() => runOrderBackfill(false)} className="rounded bg-red-600 px-5 py-3 font-semibold hover:bg-red-500">Import WooCommerce Orders</button>
           <button onClick={() => runCustomerRebuild(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Preview Customer Profile Update</button>
           <button disabled={importedOrdersCount === 0} onClick={() => runCustomerRebuild(false)} className="rounded bg-emerald-700 px-5 py-3 font-semibold hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50">Update Customer Profiles</button>
+          {rebuildBatch?.hasMore && <button onClick={() => runCustomerRebuild(rebuildBatch.dryRun, rebuildBatch.nextOffset)} className="rounded bg-emerald-800 px-5 py-3 font-semibold hover:bg-emerald-700">Continue Customer Profile {rebuildBatch.dryRun ? "Preview" : "Update"}</button>}
           <button onClick={() => runSubscriptionBackfill(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Test WooCommerce Subscription Import</button>
           <button onClick={() => runSubscriptionBackfill(false)} className="rounded bg-red-700 px-5 py-3 font-semibold hover:bg-red-600">Import WooCommerce Subscriptions</button>
           <button onClick={syncWooCommerce} className="rounded bg-zinc-800 px-5 py-3 font-semibold text-zinc-200 hover:bg-zinc-700">Single Customer Repair Sync</button>

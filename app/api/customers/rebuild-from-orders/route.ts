@@ -8,6 +8,7 @@ import { SyncJob } from "@/models/SyncJob";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 
 export const dynamic = "force-dynamic";
+const maxRebuildRuntimeMs = 8000;
 
 type AggregationKeyType = "email" | "phone" | "customerId" | "company";
 
@@ -245,7 +246,7 @@ export async function POST(request: Request) {
     dryRun?: boolean;
     allowReplaceWithSmallerHistory?: boolean;
   };
-  const limit = safeNumber(body.limit, 1000, 5000);
+  const limit = safeNumber(body.limit, 50, 100);
   const offset = safeNumber(body.offset, 0, 1000000);
   const dryRun = body.dryRun === true;
   const allowReplaceWithSmallerHistory = body.allowReplaceWithSmallerHistory === true;
@@ -273,13 +274,20 @@ export async function POST(request: Request) {
   const groups = groupOrders(storedOrders);
   const selectedGroups = groups.slice(offset, offset + limit);
   const rebuildAt = new Date().toISOString();
+  const deadline = Date.now() + maxRebuildRuntimeMs;
   const warnings: string[] = [];
   let customersRebuilt = 0;
+  let customersProcessed = 0;
   let customersSkippedSmallerHistory = 0;
 
   for (const group of selectedGroups) {
+    if (Date.now() >= deadline) {
+      warnings.push(`Stopped customer rebuild batch at ${customersProcessed} processed customers to stay within runtime budget.`);
+      break;
+    }
     const customer = buildCustomer(group, rebuildAt);
     const existing = await findExisting(customer);
+    customersProcessed += 1;
     const existingOrderCount = existing?.orders?.length ?? existing?.orderCount ?? 0;
     if (!allowReplaceWithSmallerHistory && existingOrderCount > customer.orders.length) {
       customersSkippedSmallerHistory += 1;
@@ -296,7 +304,9 @@ export async function POST(request: Request) {
     }
   }
 
-  const finalStatus = warnings.length > 0 ? "partial" : "completed";
+  const nextOffset = offset + customersProcessed;
+  const hasMore = nextOffset < groups.length;
+  const finalStatus = warnings.length > 0 || hasMore ? "partial" : "completed";
   await SyncJob.updateOne(
     { _id: job._id },
     {
@@ -305,11 +315,17 @@ export async function POST(request: Request) {
         finishedAt: new Date().toISOString(),
         progress: 100,
         pagesFetched: 1,
-        recordsProcessed: customersRebuilt,
+        recordsProcessed: customersProcessed,
         warnings,
+        lastCursor: { page: nextOffset, status: hasMore ? "orders" : "complete" },
       },
     }
   );
+  const rebuiltCount = dryRun ? 0 : customersRebuilt;
+  const matchedCount = dryRun ? customersRebuilt : 0;
+  const batchMessage = hasMore
+    ? `Processed ${customersProcessed} customers. Continue update to process next batch.`
+    : `Processed ${customersProcessed} customers. Customer profile rebuild batch is complete.`;
 
   return NextResponse.json({
     jobId: String(job._id),
@@ -321,13 +337,14 @@ export async function POST(request: Request) {
     totalOrderRecords: storedOrders.length,
     totalCustomerGroups: groups.length,
     customersConsidered: selectedGroups.length,
-    customersRebuilt: dryRun ? 0 : customersRebuilt,
-    dryRunCustomersMatched: dryRun ? customersRebuilt : 0,
+    customersProcessed,
+    customersRebuilt: rebuiltCount,
+    dryRunCustomersMatched: matchedCount,
     customersSkippedSmallerHistory,
+    hasMore,
+    nextOffset,
     partialSync: finalStatus === "partial",
     warnings,
-    message: dryRun
-      ? `Dry run found ${customersRebuilt} customer group${customersRebuilt === 1 ? "" : "s"} to rebuild.`
-      : `Rebuilt ${customersRebuilt} customer${customersRebuilt === 1 ? "" : "s"} from stored WooCommerce orders.`,
+    message: batchMessage,
   });
 }
