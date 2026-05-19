@@ -36,6 +36,18 @@ function asNumber(value: unknown) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function normalizedEmail(value: unknown) {
+  return asString(value).trim().toLowerCase();
+}
+
+function normalizedPhone(value: unknown) {
+  return asString(value).replace(/\D/g, "");
+}
+
+function normalizedName(...values: unknown[]) {
+  return values.map(asString).join(" ").replace(/\s+/g, " ").trim();
+}
+
 function last4(cardNumber: string) {
   const digits = cardNumber.replace(/\D/g, "");
   return digits.slice(-4);
@@ -123,11 +135,15 @@ export function normalizeAuthorizeNetTransaction(transaction: AuthNetObject, imp
   const payment = asRecord(transaction.payment);
   const creditCard = asRecord(payment.creditCard);
   const profile = asRecord(transaction.profile);
+  const customerProfile = asRecord(customer.profile);
+  const paymentProfile = asRecord(profile.paymentProfile || transaction.paymentProfile || customer.paymentProfile);
   const firstName = asString(billTo.firstName);
   const lastName = asString(billTo.lastName);
-  const email = asString(customer.email || billTo.email);
-  const cardNumber = asString(creditCard.cardNumber);
+  const email = normalizedEmail(customer.email || billTo.email || transaction.email || transaction.customerEmail);
+  const cardNumber = asString(creditCard.cardNumber || payment.cardNumber || transaction.accountNumber);
   const submittedAt = asString(transaction.submitTimeUTC || transaction.submitTimeLocal);
+  const profileId = asString(profile.customerProfileId || customerProfile.customerProfileId || transaction.customerProfileId || customer.id);
+  const paymentProfileId = asString(profile.customerPaymentProfileId || paymentProfile.customerPaymentProfileId || transaction.customerPaymentProfileId);
   return {
     transactionId: asString(transaction.transId),
     transactionStatus: asString(transaction.transactionStatus),
@@ -135,22 +151,22 @@ export function normalizeAuthorizeNetTransaction(transaction: AuthNetObject, imp
     authCode: asString(transaction.authCode),
     invoiceNumber: asString(order.invoiceNumber),
     description: asString(order.description),
-    amount: asNumber(transaction.authAmount ?? transaction.settleAmount),
+    amount: asNumber(transaction.settleAmount || transaction.authAmount),
     currency: asString(transaction.currencyCode || "USD"),
     submittedAt,
     settledAt: asString(transaction.settleTimeUTC || transaction.settleTimeLocal || (asString(transaction.transactionStatus).toLowerCase().includes("settled") ? submittedAt : "")),
     customerEmail: email,
-    normalizedEmail: email.trim().toLowerCase(),
-    customerName: `${firstName} ${lastName}`.trim() || asString(customer.id),
+    normalizedEmail: email,
+    customerName: normalizedName(firstName, lastName) || normalizedName(customer.firstName, customer.lastName) || asString(customer.id),
     billingFirstName: firstName,
     billingLastName: lastName,
     billingCompany: asString(billTo.company),
-    billingPhone: asString(billTo.phoneNumber),
-    cardType: asString(creditCard.cardType),
+    billingPhone: normalizedPhone(billTo.phoneNumber || customer.phoneNumber || transaction.phoneNumber),
+    cardType: asString(creditCard.cardType || payment.cardType || transaction.accountType),
     cardLast4: last4(cardNumber),
     paymentMethod: "card",
-    customerProfileId: asString(profile.customerProfileId),
-    customerPaymentProfileId: asString(profile.customerPaymentProfileId),
+    customerProfileId: profileId,
+    customerPaymentProfileId: paymentProfileId,
     rawSafeMeta: [
       { key: "accountType", value: asString(transaction.accountType).slice(0, 120) },
       { key: "marketType", value: asString(transaction.marketType).slice(0, 120) },

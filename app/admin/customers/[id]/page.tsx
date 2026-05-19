@@ -1,7 +1,9 @@
 "use client";
 
+import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import type { ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type OrderLineItem = {
   productId: number;
@@ -96,6 +98,13 @@ type SourceCoverage = {
   aggregationKeyType?: string;
   lastBackfillImportAt?: string;
   lastCustomerRebuildAt?: string;
+  wooCommerceCustomerOrdersStored?: number;
+  wooCommerceOrderRecordsFound?: number;
+  authorizeNetTransactionsFound?: number;
+  gatewayOnlyPaymentsAttached?: number;
+  reconciledRecords?: number;
+  missingUnattachedRecords?: number;
+  revenueCoveragePercent?: number;
   warningSummary?: string;
   lastSyncedAt?: string;
   warnings?: string[];
@@ -117,9 +126,12 @@ type GatewayPayment = {
   status: string;
   amount: number;
   cardLast4: string;
+  cardType?: string;
   matchedBy: string;
   matchConfidence: string;
   source: string;
+  customerProfileId?: string;
+  customerPaymentProfileId?: string;
 };
 
 type CustomerDetail = {
@@ -296,51 +308,127 @@ function buildTemplates(customer: CustomerDetail, actualPaid: number, attempted:
   };
 }
 
+function DetailShell({ children }: { children: ReactNode }) {
+  return <main className="min-h-screen bg-black p-4 text-base text-zinc-100 md:p-8">
+    <div className="mx-auto max-w-6xl space-y-5">
+      <header className="flex flex-col gap-3 border-b border-zinc-900 pb-4 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Red Spectrum Customer Intelligence</p>
+          <h1 className="mt-1 text-2xl font-bold text-zinc-100 md:text-3xl">Customer Details</h1>
+        </div>
+        <Link href="/admin?tab=customers" className="w-fit rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-semibold text-zinc-100 hover:border-red-500/60 hover:bg-zinc-800">
+          Back to Customer List
+        </Link>
+      </header>
+      {children}
+    </div>
+  </main>;
+}
+
+function CustomerLoadingState() {
+  return <DetailShell>
+    <section className="flex min-h-[420px] items-center justify-center rounded-xl border border-zinc-800 bg-zinc-950/80 p-6">
+      <div className="w-full max-w-xl text-center">
+        <div className="mx-auto h-12 w-12 animate-spin rounded-full border-2 border-zinc-700 border-t-red-500" />
+        <h2 className="mt-5 text-xl font-semibold text-zinc-100">Loading customer details...</h2>
+        <p className="mt-2 text-sm text-zinc-400">Fetching customer profile, payment history, and order timeline...</p>
+        <div className="mx-auto mt-6 max-w-md space-y-3">
+          <div className="h-4 animate-pulse rounded bg-zinc-800" />
+          <div className="h-4 animate-pulse rounded bg-zinc-800/80" />
+          <div className="h-4 w-2/3 animate-pulse rounded bg-zinc-800/60" />
+        </div>
+      </div>
+    </section>
+  </DetailShell>;
+}
+
+function CustomerErrorState({ onRetry }: { onRetry: () => void }) {
+  return <DetailShell>
+    <section className="rounded-xl border border-red-500/30 bg-red-950/20 p-6">
+      <h2 className="text-xl font-semibold text-red-200">Unable to load customer details</h2>
+      <p className="mt-2 text-zinc-300">Please go back and try again, or refresh this page.</p>
+      <div className="mt-5 flex flex-wrap gap-3">
+        <button onClick={onRetry} className="rounded bg-red-700 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600">Retry</button>
+        <Link href="/admin?tab=customers" className="rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-semibold text-zinc-100 hover:bg-zinc-800">Back to Customer List</Link>
+      </div>
+    </section>
+  </DetailShell>;
+}
+
 export default function CustomerDetailPage() {
   const params = useParams<{ id: string }>();
   const [customer, setCustomer] = useState<CustomerDetail | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
   const [notes, setNotes] = useState("");
   const [tags, setTags] = useState("");
   const [message, setMessage] = useState("");
   const [loadError, setLoadError] = useState("");
   const [subscriptions, setSubscriptions] = useState<Array<Record<string, string | number>>>([]);
   const [sourceCompare, setSourceCompare] = useState<SourceCompare | null>(null);
+  const activeController = useRef<AbortController | null>(null);
+  const requestSequence = useRef(0);
+
+  const loadCustomer = useCallback(async () => {
+    activeController.current?.abort();
+    const controller = new AbortController();
+    activeController.current = controller;
+    const requestId = requestSequence.current + 1;
+    requestSequence.current = requestId;
+    let timedOut = false;
+    const timeout = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 15000);
+
+    setIsLoading(true);
+    setLoadError("");
+    setCustomer(null);
+    setSourceCompare(null);
+    setSubscriptions([]);
+
+    try {
+      const safeId = encodeURIComponent(decodeURIComponent(params.id));
+      const response = await fetch(`/api/customers/${safeId}`, { signal: controller.signal, cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Customer not found.");
+      if (requestSequence.current !== requestId) return;
+      const nextCustomer = data.customer;
+      setCustomer(nextCustomer);
+      setNotes(nextCustomer?.notes ?? "");
+      setTags((nextCustomer?.tags ?? []).join(", "));
+      setIsLoading(false);
+
+      const email = String(nextCustomer?.email ?? "").toLowerCase();
+      if (email && !email.endsWith("@woocommerce.local")) {
+        fetch(`/api/customers/compare-source?email=${encodeURIComponent(email)}`, { signal: controller.signal, cache: "no-store" }).then((r3) => r3.json()).then((compare) => {
+          if (requestSequence.current === requestId && !compare.error) setSourceCompare(compare);
+        }).catch(() => {
+          if (requestSequence.current === requestId) setSourceCompare(null);
+        });
+        fetch(`/api/subscriptions?kind=all-real-data&limit=25&q=${encodeURIComponent(email)}`, { signal: controller.signal, cache: "no-store" }).then((r2) => r2.json()).then((subs) => {
+          if (requestSequence.current === requestId) setSubscriptions((subs.rows ?? []).filter((row: Record<string, string | number>) => String(row.customerEmail ?? "").toLowerCase() === email));
+        }).catch(() => {
+          if (requestSequence.current === requestId) setSubscriptions([]);
+        });
+      }
+    } catch (error) {
+      if (requestSequence.current !== requestId || (controller.signal.aborted && !timedOut)) return;
+      setLoadError(timedOut ? "timeout" : error instanceof Error ? error.message : "Unable to load customer details.");
+      setIsLoading(false);
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  }, [params.id]);
 
   useEffect(() => {
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 15000);
-    const load = async () => {
-      setLoadError("");
-      try {
-        const safeId = encodeURIComponent(decodeURIComponent(params.id));
-        const response = await fetch(`/api/customers/${safeId}`, { signal: controller.signal, cache: "no-store" });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "Customer not found.");
-        const nextCustomer = data.customer;
-        setCustomer(nextCustomer);
-        setNotes(nextCustomer?.notes ?? "");
-        setTags((nextCustomer?.tags ?? []).join(", "));
-        const email = String(nextCustomer?.email ?? "").toLowerCase();
-        if (email && !email.endsWith("@woocommerce.local")) {
-          fetch(`/api/customers/compare-source?email=${encodeURIComponent(email)}`, { signal: controller.signal, cache: "no-store" }).then((r3) => r3.json()).then((compare) => {
-            if (!compare.error) setSourceCompare(compare);
-          }).catch(() => setSourceCompare(null));
-          fetch(`/api/subscriptions?kind=all-real-data&limit=25&q=${encodeURIComponent(email)}`, { signal: controller.signal, cache: "no-store" }).then((r2) => r2.json()).then((subs) => {
-            setSubscriptions((subs.rows ?? []).filter((row: Record<string, string | number>) => String(row.customerEmail ?? "").toLowerCase() === email));
-          }).catch(() => setSubscriptions([]));
-        }
-      } catch (error) {
-        setLoadError(controller.signal.aborted ? "Customer detail request took too long. Try again or open from the customer table." : error instanceof Error ? error.message : "Unable to load customer details.");
-      } finally {
-        window.clearTimeout(timeout);
-      }
-    };
-    load();
+    const loadTimer = window.setTimeout(() => {
+      void loadCustomer();
+    }, 0);
     return () => {
-      window.clearTimeout(timeout);
-      controller.abort();
+      window.clearTimeout(loadTimer);
+      activeController.current?.abort();
     };
-  }, [params.id]);
+  }, [loadCustomer]);
 
   const save = async () => {
     const response = await fetch(`/api/customers/${params.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ notes, tags: tags.split(",").map((t) => t.trim()).filter(Boolean) }) });
@@ -352,6 +440,14 @@ export default function CustomerDetailPage() {
   const copy = async (text: string, label: string) => {
     await navigator.clipboard.writeText(text);
     setMessage(`${label} copied.`);
+  };
+
+  const backToCustomerList = () => {
+    if (window.history.length > 1) {
+      window.history.back();
+      return;
+    }
+    window.location.href = "/admin?tab=customers";
   };
 
   const attemptedProductRows = useMemo(() => {
@@ -409,9 +505,12 @@ export default function CustomerDetailPage() {
     return Array.from(rows.values()).sort((a, b) => new Date(b.lastPaidDate).getTime() - new Date(a.lastPaidDate).getTime());
   }, [customer]);
 
-  if (!customer) return <main className="min-h-screen bg-black p-8 text-zinc-300">{loadError || "Loading customer details..."}</main>;
+  if (isLoading) return <CustomerLoadingState />;
+  if (loadError || !customer) return <CustomerErrorState onRetry={loadCustomer} />;
 
   const orders = [...(customer.orders ?? [])].sort((a, b) => new Date(b.dateCreated).getTime() - new Date(a.dateCreated).getTime());
+  const gatewayOnlyOrders = orders.filter((order) => order.source === "authorize_net_only");
+  const wooCustomerOrdersStored = orders.length - gatewayOnlyOrders.length;
   const attemptedOrders = orders.filter((order) => order.isAttempted);
   const paidOrdersFromTimeline = orders.filter(isPaidOrder);
   const actualPaid = Number(customer.paidTotal ?? customer.totalPaid ?? 0);
@@ -420,7 +519,6 @@ export default function CustomerDetailPage() {
   const timelineMissingForPaid = actualPaid > 0 && orders.length === 0 && Number(customer.orderCount ?? 0) > 0;
   const templates = buildTemplates(customer, actualPaid, attempted, attemptedOrders);
   const isLead = actualPaid === 0 && attempted > 0;
-  const latestRelevantOrder = attemptedOrders[0] ?? orders[0];
   const verification = chooseBestVerification(customer, orders);
   const productJourney = [...(customer.productJourney ?? [])].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
   const baseProductsPurchased = customer.baseProductsPurchased ?? [];
@@ -433,6 +531,45 @@ export default function CustomerDetailPage() {
   const classifiedAttemptedProducts = [...attemptedBaseProducts, ...attemptedBoostProducts, ...attemptedAddOnProducts];
   const attemptedProductSummary = classifiedAttemptedProducts.length ? classifiedAttemptedProducts : customer.attemptedProducts ?? [];
   const requiresProductReview = isLead && attemptedBoostProducts.length > 0 && baseProductsPurchased.length === 0;
+  const missingUnattachedRecords = Math.max(
+    Number(customer.sourceCoverage?.missingUnattachedRecords ?? 0),
+    sourceCompare ? Math.max(0, sourceCompare.wooCommerceOrderRecordsCount - sourceCompare.customerOrdersCount) : 0
+  );
+  const gatewayHistoryRows = (() => {
+    const byTransaction = new Map<string, GatewayPayment>();
+    for (const payment of customer.gatewayPayments ?? []) {
+      byTransaction.set(payment.transactionId || `${payment.provider}-${payment.invoiceNumber}-${payment.amount}-${payment.date}`, payment);
+    }
+    for (const order of gatewayOnlyOrders) {
+      if (!order.transactionId || byTransaction.has(order.transactionId)) continue;
+      byTransaction.set(order.transactionId, {
+        date: order.paidDate || order.dateCreated,
+        provider: "authorize_net",
+        transactionId: order.transactionId,
+        invoiceNumber: order.orderNumber,
+        status: order.gatewayVerification?.transactionStatus || order.status,
+        amount: order.total,
+        cardLast4: order.gatewayVerification?.last4 || "",
+        cardType: order.gatewayVerification?.cardType || "",
+        matchedBy: order.gatewayVerification?.matchedBy || order.matchedBy?.join(", ") || "",
+        matchConfidence: order.gatewayVerification?.confidence || order.matchConfidence || "",
+        source: "authorize_net_only",
+        customerProfileId: order.gatewayVerification?.customerProfileId || "",
+        customerPaymentProfileId: order.gatewayVerification?.paymentProfileId || "",
+      });
+    }
+    return Array.from(byTransaction.values()).sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
+  })();
+  const latestGatewayPayment = gatewayHistoryRows[0];
+  const sourceCoverageRows = [
+    ["WooCommerce customer orders stored", customer.sourceCoverage?.wooCommerceCustomerOrdersStored ?? wooCustomerOrdersStored],
+    ["WooCommerceOrder records found", customer.sourceCoverage?.wooCommerceOrderRecordsFound ?? sourceCompare?.wooCommerceOrderRecordsCount ?? "-"],
+    ["Authorize.net transactions found", customer.sourceCoverage?.authorizeNetTransactionsFound ?? gatewayHistoryRows.filter((payment) => payment.provider === "authorize_net").length],
+    ["Gateway-only payments attached", customer.sourceCoverage?.gatewayOnlyPaymentsAttached ?? gatewayOnlyOrders.length],
+    ["Reconciled records", customer.sourceCoverage?.reconciledRecords ?? gatewayHistoryRows.length],
+    ["Missing/unattached records", missingUnattachedRecords],
+    ["Revenue coverage", `${Number(customer.sourceCoverage?.revenueCoveragePercent ?? (actualPaid > 0 ? 100 : 0)).toFixed(0)}%`],
+  ];
   const plan = isLead
     ? {
         priority: customer.leadUrgency === "very_high" ? "Very High" : "High",
@@ -463,9 +600,14 @@ export default function CustomerDetailPage() {
 
   return <main className="min-h-screen bg-black p-4 text-base text-zinc-100 md:p-8">
     <div className="mx-auto max-w-6xl space-y-5">
-      <header>
-        <h1 className="text-3xl font-bold text-red-400">{customer.name}</h1>
-        <p className="text-zinc-400">{customer.email} - {customer.phone || "N/A"}</p>
+      <header className="flex flex-col gap-3 border-b border-zinc-900 pb-4 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h1 className="text-3xl font-bold text-red-400">{customer.name}</h1>
+          <p className="text-zinc-400">{customer.email} - {customer.phone || "N/A"}</p>
+        </div>
+        <button onClick={backToCustomerList} className="w-fit rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-semibold text-zinc-100 hover:border-red-500/60 hover:bg-zinc-800">
+          Back to Customer List
+        </button>
       </header>
 
       <section className="grid gap-3 md:grid-cols-4">
@@ -497,6 +639,7 @@ export default function CustomerDetailPage() {
           <div><p className="text-xs uppercase text-zinc-400">Aggregation Key</p><p className="font-semibold">{customer.sourceCoverage?.aggregationKeyType || Object.keys(customer.sourceCoverage?.matchReasonCounts ?? {})[0] || "-"}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Last Backfill Import</p><p className="font-semibold">{displayDateTime(customer.sourceCoverage?.lastBackfillImportAt)}</p></div>
           <div><p className="text-xs uppercase text-zinc-400">Last Customer Rebuild</p><p className="font-semibold">{displayDateTime(customer.sourceCoverage?.lastCustomerRebuildAt || customer.sourceCoverage?.lastSyncedAt || customer.lastSyncedAt)}</p></div>
+          {sourceCoverageRows.map(([label, value]) => <div key={String(label)}><p className="text-xs uppercase text-zinc-400">{label}</p><p className="font-semibold">{String(value)}</p></div>)}
         </div>
         {sourceCompare && <p className={`mt-3 rounded border p-3 text-sm ${sourceCompare.mismatch ? "border-amber-500/30 bg-amber-500/10 text-amber-100" : "border-emerald-500/30 bg-emerald-500/10 text-emerald-100"}`}>
           Stored customer orders: {sourceCompare.customerOrdersCount}. WooCommerceOrder records: {sourceCompare.wooCommerceOrderRecordsCount}. {sourceCompare.mismatch ? `${sourceCompare.missingOrderNumbers.length} missing orders. ${sourceCompare.recommendation}.` : "Order counts match stored WooCommerce records."}
@@ -526,7 +669,7 @@ export default function CustomerDetailPage() {
             <tbody>{productJourney.map((item, index) => <tr key={`${item.orderNumber}-${item.productName}-${index}`} className="border-t border-zinc-800">
               <td className="px-3 py-3">{displayDate(item.date)}</td>
               <td className="px-3 py-3">{item.orderNumber}</td>
-              <td className="px-3 py-3 font-semibold">{item.productName}</td>
+              <td className="px-3 py-3 font-semibold">{item.productName || "Authorize.net Payment"}</td>
               <td className="px-3 py-3"><span className={`rounded border px-2 py-1 text-xs ${productCategoryBadgeClass(item.category)}`}>{productCategoryLabel(item.category)}</span></td>
               <td className="px-3 py-3">{money(item.amount)}</td>
               <td className="px-3 py-3">{displayStatus(item.type)}</td>
@@ -547,7 +690,7 @@ export default function CustomerDetailPage() {
               const type = getOrderType(order);
               return <tr key={order.orderId} className="border-t border-zinc-800">
                 <td className="px-3 py-3">{displayDateTime(order.dateCreated)}</td>
-                <td className="px-3 py-3">{order.orderNumber}</td>
+                <td className="px-3 py-3">{order.orderNumber}{order.source === "authorize_net_only" && <span className="ml-2 rounded border border-emerald-500/50 bg-emerald-500/15 px-2 py-1 text-xs text-emerald-200">Authorize.net Only</span>}</td>
                 <td className="px-3 py-3">{displayStatus(order.status)}</td>
                 <td className="px-3 py-3">{order.paymentMethodTitle || order.paymentMethod || "-"}</td>
                 <td className="px-3 py-3">{productNames(order)}</td>
@@ -589,32 +732,29 @@ export default function CustomerDetailPage() {
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
         <h2 className="text-xl font-semibold text-sky-300">Payment Verification</h2>
-        <div className="mt-3 grid gap-3 md:grid-cols-4">
-          <div><p className="text-xs uppercase text-zinc-400">WooCommerce Status</p><p className="font-semibold">{displayStatus(latestRelevantOrder?.status || customer.lastAttemptStatus)}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">WooCommerce Method</p><p className="font-semibold">{latestRelevantOrder?.paymentMethodTitle || latestRelevantOrder?.paymentMethod || customer.lastAttemptPaymentMethod || "-"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Gateway Provider</p><p className="font-semibold">{verification?.provider || "-"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Gateway Status</p><p className="font-semibold">{verification?.transactionStatus || (verification?.matched ? "verified" : "Not verified")}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Confidence</p><p className="font-semibold">{verification?.confidence || "not_found"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Matched By</p><p className="font-semibold">{verification?.matchedBy || "-"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Transaction ID</p><p className="font-semibold">{verification?.transactionId || "-"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Payment Intent ID</p><p className="font-semibold">{verification?.paymentIntentId || "-"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Charge ID</p><p className="font-semibold">{verification?.chargeId || "-"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Stripe Customer ID</p><p className="font-semibold">{verification?.stripeCustomerId || "-"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Customer Vault ID</p><p className="font-semibold">{verification?.customerVaultId || "-"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Last 4</p><p className="font-semibold">{verification?.last4 || "-"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Card Type</p><p className="font-semibold">{verification?.cardType || "-"}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Last Checked</p><p className="font-semibold">{displayDateTime(verification?.lastCheckedAt)}</p></div>
-          <div><p className="text-xs uppercase text-zinc-400">Recommended</p><p className="font-semibold">{verification?.matched ? "Payment verified" : "Manual follow-up"}</p></div>
-        </div>
-        <p className="mt-3 text-zinc-300">{verification?.notes || "Manual verification required."}</p>
+        {latestGatewayPayment ? <>
+          <div className="mt-3 grid gap-3 md:grid-cols-4">
+            <div><p className="text-xs uppercase text-zinc-400">Provider</p><p className="font-semibold">{displayStatus(latestGatewayPayment.provider || verification?.provider)}</p></div>
+            <div><p className="text-xs uppercase text-zinc-400">Status</p><p className="font-semibold">{displayStatus(latestGatewayPayment.status || verification?.transactionStatus)}</p></div>
+            <div><p className="text-xs uppercase text-zinc-400">Transaction ID</p><p className="font-semibold">{latestGatewayPayment.transactionId || verification?.transactionId || "-"}</p></div>
+            <div><p className="text-xs uppercase text-zinc-400">Invoice #</p><p className="font-semibold">{latestGatewayPayment.invoiceNumber || "-"}</p></div>
+            <div><p className="text-xs uppercase text-zinc-400">Amount</p><p className="font-semibold">{money(Number(latestGatewayPayment.amount ?? verification?.amount ?? 0))}</p></div>
+            <div><p className="text-xs uppercase text-zinc-400">Card Type</p><p className="font-semibold">{latestGatewayPayment.cardType || verification?.cardType || "-"}</p></div>
+            <div><p className="text-xs uppercase text-zinc-400">Last 4</p><p className="font-semibold">{latestGatewayPayment.cardLast4 || verification?.last4 || "-"}</p></div>
+            <div><p className="text-xs uppercase text-zinc-400">Customer Profile ID</p><p className="font-semibold">{latestGatewayPayment.customerProfileId || verification?.customerProfileId || "-"}</p></div>
+            <div><p className="text-xs uppercase text-zinc-400">Payment Profile ID</p><p className="font-semibold">{latestGatewayPayment.customerPaymentProfileId || verification?.paymentProfileId || "-"}</p></div>
+            <div><p className="text-xs uppercase text-zinc-400">Last Checked</p><p className="font-semibold">{displayDateTime(verification?.lastCheckedAt || latestGatewayPayment.date)}</p></div>
+          </div>
+          <p className="mt-3 text-zinc-300">{verification?.notes || "Latest gateway payment matched to this customer."}</p>
+        </> : <p className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100">No gateway payment has been matched yet. Run Authorize.net repair or reconciliation.</p>}
       </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
         <h2 className="text-xl font-semibold text-emerald-300">Gateway Payment History</h2>
         <div className="mt-3 overflow-x-auto rounded border border-zinc-800">
           <table className="min-w-[1050px] text-sm">
-            <thead className="bg-zinc-950"><tr>{["Date", "Provider", "Transaction ID", "Invoice #", "Status", "Amount", "Card Last4", "Match Method", "Confidence", "Source"].map((h) => <th key={h} className="px-3 py-2 text-left text-xs uppercase text-zinc-400">{h}</th>)}</tr></thead>
-            <tbody>{(customer.gatewayPayments ?? []).map((payment) => <tr key={payment.transactionId} className={`border-t border-zinc-800 ${payment.source === "authorize_net_only" ? "bg-emerald-500/5" : ""}`}>
+            <thead className="bg-zinc-950"><tr>{["Date", "Provider", "Transaction ID", "Invoice #", "Status", "Amount", "Card Last4", "Card Type", "Match Method", "Confidence", "Source"].map((h) => <th key={h} className="px-3 py-2 text-left text-xs uppercase text-zinc-400">{h}</th>)}</tr></thead>
+            <tbody>{gatewayHistoryRows.map((payment) => <tr key={payment.transactionId || `${payment.invoiceNumber}-${payment.date}`} className={`border-t border-zinc-800 ${payment.source === "authorize_net_only" ? "bg-emerald-500/5" : ""}`}>
               <td className="px-3 py-3">{displayDateTime(payment.date)}</td>
               <td className="px-3 py-3">{displayStatus(payment.provider)}</td>
               <td className="px-3 py-3">{payment.transactionId}</td>
@@ -622,12 +762,13 @@ export default function CustomerDetailPage() {
               <td className="px-3 py-3">{displayStatus(payment.status)}</td>
               <td className="px-3 py-3">{money(payment.amount)}</td>
               <td className="px-3 py-3">{payment.cardLast4 || "-"}</td>
+              <td className="px-3 py-3">{payment.cardType || "-"}</td>
               <td className="px-3 py-3">{displayStatus(payment.matchedBy)}</td>
               <td className="px-3 py-3">{displayStatus(payment.matchConfidence)}</td>
               <td className="px-3 py-3">{payment.source === "authorize_net_only" ? "Authorize.net only" : displayStatus(payment.source)}</td>
             </tr>)}</tbody>
           </table>
-          {(customer.gatewayPayments ?? []).length === 0 && <p className="p-3 text-zinc-400">No gateway payment history has been reconciled for this customer yet.</p>}
+          {gatewayHistoryRows.length === 0 && <p className="p-3 text-zinc-400">No gateway payment history has been reconciled for this customer yet.</p>}
         </div>
       </section>
 

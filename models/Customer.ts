@@ -110,9 +110,12 @@ export interface CustomerGatewayPayment {
   status: string;
   amount: number;
   cardLast4: string;
+  cardType: string;
   matchedBy: string;
   matchConfidence: string;
   source: string;
+  customerProfileId: string;
+  customerPaymentProfileId: string;
 }
 
 export interface CustomerDocument {
@@ -199,6 +202,13 @@ export interface CustomerSourceCoverage {
   aggregationKeyType: "email" | "phone" | "customerId" | "company" | "";
   lastBackfillImportAt: string;
   lastCustomerRebuildAt: string;
+  wooCommerceCustomerOrdersStored: number;
+  wooCommerceOrderRecordsFound: number;
+  authorizeNetTransactionsFound: number;
+  gatewayOnlyPaymentsAttached: number;
+  reconciledRecords: number;
+  missingUnattachedRecords: number;
+  revenueCoveragePercent: number;
 }
 
 const customerOrderLineItemSchema = new Schema<CustomerOrderLineItem>(
@@ -321,6 +331,13 @@ const customerSourceCoverageSchema = new Schema<CustomerSourceCoverage>(
     aggregationKeyType: { type: String, enum: ["email", "phone", "customerId", "company", ""], default: "" },
     lastBackfillImportAt: { type: String, default: "" },
     lastCustomerRebuildAt: { type: String, default: "" },
+    wooCommerceCustomerOrdersStored: { type: Number, default: 0 },
+    wooCommerceOrderRecordsFound: { type: Number, default: 0 },
+    authorizeNetTransactionsFound: { type: Number, default: 0 },
+    gatewayOnlyPaymentsAttached: { type: Number, default: 0 },
+    reconciledRecords: { type: Number, default: 0 },
+    missingUnattachedRecords: { type: Number, default: 0 },
+    revenueCoveragePercent: { type: Number, default: 0 },
   },
   { _id: false }
 );
@@ -349,9 +366,12 @@ const customerGatewayPaymentSchema = new Schema<CustomerGatewayPayment>(
     status: { type: String, default: "" },
     amount: { type: Number, default: 0 },
     cardLast4: { type: String, default: "" },
+    cardType: { type: String, default: "" },
     matchedBy: { type: String, default: "" },
     matchConfidence: { type: String, default: "" },
     source: { type: String, default: "" },
+    customerProfileId: { type: String, default: "" },
+    customerPaymentProfileId: { type: String, default: "" },
   },
   { _id: false }
 );

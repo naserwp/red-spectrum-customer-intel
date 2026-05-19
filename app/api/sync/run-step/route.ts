@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server";
 import { isAuthorizeNetConfigured, fetchSettledBatchIds, fetchTransactionDetails, fetchTransactionIdsForBatch, fetchUnsettledTransactionIds, normalizeAuthorizeNetTransaction } from "@/lib/authorizeNet";
+import { reconcileAuthorizeNetTransaction } from "@/lib/authorizeNetReconciliation";
 import { calculateCustomerScore, scoreToStars, type CustomerScoreInput } from "@/lib/customerScore";
 import { buildProductJourneySummary } from "@/lib/productClassification";
 import { connectToDatabase } from "@/lib/mongodb";
 import { fetchWooCommerceOrders, fetchWooCommerceSubscriptions, isWooCommerceConfigured, wooCommerceOrderStatuses, wooCommerceSubscriptionStatuses } from "@/lib/woocommerce";
 import { countBy, normalizeWooOrder, orderHistoryItemFromStoredOrder, unique } from "@/lib/wooOrderImport";
 import { normalizeWooSubscription } from "@/lib/wooSubscriptionImport";
-import { AuthorizeNetTransaction } from "@/models/AuthorizeNetTransaction";
+import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer } from "@/models/Customer";
 import { SyncJob } from "@/models/SyncJob";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
@@ -254,14 +255,11 @@ async function importAuthorizeNetStep(cursor: SyncCursor) {
 
 async function reconcileAuthorizeNetStep(cursor: SyncCursor) {
   const offset = cursor.reconcileOffset ?? 0;
-  const transactions = await AuthorizeNetTransaction.find({}).sort({ submittedAt: -1 }).skip(offset).limit(reconcileLimit).lean();
+  const transactions = await AuthorizeNetTransaction.find({}).sort({ submittedAt: -1 }).skip(offset).limit(reconcileLimit).lean<AuthorizeNetTransactionDocument[]>();
   let authorizeNetPaymentsReconciled = 0;
   for (const transaction of transactions) {
-    if (!transaction.normalizedEmail) continue;
-    const customer = await Customer.findOne({ $or: [{ normalizedEmail: transaction.normalizedEmail }, { email: transaction.normalizedEmail }] }).lean<{ _id: unknown } | null>();
-    if (!customer) continue;
-    await AuthorizeNetTransaction.updateOne({ transactionId: transaction.transactionId }, { $set: { matchedCustomerId: String(customer._id), matchedBy: "normalizedEmail", matchConfidence: "high" } });
-    authorizeNetPaymentsReconciled += 1;
+    const result = await reconcileAuthorizeNetTransaction(transaction, false);
+    if (result.matched) authorizeNetPaymentsReconciled += 1;
   }
   const hasMore = transactions.length === reconcileLimit;
   return {

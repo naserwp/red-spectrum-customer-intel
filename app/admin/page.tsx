@@ -1104,7 +1104,7 @@ export default function AdminPage() {
 
       {tab === "Overview" && <>
         <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <Card label="Paid Revenue" value={money(Number(summary.paidRevenue ?? 0))} helper="Actual paid WooCommerce orders only" />
+          <Card label="Paid Revenue" value={money(Number(summary.paidRevenue ?? 0))} helper="Actual paid WooCommerce and reconciled Authorize.net payments" />
           <Card label="Attempted Pipeline" value={money(Number(summary.attemptedRevenue ?? 0))} helper="Unpaid checkout/payment attempts" />
           <Card label="Active Subscriptions" value={Number(summary.activeSubscriptions ?? 0)} helper={String(summary.subscriptionNote || "Real active subscription records only")} />
           <Card label="Failed Payments This Month" value={Number(summary.failedPaymentsThisMonth ?? 0)} helper="Real subscription failures this month" />
