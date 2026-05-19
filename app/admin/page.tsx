@@ -4,7 +4,7 @@ import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Customer = {
   _id: string; name: string; email: string; phone: string; totalPaid: number; paidTotal?: number; attemptedTotal?: number;
@@ -119,6 +119,7 @@ type AuthNetBatchState = {
 const tabs = ["Overview", "Customers", "Subscriptions", "Upcoming Bills", "High Value", "Hot Leads", "Risk Review", "Gateway Analytics", "5-Year Sales", "Sync Center"] as const;
 const pageSizes = [25, 50, 100] as const;
 const rebuildBatchSize = 50;
+const slowRequestMessage = "This request is taking longer than expected. Try again or narrow the search.";
 const highValueThreshold = 2000;
 const money = (n: number) => `$${n.toFixed(2)}`;
 const paidAmount = (c: Customer) => Number(c.paidTotal ?? c.totalPaid ?? 0);
@@ -552,6 +553,8 @@ export default function AdminPage() {
   const [upcomingMeta, setUpcomingMeta] = useState<Record<string, unknown>>({});
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const [requestWarning, setRequestWarning] = useState("");
+  const [tabLoading, setTabLoading] = useState<Record<string, boolean>>({});
   const [syncResult, setSyncResult] = useState<SyncRunResult | null>(null);
   const [syncLastRun, setSyncLastRun] = useState<SyncLastRun | null>(null);
   const [rebuildBatch, setRebuildBatch] = useState<RebuildBatchState | null>(null);
@@ -562,39 +565,97 @@ export default function AdminPage() {
   const [pageSize, setPageSize] = useState<(typeof pageSizes)[number]>(25);
   const [total, setTotal] = useState(0);
   const [search, setSearch] = useState("");
+  const [appliedSearch, setAppliedSearch] = useState("");
+  const requestControllers = useRef(new Map<string, { controller: AbortController; key: string }>());
 
-  const loadCustomers = useCallback(async (nextPage = page) => {
-    const params = new URLSearchParams({ page: String(nextPage), limit: String(pageSize) });
-    if (search.trim()) params.set("q", search.trim());
-    const data = await fetch(`/api/customers/table?${params.toString()}`, { cache: "no-store" }).then((r) => r.json());
+  const fetchJson = useCallback(async (scope: string, url: string, init?: RequestInit) => {
+    const key = `${init?.method ?? "GET"}:${url}:${typeof init?.body === "string" ? init.body : ""}`;
+    const existing = requestControllers.current.get(scope);
+    if (existing?.key === key) return null;
+    existing?.controller.abort();
+
+    const controller = new AbortController();
+    requestControllers.current.set(scope, { controller, key });
+    let timedOut = false;
+    const timeout = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 15000);
+    try {
+      const response = await fetch(url, { ...init, cache: "no-store", signal: controller.signal });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Request failed.");
+      return data;
+    } catch (fetchError) {
+      if (controller.signal.aborted) {
+        if (timedOut) setRequestWarning(slowRequestMessage);
+        return null;
+      }
+      throw fetchError;
+    } finally {
+      window.clearTimeout(timeout);
+      const current = requestControllers.current.get(scope);
+      if (current?.key === key) requestControllers.current.delete(scope);
+    }
+  }, []);
+
+  useEffect(() => () => {
+    requestControllers.current.forEach(({ controller }) => controller.abort());
+    requestControllers.current.clear();
+  }, []);
+
+  const loadCustomers = useCallback(async (nextPage = 1, query = appliedSearch, nextPageSize = pageSize) => {
+    const params = new URLSearchParams({ page: String(nextPage), limit: String(nextPageSize) });
+    if (query.trim()) params.set("q", query.trim());
+    const data = await fetchJson("customers-table", `/api/customers/table?${params.toString()}`);
+    if (!data) return;
     setCustomers(data.rows || []);
     setTotal(data.total || 0);
     setPage(data.page || nextPage);
-  }, [page, pageSize, search]);
+  }, [appliedSearch, fetchJson, pageSize]);
 
-  const loadHotLeads = useCallback(async () => {
-    const data = await fetch("/api/customers/table?kind=hot-leads&limit=100", { cache: "no-store" }).then((r) => r.json());
+  const loadHotLeads = useCallback(async (query = appliedSearch) => {
+    const params = new URLSearchParams({ kind: "hot-leads", limit: "100" });
+    if (query.trim()) params.set("q", query.trim());
+    const data = await fetchJson("hot-leads", `/api/customers/table?${params.toString()}`);
+    if (!data) return;
     setHotLeadRows(data.rows || []);
-  }, []);
+  }, [appliedSearch, fetchJson]);
 
-  const loadDashboardData = useCallback(async () => {
-    const [summaryData, subscriptionData, candidateData, upcomingData, riskData, salesData] = await Promise.all([
-      fetch("/api/analytics/summary", { cache: "no-store" }).then((r) => r.json()),
-      fetch("/api/subscriptions?kind=real&limit=100", { cache: "no-store" }).then((r) => r.json()),
-      fetch("/api/subscriptions?kind=candidates&limit=100", { cache: "no-store" }).then((r) => r.json()),
-      fetch("/api/upcoming-bills", { cache: "no-store" }).then((r) => r.json()),
-      fetch("/api/risk-customers", { cache: "no-store" }).then((r) => r.json()),
-      fetch("/api/analytics/sales-history?years=5", { cache: "no-store" }).then((r) => r.json()),
-    ]);
+  const loadSummary = useCallback(async () => {
+    const summaryData = await fetchJson("summary", "/api/analytics/summary");
+    if (!summaryData) return;
     setSummary(summaryData || {});
-    setSubscriptions(subscriptionData.rows || []);
-    setSubscriptionCandidates(candidateData.rows || []);
+  }, [fetchJson]);
+
+  const loadSubscriptions = useCallback(async () => {
+    const [subscriptionData, candidateData] = await Promise.all([
+      fetchJson("subscriptions-real", "/api/subscriptions?kind=real&limit=100"),
+      fetchJson("subscriptions-candidates", "/api/subscriptions?kind=candidates&limit=100"),
+    ]);
+    if (subscriptionData) setSubscriptions(subscriptionData.rows || []);
+    if (candidateData) setSubscriptionCandidates(candidateData.rows || []);
+  }, [fetchJson]);
+
+  const loadUpcomingBills = useCallback(async () => {
+    const upcomingData = await fetchJson("upcoming-bills", "/api/upcoming-bills");
+    if (!upcomingData) return;
     setUpcomingBills(upcomingData.rows || []);
     setRecurringCandidates(upcomingData.recurringCandidates || []);
     setUpcomingMeta(upcomingData || {});
+  }, [fetchJson]);
+
+  const loadRiskRows = useCallback(async () => {
+    const riskData = await fetchJson("risk-customers", "/api/risk-customers");
+    if (!riskData) return;
     setRiskRows(riskData.rows || []);
+  }, [fetchJson]);
+
+  const loadSalesHistory = useCallback(async () => {
+    const salesData = await fetchJson("sales-history", "/api/analytics/sales-history?years=5");
+    if (!salesData) return;
     setSalesHistory(salesData.yearly || []);
-  }, []);
+  }, [fetchJson]);
 
   const applyGatewayRange = useCallback((range: GatewayRange) => {
     const now = new Date();
@@ -632,21 +693,54 @@ export default function AdminPage() {
       provider: gatewayProvider,
       status: gatewayStatus,
     });
-    const data = await fetch(`/api/analytics/gateways?${params.toString()}`, { cache: "no-store" }).then((r) => r.json());
+    const data = await fetchJson("gateway-analytics", `/api/analytics/gateways?${params.toString()}`);
+    if (!data) return;
     setGatewayAnalytics(data);
-  }, [gatewayFrom, gatewayTo, gatewayInterval, gatewayProvider, gatewayStatus]);
+  }, [fetchJson, gatewayFrom, gatewayTo, gatewayInterval, gatewayProvider, gatewayStatus]);
+
+  const loadActiveTab = useCallback(async (activeTab: (typeof tabs)[number], options?: { page?: number; query?: string; pageSize?: (typeof pageSizes)[number] }) => {
+    const nextPage = options?.page ?? 1;
+    const query = options?.query ?? appliedSearch;
+    const nextPageSize = options?.pageSize ?? pageSize;
+    setTabLoading((current) => ({ ...current, [activeTab]: true }));
+    try {
+      if (activeTab === "Overview") await Promise.all([loadSummary(), loadCustomers(nextPage, query, nextPageSize)]);
+      else if (activeTab === "Customers") await loadCustomers(nextPage, query, nextPageSize);
+      else if (activeTab === "Subscriptions") await Promise.all([loadSummary(), loadSubscriptions()]);
+      else if (activeTab === "Upcoming Bills") await Promise.all([loadSummary(), loadUpcomingBills()]);
+      else if (activeTab === "Hot Leads") await Promise.all([loadSummary(), loadHotLeads(query)]);
+      else if (activeTab === "Risk Review") await Promise.all([loadSummary(), loadRiskRows()]);
+      else if (activeTab === "Gateway Analytics") await loadGatewayData();
+      else if (activeTab === "5-Year Sales") await Promise.all([loadSummary(), loadSalesHistory()]);
+      else if (activeTab === "High Value") await Promise.all([loadSummary(), loadCustomers(nextPage, query, nextPageSize)]);
+    } finally {
+      setTabLoading((current) => ({ ...current, [activeTab]: false }));
+    }
+  }, [appliedSearch, loadCustomers, loadGatewayData, loadHotLeads, loadRiskRows, loadSalesHistory, loadSubscriptions, loadSummary, loadUpcomingBills, pageSize]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    loadCustomers(1).catch(() => setError("Unable to load customers."));
-    loadHotLeads().catch(() => setError("Unable to load hot checkout leads."));
-    loadDashboardData().catch(() => setError("Unable to load dashboard data."));
-  }, [loadCustomers, loadHotLeads, loadDashboardData]);
+    loadActiveTab(tab, { page: 1, query: appliedSearch }).catch(() => setError("Unable to load dashboard data."));
+  }, [tab, loadActiveTab, appliedSearch]);
 
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    loadGatewayData().catch(() => setError("Unable to load gateway analytics."));
-  }, [loadGatewayData]);
+  const handleApplySearch = () => {
+    const query = search.trim();
+    setMessage("");
+    setRequestWarning("");
+    setError("");
+    setPage(1);
+    if (query === appliedSearch) {
+      loadActiveTab(tab, { page: 1, query }).catch(() => setError("Unable to load dashboard data."));
+      return;
+    }
+    setAppliedSearch(query);
+  };
+
+  const handleTabChange = (nextTab: (typeof tabs)[number]) => {
+    setMessage("");
+    setRequestWarning("");
+    setTab(nextTab);
+  };
 
   const syncWooCommerce = async () => {
     setError("");
@@ -656,9 +750,7 @@ export default function AdminPage() {
     if (!res.ok) return setError(data.error || "Sync failed");
     const warning = data.warning ? ` ${data.warning}` : "";
     setMessage(`${data.message || "Sync completed"} Orders fetched: ${data.totalOrdersFetched ?? 0}. Paid orders: ${data.paidOrders ?? 0}. Unpaid orders: ${data.unpaidOrders ?? 0}.${warning}`);
-    await loadCustomers(1);
-    await loadHotLeads();
-    await loadDashboardData();
+    await loadActiveTab(tab, { page: 1, query: appliedSearch });
   };
 
   const logout = async () => {
@@ -697,7 +789,7 @@ export default function AdminPage() {
       warnings: data.warnings ?? [],
       lastRunTime: new Date().toLocaleString(),
     });
-    await loadDashboardData();
+    await loadActiveTab(tab, { page: 1, query: appliedSearch });
   };
 
   const runSubscriptionBackfill = async (dryRun: boolean) => {
@@ -731,7 +823,7 @@ export default function AdminPage() {
       warnings: data.warnings ?? [],
       lastRunTime: new Date().toLocaleString(),
     });
-    await loadDashboardData();
+    await loadActiveTab(tab, { page: 1, query: appliedSearch });
   };
 
   const runAuthorizeNetImport = async (offset = 0) => {
@@ -763,7 +855,7 @@ export default function AdminPage() {
       warnings: data.warnings ?? [],
       lastRunTime: new Date().toLocaleString(),
     });
-    await loadDashboardData();
+    await loadActiveTab(tab, { page: 1, query: appliedSearch });
   };
 
   const runAuthorizeNetReconcile = async (offset = 0) => {
@@ -792,8 +884,7 @@ export default function AdminPage() {
       warnings: data.warnings ?? [],
       lastRunTime: new Date().toLocaleString(),
     });
-    await loadCustomers(1);
-    await loadDashboardData();
+    await loadActiveTab(tab, { page: 1, query: appliedSearch });
   };
 
   const runCustomerRebuild = async (dryRun: boolean, offset = 0) => {
@@ -830,9 +921,7 @@ export default function AdminPage() {
       warnings: data.warnings ?? [],
       lastRunTime: new Date().toLocaleString(),
     });
-    await loadCustomers(1);
-    await loadHotLeads();
-    await loadDashboardData();
+    await loadActiveTab(tab, { page: 1, query: appliedSearch });
   };
 
   const exportCustomerPdf = (c: Customer) => {
@@ -882,19 +971,21 @@ export default function AdminPage() {
             <p className="mt-1 text-sm text-zinc-400">Paid revenue, subscription status, checkout pipeline, and customer risk.</p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <button onClick={() => setTab("Sync Center")} className="rounded-lg bg-red-600 px-5 py-3 font-semibold text-white shadow-lg shadow-red-950/30 transition hover:bg-red-500">Sync Center</button>
+            <button onClick={() => handleTabChange("Sync Center")} className="rounded-lg bg-red-600 px-5 py-3 font-semibold text-white shadow-lg shadow-red-950/30 transition hover:bg-red-500">Sync Center</button>
             <button onClick={logout} className="rounded-lg border border-zinc-700 bg-zinc-900 px-5 py-3 font-semibold text-zinc-200 transition hover:border-red-800 hover:bg-zinc-800">Logout</button>
           </div>
         </div>
       </header>
-      <nav className="sticky top-0 z-10 flex gap-2 overflow-auto rounded-xl border border-red-950/40 bg-zinc-950/95 p-3 shadow-lg shadow-black/30 backdrop-blur">{tabs.map((t) => <button key={t} onClick={() => setTab(t)} className={`whitespace-nowrap rounded-lg px-4 py-2 text-sm font-semibold transition ${tab === t ? "bg-red-600 text-white shadow-lg shadow-red-950/50 ring-1 ring-red-400/30" : "border border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-red-900 hover:bg-zinc-800 hover:text-white"}`}>{t}</button>)}</nav>
+      <nav className="sticky top-0 z-10 flex gap-2 overflow-auto rounded-xl border border-red-950/40 bg-zinc-950/95 p-3 shadow-lg shadow-black/30 backdrop-blur">{tabs.map((t) => <button key={t} onClick={() => handleTabChange(t)} className={`whitespace-nowrap rounded-lg px-4 py-2 text-sm font-semibold transition ${tab === t ? "bg-red-600 text-white shadow-lg shadow-red-950/50 ring-1 ring-red-400/30" : "border border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-red-900 hover:bg-zinc-800 hover:text-white"}`}>{t}</button>)}</nav>
       <div className="flex flex-wrap items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-950/80 p-3">
-        <input value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") loadCustomers(1); }} className="min-w-64 rounded bg-zinc-950 px-3 py-2 text-sm outline-none ring-1 ring-zinc-800" placeholder="Search customers by name, email, phone" />
+        <input value={search} onChange={(e) => { setSearch(e.target.value); setPage(1); }} onKeyDown={(e) => { if (e.key === "Enter") handleApplySearch(); }} className="min-w-64 rounded bg-zinc-950 px-3 py-2 text-sm outline-none ring-1 ring-zinc-800" placeholder="Search customers by name, email, phone" />
         <select value={pageSize} onChange={(e) => { setPageSize(Number(e.target.value) as (typeof pageSizes)[number]); setPage(1); }} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">{pageSizes.map((size) => <option key={size} value={size}>{size} rows</option>)}</select>
-        <button onClick={() => loadCustomers(1)} className="rounded bg-zinc-700 px-4 py-2 text-sm font-semibold">Apply</button>
+        <button onClick={handleApplySearch} className="rounded bg-zinc-700 px-4 py-2 text-sm font-semibold">Apply</button>
       </div>
       {error && <p className="rounded border border-red-800 bg-red-950/50 p-3">{error}</p>}
-      {message && <p className="rounded border border-emerald-800 bg-emerald-950/50 p-3">{message}</p>}
+      {requestWarning && <p className="rounded border border-amber-700 bg-amber-950/50 p-3 text-amber-100">{requestWarning}</p>}
+      {tabLoading[tab] && <p className="rounded border border-zinc-800 bg-zinc-900 p-3 text-zinc-400">Loading {tab}...</p>}
+      {tab === "Sync Center" && message && <p className="rounded border border-emerald-800 bg-emerald-950/50 p-3">{message}</p>}
 
       {tab === "Overview" && <>
         <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">

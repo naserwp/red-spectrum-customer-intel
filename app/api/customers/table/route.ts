@@ -38,6 +38,10 @@ function productsAttempted(order: WooCommerceOrderDocument) {
   return Array.from(new Set((order.products ?? order.lineItems ?? []).map((item) => item.name).filter(Boolean)));
 }
 
+function escapeRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export async function GET(request: Request) {
   await connectToDatabase();
   const { searchParams } = new URL(request.url);
@@ -115,7 +119,13 @@ export async function GET(request: Request) {
     { $or: [{ name: { $type: "string", $ne: "" } }, { email: { $type: "string", $ne: "" } }] },
   ];
   if (risk) and.push({ riskLevel: risk });
-  if (q) and.push({ $or: [{ name: { $regex: q, $options: "i" } }, { email: { $regex: q, $options: "i" } }, { phone: { $regex: q, $options: "i" } }] });
+  if (q) {
+    const normalizedQuery = q.toLowerCase();
+    const looksLikeExactEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedQuery);
+    and.push(looksLikeExactEmail
+      ? { $or: [{ normalizedEmail: normalizedQuery }, { email: normalizedQuery }, { email: q }] }
+      : { $or: [{ name: { $regex: escapeRegex(q), $options: "i" } }, { email: { $regex: escapeRegex(q), $options: "i" } }, { phone: { $regex: escapeRegex(q), $options: "i" } }] });
+  }
   const query: Record<string, unknown> = { $and: and };
   const sort: Record<string, 1 | -1> = { paidTotal: -1, attemptedTotal: -1 };
   const [total, rows] = await Promise.all([
