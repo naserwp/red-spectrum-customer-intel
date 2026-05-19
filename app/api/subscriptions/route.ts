@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { cachedJson } from "@/lib/apiCache";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Subscription } from "@/models/Subscription";
 import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
@@ -14,6 +15,49 @@ export async function GET(request: Request) {
   const status = searchParams.get("status") ?? "";
   const kind = searchParams.get("kind") ?? "real";
   const search = (searchParams.get("q") ?? "").trim();
+  const dashboard = searchParams.get("dashboard") === "1";
+  if (dashboard) {
+    return cachedJson(`subscriptions-dashboard:${page}:${limit}:${search}`, async () => {
+      const [total, records, candidateRows] = await Promise.all([
+        WooCommerceSubscriptionRecord.countDocuments({}),
+        WooCommerceSubscriptionRecord.find(search ? { $or: [{ customerName: { $regex: search, $options: "i" } }, { customerEmail: { $regex: search, $options: "i" } }, { subscriptionNumber: { $regex: search, $options: "i" } }] } : {}).sort({ nextPaymentDate: 1 }).skip((page - 1) * limit).limit(limit).lean<LeanWooSubscription[]>(),
+        Subscription.find({ isPlaceholder: { $ne: true }, recordType: "subscription_candidate" }).sort({ nextBillingDate: 1 }).limit(limit).lean(),
+      ]);
+      const rows = records.map((record) => ({
+        _id: String(record._id),
+        subscriptionId: String(record.wooSubscriptionId),
+        subscriptionNumber: record.subscriptionNumber,
+        source: "woocommerce",
+        customerEmail: record.customerEmail,
+        customerName: record.customerName,
+        customerPhone: record.customerPhone,
+        status: record.status,
+        amount: record.amount,
+        monthlyRecurringRevenue: record.status === "active" ? record.amount : 0,
+        billingInterval: [record.billingInterval, record.billingPeriod].filter(Boolean).join(" "),
+        nextBillingDate: record.nextPaymentDate,
+        lastBillingDate: record.lastPaymentDate,
+        startDate: record.startDate,
+        paymentMethodTitle: record.paymentMethodTitle || record.paymentMethod,
+        productNames: record.productNames,
+        sourceStatus: "real",
+        recordType: "subscription",
+      }));
+      return {
+        page,
+        limit,
+        total,
+        rows,
+        candidateRows,
+        summary: {
+          totalSubscriptions: total,
+          activeSubscriptions: records.filter((record) => record.status === "active").length,
+          monthlyRecurringRevenue: records.filter((record) => record.status === "active").reduce((sum, record) => sum + Number(record.amount ?? 0), 0),
+          subscriptionCandidates: candidateRows.length,
+        },
+      };
+    });
+  }
   const q: Record<string, unknown> = {};
   if (kind === "real") {
     if (source && source !== "woocommerce") return NextResponse.json({ page, limit, total: 0, rows: [] });

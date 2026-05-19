@@ -43,6 +43,7 @@ function escapeRegex(value: string) {
 }
 
 export async function GET(request: Request) {
+  const started = Date.now();
   await connectToDatabase();
   const { searchParams } = new URL(request.url);
   const page = Math.max(1, Number(searchParams.get("page") ?? 1));
@@ -113,7 +114,9 @@ export async function GET(request: Request) {
       .filter((row) => textMatch({ name: String(row.name ?? ""), email: String(row.email ?? ""), phone: String(row.phone ?? "") }))
       .sort((a, b) => Number(b.attemptedTotal ?? 0) - Number(a.attemptedTotal ?? 0) || String(b.lastAttemptDate ?? "").localeCompare(String(a.lastAttemptDate ?? "")));
     const start = (page - 1) * limit;
-    return NextResponse.json({ page, limit, total: rows.length, rows: rows.slice(start, start + limit) });
+    const payload = { page, limit, total: rows.length, rows: rows.slice(start, start + limit) };
+    console.log(`[api] customers-table durationMs=${Date.now() - started} mongoMs=${Date.now() - started} cache=none responseBytes=${JSON.stringify(payload).length}`);
+    return NextResponse.json(payload);
   }
   const and: Record<string, unknown>[] = [
     { $or: [{ name: { $type: "string", $ne: "" } }, { email: { $type: "string", $ne: "" } }] },
@@ -132,5 +135,7 @@ export async function GET(request: Request) {
     Customer.countDocuments(query),
     Customer.find(query).sort(sort).skip((page - 1) * limit).limit(limit).lean(),
   ]);
-  return NextResponse.json({ page, limit, total, rows });
+  const payload = { page, limit, total, rows };
+  console.log(`[api] customers-table durationMs=${Date.now() - started} mongoMs=${Date.now() - started} cache=none responseBytes=${JSON.stringify(payload).length}`);
+  return NextResponse.json(payload);
 }

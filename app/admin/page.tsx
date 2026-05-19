@@ -237,6 +237,12 @@ function Card({ label, value, helper }: { label: string; value: string | number;
   </div>;
 }
 
+function LoadingSkeleton() {
+  return <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    {[0, 1, 2, 3].map((item) => <div key={item} className="h-24 animate-pulse rounded-xl border border-zinc-800 bg-zinc-900/70" />)}
+  </div>;
+}
+
 function Pager({ start, end, total, page, maxPage, setPage }: { start: number; end: number; total: number; page: number; maxPage: number; setPage: (p: number) => void }) {
   return <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-zinc-400">
     <p>Showing {start}-{end} of {total}</p>
@@ -574,6 +580,7 @@ export default function AdminPage() {
   const [gatewayProvider, setGatewayProvider] = useState<GatewayProvider>("all");
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>("all");
   const [upcomingMeta, setUpcomingMeta] = useState<Record<string, unknown>>({});
+  const [riskMeta, setRiskMeta] = useState<Record<string, unknown>>({});
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [requestWarning, setRequestWarning] = useState("");
@@ -650,9 +657,10 @@ export default function AdminPage() {
   }, [appliedSearch, fetchJson]);
 
   const loadSummary = useCallback(async () => {
-    const summaryData = await fetchJson("summary", "/api/analytics/summary");
+    const summaryData = await fetchJson("summary", "/api/customers/summary");
     if (!summaryData) return;
     setSummary(summaryData || {});
+    if (summaryData.lastSyncAt) setSyncStatus({ lastSyncAt: String(summaryData.lastSyncAt), dataFreshness: "Fresh" });
   }, [fetchJson]);
 
   const loadSyncStatus = useCallback(async () => {
@@ -662,12 +670,11 @@ export default function AdminPage() {
   }, [fetchJson]);
 
   const loadSubscriptions = useCallback(async () => {
-    const [subscriptionData, candidateData] = await Promise.all([
-      fetchJson("subscriptions-real", "/api/subscriptions?kind=real&limit=100"),
-      fetchJson("subscriptions-candidates", "/api/subscriptions?kind=candidates&limit=100"),
-    ]);
-    if (subscriptionData) setSubscriptions(subscriptionData.rows || []);
-    if (candidateData) setSubscriptionCandidates(candidateData.rows || []);
+    const subscriptionData = await fetchJson("subscriptions-dashboard", "/api/subscriptions?dashboard=1&limit=100");
+    if (!subscriptionData) return;
+    setSubscriptions(subscriptionData.rows || []);
+    setSubscriptionCandidates(subscriptionData.candidateRows || []);
+    setSummary((current) => ({ ...current, ...(subscriptionData.summary ?? {}) }));
   }, [fetchJson]);
 
   const loadUpcomingBills = useCallback(async () => {
@@ -682,6 +689,7 @@ export default function AdminPage() {
     const riskData = await fetchJson("risk-customers", "/api/risk-customers");
     if (!riskData) return;
     setRiskRows(riskData.rows || []);
+    setRiskMeta(riskData || {});
   }, [fetchJson]);
 
   const loadSalesHistory = useCallback(async () => {
@@ -737,15 +745,18 @@ export default function AdminPage() {
     const nextPageSize = options?.pageSize ?? pageSize;
     setTabLoading((current) => ({ ...current, [activeTab]: true }));
     try {
-      if (activeTab === "Overview") await Promise.all([loadSummary(), loadCustomers(nextPage, query, nextPageSize)]);
+      if (activeTab === "Overview") {
+        await loadSummary();
+        await loadCustomers(nextPage, query, nextPageSize);
+      }
       else if (activeTab === "Customers") await loadCustomers(nextPage, query, nextPageSize);
-      else if (activeTab === "Subscriptions") await Promise.all([loadSummary(), loadSubscriptions()]);
-      else if (activeTab === "Upcoming Bills") await Promise.all([loadSummary(), loadUpcomingBills()]);
-      else if (activeTab === "Hot Leads") await Promise.all([loadSummary(), loadHotLeads(query)]);
-      else if (activeTab === "Risk Review") await Promise.all([loadSummary(), loadRiskRows()]);
+      else if (activeTab === "Subscriptions") await loadSubscriptions();
+      else if (activeTab === "Upcoming Bills") await loadUpcomingBills();
+      else if (activeTab === "Hot Leads") await loadHotLeads(query);
+      else if (activeTab === "Risk Review") await loadRiskRows();
       else if (activeTab === "Gateway Analytics") await loadGatewayData();
-      else if (activeTab === "5-Year Sales") await Promise.all([loadSummary(), loadSalesHistory()]);
-      else if (activeTab === "High Value") await Promise.all([loadSummary(), loadCustomers(nextPage, query, nextPageSize)]);
+      else if (activeTab === "5-Year Sales") await loadSalesHistory();
+      else if (activeTab === "High Value") await loadCustomers(nextPage, query, nextPageSize);
     } finally {
       setTabLoading((current) => ({ ...current, [activeTab]: false }));
     }
@@ -755,11 +766,6 @@ export default function AdminPage() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     loadActiveTab(tab, { page: 1, query: appliedSearch }).catch(() => setError("Unable to load dashboard data."));
   }, [tab, loadActiveTab, appliedSearch]);
-
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    loadSyncStatus().catch(() => undefined);
-  }, [loadSyncStatus]);
 
   const handleApplySearch = () => {
     const query = search.trim();
@@ -827,7 +833,8 @@ export default function AdminPage() {
         warnings,
         lastRunTime: new Date().toLocaleString(),
       });
-      await Promise.all([loadSyncStatus(), loadActiveTab(tab, { page: 1, query: appliedSearch })]);
+      await loadSyncStatus();
+      await loadActiveTab(tab, { page: 1, query: appliedSearch });
     } catch (syncError) {
       setError(syncError instanceof Error ? syncError.message : "Sync failed.");
     } finally {
@@ -1052,6 +1059,13 @@ export default function AdminPage() {
   const customerEnd = Math.min(total, page * pageSize);
   const customerMaxPage = Math.max(1, Math.ceil(total / pageSize));
   const highValueRows = useMemo(() => customers.filter((c) => paidAmount(c) >= highValueThreshold).sort((a, b) => paidAmount(b) - paidAmount(a)), [customers]);
+  const hotLeadFailedThisMonth = useMemo(() => {
+    const now = new Date();
+    return hotLeadRows.filter((row) => {
+      const date = new Date(row.lastAttemptDate ?? "");
+      return Number.isFinite(date.getTime()) && date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth();
+    }).reduce((sum, row) => sum + Number(row.attemptedOrderCount ?? 0), 0);
+  }, [hotLeadRows]);
   const riskDisplayRows = riskRows.length ? riskRows : customers.filter((c) => c.riskLevel === "high" || c.failedPayments > 0 || c.chargebacks > 0);
   const highValuePage = usePagedRows(highValueRows, pageSize);
   const hotLeadPage = usePagedRows(hotLeadRows, pageSize);
@@ -1085,7 +1099,7 @@ export default function AdminPage() {
       </div>
       {error && <p className="rounded border border-red-800 bg-red-950/50 p-3">{error}</p>}
       {requestWarning && <p className="rounded border border-amber-700 bg-amber-950/50 p-3 text-amber-100">{requestWarning}</p>}
-      {tabLoading[tab] && <p className="rounded border border-zinc-800 bg-zinc-900 p-3 text-zinc-400">Loading {tab}...</p>}
+      {tabLoading[tab] && <LoadingSkeleton />}
       {tab === "Sync Center" && message && <p className="rounded border border-emerald-800 bg-emerald-950/50 p-3">{message}</p>}
 
       {tab === "Overview" && <>
@@ -1121,7 +1135,7 @@ export default function AdminPage() {
       </>}
 
       {tab === "Upcoming Bills" && <>
-        <section className="grid gap-3 sm:grid-cols-3"><Card label="Upcoming 30D" value={Number(summary.upcomingBills30d ?? 0)} helper="Active subscriptions with real next billing date" /><Card label="Estimated Upcoming Revenue" value={money(Number(summary.estimatedUpcomingRevenue30d ?? 0))} /><Card label="High Risk Upcoming" value={Number(upcomingMeta.highRiskCount ?? 0)} /></section>
+        <section className="grid gap-3 sm:grid-cols-3"><Card label="Upcoming 30D" value={upcomingBills.length} helper="Active subscriptions with real next billing date" /><Card label="Estimated Upcoming Revenue" value={money(Number(upcomingMeta.estimatedUpcomingRevenue ?? 0))} /><Card label="High Risk Upcoming" value={Number(upcomingMeta.highRiskCount ?? 0)} /></section>
         <section className="space-y-3">
           <h2 className="text-xl font-semibold text-zinc-100">Active Subscriptions With Next Billing Date</h2>
           {typeof upcomingMeta.message === "string" && upcomingMeta.message && <p className="rounded border border-zinc-800 bg-zinc-900 p-3 text-zinc-400">{upcomingMeta.message}</p>}
@@ -1137,11 +1151,11 @@ export default function AdminPage() {
       {tab === "High Value" && <><Card label="High Value Paid Customers" value={Number(summary.highValueCustomers ?? 0)} helper="Unpaid leads excluded" /><ValueIndex rows={highValuePage.rows} /><Pager {...highValuePage} /></>}
 
       {tab === "Hot Leads" && <>
-        <section className="grid gap-3 sm:grid-cols-3"><Card label="Hot Checkout Leads" value={hotLeadRows.length} helper="Unpaid checkout/payment attempts and newer failed attempts after last paid order" /><Card label="Attempted Pipeline" value={money(hotLeadRows.reduce((sum, row) => sum + attemptedAmount(row), 0))} /><Card label="Failed/Pending Attempts This Month" value={Number(summary.failedCheckoutAttemptsThisMonth ?? 0)} /></section>
+        <section className="grid gap-3 sm:grid-cols-3"><Card label="Hot Checkout Leads" value={hotLeadRows.length} helper="Unpaid checkout/payment attempts and newer failed attempts after last paid order" /><Card label="Attempted Pipeline" value={money(hotLeadRows.reduce((sum, row) => sum + attemptedAmount(row), 0))} /><Card label="Failed/Pending Attempts This Month" value={hotLeadFailedThisMonth} /></section>
         <HotLeadsTable rows={hotLeadPage.rows} /><Pager {...hotLeadPage} />
       </>}
 
-      {tab === "Risk Review" && <><section className="grid gap-3 sm:grid-cols-4"><Card label="Risk Customers" value={riskDisplayRows.length} /><Card label="Failed Payments Total" value={Number(summary.failedPaymentsTotal ?? 0)} /><Card label="Failed Payments Last 30D" value={Number(summary.failedPaymentsLast30Days ?? 0)} /><Card label="Failed Checkout Attempts This Month" value={Number(summary.failedCheckoutAttemptsThisMonth ?? 0)} /></section><CustomerTable rows={riskPage.rows} exportCustomerPdf={exportCustomerPdf} /><Pager {...riskPage} /></>}
+      {tab === "Risk Review" && <><section className="grid gap-3 sm:grid-cols-4"><Card label="Risk Customers" value={riskDisplayRows.length} /><Card label="Failed Payments Total" value={Number(riskMeta.failedPaymentsTotal ?? 0)} /><Card label="Failed Payments Last 30D" value={Number(riskMeta.failedPaymentsLast30Days ?? 0)} /><Card label="Failed Checkout Attempts This Month" value={Number(riskMeta.failedPaymentsLast30Days ?? 0)} /></section><CustomerTable rows={riskPage.rows} exportCustomerPdf={exportCustomerPdf} /><Pager {...riskPage} /></>}
 
       {tab === "Gateway Analytics" && <GatewayAnalyticsView data={gatewayAnalytics} range={gatewayRange} setRange={applyGatewayRange} from={gatewayFrom} setFrom={setGatewayFrom} to={gatewayTo} setTo={setGatewayTo} interval={gatewayInterval} setInterval={setGatewayInterval} provider={gatewayProvider} setProvider={setGatewayProvider} status={gatewayStatus} setStatus={setGatewayStatus} reload={loadGatewayData} />}
 

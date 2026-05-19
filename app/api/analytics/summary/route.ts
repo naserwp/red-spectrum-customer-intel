@@ -1,21 +1,26 @@
-import { NextResponse } from "next/server";
 import { highValueThreshold, isInRange, monthStart, rollingDaysStart } from "@/lib/businessMetrics";
+import { cachedJson } from "@/lib/apiCache";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { SalesHistory, type SalesHistoryDocument } from "@/models/SalesHistory";
 import { Subscription, type SubscriptionDocument } from "@/models/Subscription";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
+import { SyncJob } from "@/models/SyncJob";
+
+export const dynamic = "force-dynamic";
 
 export async function GET() {
   await connectToDatabase();
-  const [customers, subs, wooSubscriptions, salesHistory] = await Promise.all([
+  return cachedJson("customers-summary", async () => {
+    const [customers, subs, wooSubscriptions, salesHistory, lastJob] = await Promise.all([
     Customer.find({}).lean<CustomerDocument[]>(),
     Subscription.find({}).lean<SubscriptionDocument[]>(),
     WooCommerceSubscriptionRecord.find({}).lean<WooCommerceSubscriptionDocument[]>(),
     SalesHistory.findOne({ source: "woocommerce" }).lean<SalesHistoryDocument | null>(),
-  ]);
-  const storedOrders = await WooCommerceOrderRecord.find({}).lean<WooCommerceOrderDocument[]>();
+    SyncJob.findOne({}).sort({ finishedAt: -1, updatedAt: -1 }).lean<{ finishedAt?: string; updatedAt?: Date | string } | null>(),
+    ]);
+    const storedOrders = await WooCommerceOrderRecord.find({}).lean<WooCommerceOrderDocument[]>();
 
   const now = new Date();
   const startOfMonth = monthStart(now);
@@ -55,7 +60,7 @@ export async function GET() {
     return acc;
   }, {});
 
-  return NextResponse.json({
+  return {
     customerCount: customers.length,
     totalRevenue: paidRevenue,
     paidRevenue,
@@ -85,5 +90,7 @@ export async function GET() {
     highValueCustomersThisMonth,
     sourceBreakdown,
     salesHistoryUpdatedAt: salesHistory?.generatedAt ?? "",
+    lastSyncAt: String(lastJob?.finishedAt || lastJob?.updatedAt || ""),
+  };
   });
 }

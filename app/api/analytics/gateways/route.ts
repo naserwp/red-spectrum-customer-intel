@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { cachedJson } from "@/lib/apiCache";
 import { isDeclinedOrFailed, isSettledSuccessful } from "@/lib/authorizeNet";
 import { connectToDatabase } from "@/lib/mongodb";
 import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
@@ -282,6 +282,7 @@ export async function GET(request: Request) {
   const interval = intervals.includes(intervalParam as Interval) ? intervalParam as Interval : "month";
   const requestedProvider = providerParam === "all" || defaultProviders.includes(providerParam as Provider) ? providerParam as Provider | "all" : "all";
   const status = statusFilters.includes(statusParam as StatusFilter) ? statusParam as StatusFilter : "all";
+  return cachedJson(`gateways:${from.toISOString()}:${to.toISOString()}:${interval}:${requestedProvider}:${status}`, async () => {
 
   const [customers, authorizeNetTransactions] = await Promise.all([
     Customer.find({}, { name: 1, email: 1, orders: 1 }).lean<Pick<CustomerDocument, "name" | "email" | "orders">[]>(),
@@ -382,7 +383,7 @@ export async function GET(request: Request) {
     .sort((a, b) => b.paidRevenue - a.paidRevenue || b.attemptedPipeline - a.attemptedPipeline || b.orderCount - a.orderCount)
     .slice(0, 50);
 
-  return NextResponse.json({
+  return {
     filters: {
       from: from.toISOString().slice(0, 10),
       to: to.toISOString().slice(0, 10),
@@ -407,5 +408,6 @@ export async function GET(request: Request) {
     byProvider,
     timeline,
     topCustomersByGateway,
+  };
   });
 }
