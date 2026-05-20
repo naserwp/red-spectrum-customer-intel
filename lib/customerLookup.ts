@@ -1,5 +1,6 @@
 import mongoose from "mongoose";
 import { Customer, type CustomerDocument } from "@/models/Customer";
+import { WooCommerceOrderRecord } from "@/models/WooCommerceOrder";
 
 export type CustomerLookupDocument = CustomerDocument & {
   _id: unknown;
@@ -118,6 +119,30 @@ export async function findBestCustomerByIdOrEmail(rawId: string): Promise<Custom
 
   if (id.includes("@")) {
     return findBestCustomerByEmail(id);
+  }
+
+  if (/^\d+$/.test(id)) {
+    const numericId = Number(id);
+    const directCustomers = await Customer.find({
+      $or: [
+        { externalCustomerKey: { $regex: `:${id}$` } },
+        { "orders.customerId": numericId },
+        { "orders.orderId": id },
+        { "orders.orderNumber": id },
+      ],
+    }).lean<CustomerLookupDocument[]>();
+    if (directCustomers.length) {
+      return chooseBestCustomer(directCustomers, { lookupKind: "id" });
+    }
+
+    const wooOrder = await WooCommerceOrderRecord.findOne({
+      $or: [{ customerId: numericId }, { wooOrderId: numericId }, { orderNumber: id }],
+    }, { normalizedEmail: 1, billingEmail: 1, customerId: 1, orderNumber: 1 }).lean<{ normalizedEmail?: string; billingEmail?: string } | null>();
+    const email = normalizeEmail(wooOrder?.normalizedEmail || wooOrder?.billingEmail || "");
+    if (email) {
+      const result = await findBestCustomerByEmail(email);
+      if (result.customer) return { ...result, selectedDocumentReason: `matched_woocommerce_numeric_id:${id}` };
+    }
   }
 
   return { customer: null, documentsWithSameEmail: 0, selectedDocumentReason: "not_found" };

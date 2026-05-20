@@ -583,6 +583,7 @@ export default function AdminPage() {
   const [summary, setSummary] = useState<Record<string, unknown>>({});
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
   const [subscriptionCandidates, setSubscriptionCandidates] = useState<Subscription[]>([]);
+  const [subscriptionView, setSubscriptionView] = useState<"active" | "candidates">("active");
   const [upcomingBills, setUpcomingBills] = useState<Subscription[]>([]);
   const [recurringCandidates, setRecurringCandidates] = useState<RecurringCandidate[]>([]);
   const [hotLeadRows, setHotLeadRows] = useState<Customer[]>([]);
@@ -1174,13 +1175,20 @@ export default function AdminPage() {
       {tab === "Customers" && <><CustomerTable rows={customers} exportCustomerPdf={exportCustomerPdf} /><Pager start={customerStart} end={customerEnd} total={total} page={page} maxPage={customerMaxPage} setPage={loadCustomers} /></>}
 
       {tab === "Subscriptions" && <>
-        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"><Card label="Total Subscriptions" value={Number(summary.totalSubscriptions ?? 0)} helper="All imported WooCommerce subscriptions" /><Card label="Active Subscriptions" value={Number(summary.activeSubscriptions ?? 0)} helper={`${Number(summary.activeWooSubscriptions ?? 0)} WooCommerce + ${Number(summary.activeGatewayRecurringCustomers ?? 0)} Authorize.net recurring`} /><Card label="MRR" value={money(Number(summary.monthlyRecurringRevenue ?? 0))} helper="WooCommerce active subscriptions plus gateway recurring estimates" /><Card label="Subscription Candidates" value={Number(summary.subscriptionCandidates ?? 0)} helper="Recurring-like WooCommerce orders, not active subscriptions" /></section>
-        <h2 className="text-xl font-semibold text-zinc-100">Active Subscriptions</h2><SubscriptionTable rows={subPage.rows} /><Pager {...subPage} />
-        <div>
-          <h2 className="text-xl font-semibold text-zinc-100">Subscription Candidates</h2>
-          <p className="mt-1 text-sm text-zinc-400">Subscription Candidates are recurring-like WooCommerce orders, not confirmed active subscriptions.</p>
-        </div>
-        <SubscriptionTable rows={candidatePage.rows} /><Pager {...candidatePage} />
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <Card label="Total Subscriptions" value={Number(summary.totalSubscriptions ?? 0)} helper="All imported WooCommerce subscriptions" />
+          <button onClick={() => setSubscriptionView("active")} className="text-left"><Card label="Active Subscriptions" value={Number(summary.activeSubscriptions ?? 0)} helper={`${Number(summary.activeWooSubscriptions ?? 0)} WooCommerce + ${Number(summary.activeGatewayRecurringCustomers ?? 0)} Authorize.net recurring`} /></button>
+          <Card label="MRR" value={money(Number(summary.monthlyRecurringRevenue ?? 0))} helper="Active WooCommerce recurring totals plus Authorize.net recurring estimates" />
+          <button onClick={() => setSubscriptionView("candidates")} className="text-left"><Card label="Subscription Candidates" value={Number(summary.subscriptionCandidates ?? 0)} helper="Recurring-like customers not currently active" /></button>
+        </section>
+        {Number(summary.activeWooSubscriptionsDbCount ?? summary.activeWooSubscriptions ?? 0) !== Number(summary.activeWooSubscriptions ?? 0) && <p className="rounded border border-amber-800 bg-amber-950/30 p-3 text-sm text-amber-100">WooCommerce active count check: database count {Number(summary.activeWooSubscriptionsDbCount ?? 0)}, cached count {Number(summary.activeWooSubscriptions ?? 0)}. Run Sync Now if these differ.</p>}
+        {subscriptionView === "active" ? <><h2 className="text-xl font-semibold text-zinc-100">Active Subscriptions</h2><SubscriptionTable rows={subPage.rows} /><Pager {...subPage} /></> : <>
+          <div>
+            <h2 className="text-xl font-semibold text-zinc-100">Subscription Candidates</h2>
+            <p className="mt-1 text-sm text-zinc-400">Recurring-like customers not currently active. Placeholder rows are hidden.</p>
+          </div>
+          <SubscriptionTable rows={candidatePage.rows} /><Pager {...candidatePage} />
+        </>}
       </>}
 
       {tab === "Upcoming Bills" && <>

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { isAuthorizeNetConfigured, fetchSettledBatchIds, fetchTransactionDetails, fetchTransactionIdsForBatch, fetchUnsettledTransactionIds, normalizeAuthorizeNetTransaction } from "@/lib/authorizeNet";
 import { reconcileAuthorizeNetTransaction } from "@/lib/authorizeNetReconciliation";
-import { rebuildAnalyticsCache } from "@/lib/analyticsCache";
+import { rebuildAnalyticsCacheBatch } from "@/lib/analyticsCache";
 import { calculateCustomerScore, scoreToStars, type CustomerScoreInput } from "@/lib/customerScore";
 import { monthsSince } from "@/lib/customerValue";
 import { customerLedgerRecords, detectAuthorizeNetRecurring } from "@/lib/revenueAnalytics";
@@ -36,6 +36,7 @@ type SyncCursor = {
   authorizeNetOffset?: number;
   reconcileOffset?: number;
   wordpressProfileOffset?: number;
+  analyticsOffset?: number;
   completedSteps?: string[];
 };
 
@@ -371,11 +372,12 @@ async function reconcileAuthorizeNetStep(cursor: SyncCursor) {
 }
 
 async function rebuildAnalyticsStep(cursor: SyncCursor) {
-  const result = await rebuildAnalyticsCache();
+  const offset = cursor.analyticsOffset ?? 0;
+  const result = await rebuildAnalyticsCacheBatch({ limit: 100, offset, maxRuntimeMs: 8000 });
   return {
-    cursor: nextCursor(cursor, { phase: "done", completedSteps: ["analytics"] }),
+    cursor: result.hasMore ? nextCursor(cursor, { phase: "analytics", analyticsOffset: result.nextOffset }) : nextCursor(cursor, { phase: "done", completedSteps: ["analytics"] }),
     analyticsRecordsUpdated: result.rankingUpdated,
-    label: `Rebuilt dashboard analytics cache for ${result.rankingUpdated} ranked customers.`,
+    label: result.hasMore ? `Rebuilding dashboard analytics ${offset}-${result.nextOffset}...` : `Rebuilt dashboard analytics cache for ${result.rankingUpdated} ranked customers.`,
   };
 }
 

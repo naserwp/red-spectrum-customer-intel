@@ -28,13 +28,14 @@ export async function readAnalyticsSnapshot<T extends Record<string, unknown>>(k
   };
 }
 
-export async function rebuildAnalyticsCacheBatch({ limit = 500, offset = 0 }: { limit?: number; offset?: number } = {}) {
+export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxRuntimeMs = 8000 }: { limit?: number; offset?: number; maxRuntimeMs?: number } = {}) {
+  const started = Date.now();
   const generatedAt = new Date().toISOString();
   const now = new Date();
   const currentMonthStart = monthStart(now);
   const currentMonthEnd = monthEnd(now);
   const currentYearStart = new Date(now.getFullYear(), 0, 1);
-  const safeLimit = Math.min(500, Math.max(1, Math.floor(limit)));
+  const safeLimit = Math.min(100, Math.max(1, Math.floor(limit)));
   const safeOffset = Math.max(0, Math.floor(offset));
   const [customers, totalCustomers, subscriptions, summaryAgg] = await Promise.all([
     Customer.find({}, {
@@ -58,12 +59,14 @@ export async function rebuildAnalyticsCacheBatch({ limit = 500, offset = 0 }: { 
     ]),
   ]);
   const summary = summaryAgg[0];
-  const rankingRows = customers.map((customer) => {
+  const rankingRows = [];
+  for (const customer of customers) {
+    if (Date.now() - started > maxRuntimeMs - 500) break;
     const lifetimeSpent = paidValue(customer);
     const firstPaidDate = customer.firstPaidDate || customer.firstOrderDate || "";
     const latestPaidDate = customer.lastPaidDate || customer.lastOrderDate || "";
     const attemptedPipeline = Number(customer.attemptedTotal ?? 0);
-    return {
+    rankingRows.push({
       customerId: String(customer._id),
       name: customer.name,
       email: customer.email,
@@ -81,11 +84,12 @@ export async function rebuildAnalyticsCacheBatch({ limit = 500, offset = 0 }: { 
       attemptedPipeline,
       category: category(lifetimeSpent, attemptedPipeline),
       generatedAt,
-    };
-  }).filter((row) => row.lifetimeSpent > 0 || row.attemptedPipeline > 0);
+    });
+  }
+  const filteredRankingRows = rankingRows.filter((row) => row.lifetimeSpent > 0 || row.attemptedPipeline > 0);
 
-  if (rankingRows.length) {
-    await CustomerRanking.bulkWrite(rankingRows.map((row) => ({
+  if (filteredRankingRows.length) {
+    await CustomerRanking.bulkWrite(filteredRankingRows.map((row) => ({
       updateOne: { filter: { customerId: row.customerId }, update: { $set: row }, upsert: true },
     })), { ordered: false });
   }
@@ -174,20 +178,23 @@ export async function rebuildAnalyticsCacheBatch({ limit = 500, offset = 0 }: { 
           monthGrowthPercent: previousMonthRevenue > 0 ? ((currentMonthRevenue - previousMonthRevenue) / previousMonthRevenue) * 100 : currentMonthRevenue > 0 ? 100 : 0,
         },
         generatedAt,
-        status: rankingRows.length ? "ready" : "empty",
-        warnings: [],
+        status: safeOffset + rankingRows.length < totalCustomers ? "partial" : rankingRows.length ? "ready" : "empty",
+        warnings: safeOffset + rankingRows.length < totalCustomers ? ["Partial analytics rebuild completed. Continue next batch."] : [],
       },
     },
     { upsert: true }
   );
+  const customersProcessed = rankingRows.length;
+  const hasMore = safeOffset + customersProcessed < totalCustomers;
   return {
-    customersProcessed: customers.length,
-    rankingUpdated: rankingRows.length,
+    customersProcessed,
+    rankingUpdated: filteredRankingRows.length,
     summaryUpdated: true,
     subscriptionMetricsUpdated: true,
-    hasMore: safeOffset + customers.length < totalCustomers,
-    nextOffset: safeOffset + customers.length,
+    hasMore,
+    nextOffset: safeOffset + customersProcessed,
     generatedAt,
+    partial: hasMore,
   };
 }
 

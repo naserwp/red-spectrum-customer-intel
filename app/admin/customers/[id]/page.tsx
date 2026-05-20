@@ -207,6 +207,14 @@ type CustomerDetail = {
   refunds: number;
   chargebacks: number;
   subscriptionStatus: string;
+  activeSubscriptions?: number;
+  isGatewayRecurring?: boolean;
+  recurringSource?: string;
+  recurringAmount?: number;
+  recurringFrequencyEstimate?: string;
+  recurringLastPayment?: string;
+  recurringNextEstimatedPayment?: string;
+  recurringPaymentCount?: number;
   score?: number;
   stars?: number;
   tier: string;
@@ -237,6 +245,11 @@ const displayDateTime = (value?: string) => {
   if (!value) return "-";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "-" : date.toLocaleString();
+};
+const monthSpan = (start?: string, end = new Date()) => {
+  const date = start ? new Date(start) : null;
+  if (!date || Number.isNaN(date.getTime())) return 0;
+  return Math.max(0, (end.getFullYear() - date.getFullYear()) * 12 + end.getMonth() - date.getMonth() + 1);
 };
 const firstName = (name: string) => name.trim().split(/\s+/)[0] || name;
 const productNames = (order?: OrderHistoryItem, fallback: string[] = []) => {
@@ -599,6 +612,16 @@ export default function CustomerDetailPage() {
     return Array.from(byTransaction.values()).sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
   })();
   const latestGatewayPayment = gatewayHistoryRows[0];
+  const activeSubscriptionRows = subscriptions.filter((sub) => String(sub.status ?? "").toLowerCase() === "active");
+  const activeSubscriptionCount = activeSubscriptionRows.length + (customer.isGatewayRecurring ? 1 : 0);
+  const wooRecurringRevenue = activeSubscriptionRows.reduce((sum, sub) => sum + Number(sub.monthlyRecurringRevenue ?? sub.amount ?? 0), 0);
+  const recurringRevenue = wooRecurringRevenue + (customer.isGatewayRecurring ? Number(customer.recurringAmount ?? 0) : 0);
+  const nextRenewal = activeSubscriptionRows.map((sub) => String(sub.nextBillingDate ?? "")).filter(Boolean).sort()[0] || customer.recurringNextEstimatedPayment || "";
+  const lastRenewal = activeSubscriptionRows.map((sub) => String(sub.lastBillingDate ?? "")).filter(Boolean).sort().reverse()[0] || customer.recurringLastPayment || customer.lastPaidDate || "";
+  const subscriptionStart = activeSubscriptionRows.map((sub) => String(sub.startDate ?? "")).filter(Boolean).sort()[0] || customer.firstSignupDate || customer.firstOrderDate || "";
+  const subscriptionAgeMonths = monthSpan(subscriptionStart);
+  const estimatedYearlyValue = recurringRevenue * 12;
+  const renewalRisk = customer.riskLevel === "high" || customer.failedPayments > 1 ? "high" : customer.riskLevel === "medium" || customer.failedPayments > 0 ? "medium" : "low";
   const sourceCoverageRows = [
     ["WooCommerce customer orders stored", customer.sourceCoverage?.wooCommerceCustomerOrdersStored ?? wooCustomerOrdersStored],
     ["WooCommerceOrder records found", customer.sourceCoverage?.wooCommerceOrderRecordsFound ?? sourceCompare?.wooCommerceOrderRecordsCount ?? "-"],
@@ -667,6 +690,25 @@ export default function CustomerDetailPage() {
         <p className="font-semibold">Timeline not synced yet - run single customer sync</p>
         <p className="mt-1 text-sm text-amber-100/80">This customer has paid value and historical order count, but no saved WooCommerce order timeline on the selected record.</p>
       </div>}
+
+      <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+        <h2 className="text-xl font-semibold text-red-300">Subscription Intelligence</h2>
+        <div className="mt-3 grid gap-3 md:grid-cols-4">
+          {[
+            ["Active subscriptions", activeSubscriptionCount],
+            ["Recurring revenue", money(recurringRevenue)],
+            ["Payment frequency", customer.recurringFrequencyEstimate || activeSubscriptionRows[0]?.billingInterval || "-"],
+            ["Renewal risk", renewalRisk],
+            ["Subscription age", `${subscriptionAgeMonths} months`],
+            ["Next payment", displayDate(nextRenewal)],
+            ["Last payment", displayDate(lastRenewal)],
+            ["Estimated yearly value", money(estimatedYearlyValue)],
+          ].map(([label, value]) => <div key={label} className="rounded border border-zinc-700 bg-zinc-950 p-3">
+            <p className="text-xs font-semibold uppercase text-zinc-400">{label}</p>
+            <p className="mt-2 text-sm font-semibold text-zinc-100">{String(value)}</p>
+          </div>)}
+        </div>
+      </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
         <h2 className="text-xl font-semibold text-orange-300">Customer Profile</h2>
