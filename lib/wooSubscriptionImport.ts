@@ -16,8 +16,10 @@ function relatedOrderIds(subscription: WooCommerceSubscription) {
 }
 
 export function normalizeWooSubscription(subscription: WooCommerceSubscription, importedAt = new Date().toISOString()): Partial<WooCommerceSubscriptionDocument> {
+  const recurringTotal = parseMoney(subscription.total);
   return {
     wooSubscriptionId: Number(subscription.id),
+    subscriptionId: String(subscription.id),
     subscriptionNumber: String(subscription.number ?? subscription.id),
     status: (subscription.status ?? "unknown").trim().toLowerCase(),
     customerId: Number(subscription.customer_id ?? 0),
@@ -26,7 +28,8 @@ export function normalizeWooSubscription(subscription: WooCommerceSubscription, 
     normalizedEmail: normalizeEmail(subscription.billing?.email),
     customerPhone: subscription.billing?.phone ?? "",
     productNames: Array.from(new Set((subscription.line_items ?? []).map((item) => item.name ?? "").filter(Boolean))),
-    amount: parseMoney(subscription.total),
+    amount: recurringTotal,
+    recurringTotal,
     currency: subscription.currency ?? "",
     billingInterval: String(subscription.billing_interval ?? ""),
     billingPeriod: subscription.billing_period ?? "",

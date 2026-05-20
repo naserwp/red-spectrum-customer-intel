@@ -149,10 +149,21 @@ export interface CustomerDocument {
   phoneNormalized: string;
   totalPaid: number;
   paidTotal: number;
+  lifetimeValue: number;
+  rankingPaidTotal: number;
+  wooPaidTotal: number;
+  authorizeNetPaidTotal: number;
+  gatewayOnlyPaidTotal: number;
+  subscriptionPaidTotal: number;
   attemptedTotal: number;
   orderCount: number;
   paidOrderCount: number;
+  gatewayPaidCount: number;
   attemptedOrderCount: number;
+  paidMonths: number;
+  firstPaidDate: string;
+  subscriptionStartDate: string;
+  stayWithUsMonths: number;
   firstOrderDate: string;
   lastOrderDate: string;
   lastPaidDate: string;
@@ -436,10 +447,21 @@ const customerSchema = new Schema<CustomerDocument>(
     phoneNormalized: { type: String, default: "" },
     totalPaid: { type: Number, required: true },
     paidTotal: { type: Number, required: true, default: 0 },
+    lifetimeValue: { type: Number, default: 0, index: true },
+    rankingPaidTotal: { type: Number, default: 0, index: true },
+    wooPaidTotal: { type: Number, default: 0 },
+    authorizeNetPaidTotal: { type: Number, default: 0 },
+    gatewayOnlyPaidTotal: { type: Number, default: 0 },
+    subscriptionPaidTotal: { type: Number, default: 0 },
     attemptedTotal: { type: Number, required: true, default: 0 },
     orderCount: { type: Number, required: true },
     paidOrderCount: { type: Number, required: true, default: 0 },
+    gatewayPaidCount: { type: Number, default: 0 },
     attemptedOrderCount: { type: Number, required: true, default: 0 },
+    paidMonths: { type: Number, default: 0 },
+    firstPaidDate: { type: String, default: "" },
+    subscriptionStartDate: { type: String, default: "" },
+    stayWithUsMonths: { type: Number, default: 0 },
     firstOrderDate: { type: String, default: new Date(0).toISOString() },
     lastOrderDate: { type: String, required: true },
     lastPaidDate: { type: String, default: "" },
@@ -504,6 +526,11 @@ customerSchema.pre("validate", function () {
   this.phoneNormalized = this.phone?.replace(/\D/g, "") ?? "";
   if (this.paidTotal === undefined || this.paidTotal === null) this.paidTotal = this.totalPaid ?? 0;
   if (this.totalPaid === undefined || this.totalPaid === null) this.totalPaid = this.paidTotal ?? 0;
+  const paidValue = Math.max(this.lifetimeValue ?? 0, this.rankingPaidTotal ?? 0, this.paidTotal ?? 0, this.totalPaid ?? 0);
+  this.lifetimeValue = paidValue;
+  this.rankingPaidTotal = paidValue;
+  if (!this.firstPaidDate) this.firstPaidDate = this.lastPaidDate || this.firstOrderDate || "";
+  if (!this.paidMonths) this.paidMonths = this.paidOrderCount ?? 0;
   if (!this.score) this.score = calculateCustomerScore(this as unknown as CustomerDocument);
   if (!this.stars) this.stars = scoreToStars(this.score);
 });

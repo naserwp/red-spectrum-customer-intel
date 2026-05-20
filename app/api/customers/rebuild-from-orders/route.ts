@@ -1,11 +1,13 @@
 import { NextResponse } from "next/server";
 import { calculateCustomerScore, scoreToStars, type CustomerScoreInput } from "@/lib/customerScore";
+import { monthsSince } from "@/lib/customerValue";
 import { buildProductJourneySummary } from "@/lib/productClassification";
 import { countBy, normalizeText, orderHistoryItemFromStoredOrder, unique } from "@/lib/wooOrderImport";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { SyncJob } from "@/models/SyncJob";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
+import { WooCommerceSubscriptionRecord } from "@/models/WooCommerceSubscription";
 
 export const dynamic = "force-dynamic";
 const maxRebuildRuntimeMs = 8000;
@@ -119,6 +121,8 @@ function buildCustomer(group: OrderGroup, rebuildAt: string) {
   const latestPaid = paidOrders[0];
   const latestAttempt = attemptedOrders[0];
   const first = [...orders].sort((a, b) => new Date(a.dateCreated).getTime() - new Date(b.dateCreated).getTime())[0];
+  const firstPaid = [...paidOrders].sort((a, b) => new Date(a.dateCreated).getTime() - new Date(b.dateCreated).getTime())[0];
+  const paidMonths = new Set(paidOrders.map((order) => (order.paidDate || order.dateCreated).slice(0, 7)).filter(Boolean)).size;
   const email = group.keyType === "email" ? group.key : sortedStoredOrders.find((order) => order.normalizedEmail)?.normalizedEmail ?? fallbackEmail(group.keyType, group.key);
   const externalCustomerKey = externalKey(group.keyType, group.key);
   const failedPayments = orders.filter((order) => ["failed", "payment_pending", "crypto_pending"].includes(order.status)).length;
@@ -147,9 +151,20 @@ function buildCustomer(group: OrderGroup, rebuildAt: string) {
     paidTotal,
     attemptedTotal,
     totalPaid: paidTotal,
+    lifetimeValue: paidTotal,
+    rankingPaidTotal: paidTotal,
+    wooPaidTotal: paidTotal,
+    authorizeNetPaidTotal: 0,
+    gatewayOnlyPaidTotal: 0,
+    subscriptionPaidTotal: 0,
     orderCount: orders.length,
     paidOrderCount: paidOrders.length,
+    gatewayPaidCount: 0,
     attemptedOrderCount: attemptedOrders.length,
+    paidMonths: Math.max(paidMonths, paidOrders.length),
+    firstPaidDate: firstPaid?.dateCreated ?? "",
+    subscriptionStartDate: "",
+    stayWithUsMonths: monthsSince(firstPaid?.dateCreated ?? first?.dateCreated ?? ""),
     firstOrderDate: first?.dateCreated ?? rebuildAt,
     lastOrderDate: latest?.dateCreated ?? rebuildAt,
     lastPaidDate: latestPaid?.dateCreated ?? "",
@@ -286,6 +301,23 @@ export async function POST(request: Request) {
       break;
     }
     const customer = buildCustomer(group, rebuildAt);
+    const subscriptions = customer.normalizedEmail
+      ? await WooCommerceSubscriptionRecord.find({ normalizedEmail: customer.normalizedEmail }).lean<Array<{ status?: string; startDate?: string; relatedOrderIds?: number[] }>>().exec()
+      : [];
+    if (subscriptions.length) {
+      const activeSubscriptions = subscriptions.filter((subscription) => String(subscription.status ?? "").toLowerCase() === "active");
+      const subscriptionStartDate = subscriptions.map((subscription) => subscription.startDate).filter(Boolean).sort()[0] ?? "";
+      const relatedOrderIds = new Set(subscriptions.flatMap((subscription) => subscription.relatedOrderIds ?? []).map(String));
+      customer.activeSubscriptions = activeSubscriptions.length;
+      customer.subscriptionStatus = activeSubscriptions.length ? "active" : "inactive";
+      customer.subscriptionStartDate = subscriptionStartDate;
+      customer.firstPaidDate = [subscriptionStartDate, customer.firstPaidDate].filter(Boolean).sort()[0] ?? customer.firstPaidDate;
+      customer.stayWithUsMonths = monthsSince(customer.firstPaidDate || subscriptionStartDate || customer.firstOrderDate);
+      customer.subscriptionPaidTotal = group.orders.reduce((sum, order) => {
+        if (!order.isPaid) return sum;
+        return relatedOrderIds.has(String(order.wooOrderId)) || relatedOrderIds.has(String(order.orderNumber)) ? sum + Number(order.paidAmount ?? order.total ?? 0) : sum;
+      }, 0);
+    }
     const existing = await findExisting(customer);
     customersProcessed += 1;
     const existingOrderCount = existing?.orders?.length ?? existing?.orderCount ?? 0;

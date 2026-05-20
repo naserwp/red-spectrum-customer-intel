@@ -2,14 +2,15 @@
 
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
-import Image from "next/image";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AdminHeader } from "@/app/admin/_components/AdminHeader";
+import { AdminLayout } from "@/app/admin/_components/AdminLayout";
 
 type Customer = {
   _id: string; name: string; email: string; phone: string; totalPaid: number; paidTotal?: number; attemptedTotal?: number;
-  paidOrderCount?: number; attemptedOrderCount?: number; leadStatus?: string; paymentStatus?: string; lastPaidDate?: string; lastAttemptDate?: string;
+  lifetimeValue?: number; rankingPaidTotal?: number; paidOrderCount?: number; gatewayPaidCount?: number; attemptedOrderCount?: number; paidMonths?: number;
+  firstPaidDate?: string; subscriptionStartDate?: string; stayWithUsMonths?: number; leadStatus?: string; paymentStatus?: string; lastPaidDate?: string; lastAttemptDate?: string;
   activeSubscriptions: number; failedPayments: number; chargebacks: number; estimatedCreditLimit: number; tier: string; riskLevel: string;
   score: number; stars: number; aiSummaryPreview: string; aiSummary: string; subscriptionStatus: string; orderCount: number; averageOrderValue: number;
   firstOrderDate: string; lastOrderDate: string; refunds: number; riskExplanation: string; recommendedAction: string;
@@ -145,7 +146,7 @@ const rebuildBatchSize = 50;
 const slowRequestMessage = "This request is taking longer than expected. Try again or narrow the search.";
 const highValueThreshold = 2000;
 const money = (n: number) => `$${n.toFixed(2)}`;
-const paidAmount = (c: Customer) => Number(c.paidTotal ?? c.totalPaid ?? 0);
+const paidAmount = (c: Customer) => Number(c.lifetimeValue ?? c.rankingPaidTotal ?? c.paidTotal ?? c.totalPaid ?? 0);
 const attemptedAmount = (c: Customer) => Number(c.attemptedTotal ?? 0);
 const customerDetailHref = (c: Customer) => `/admin/customers/${encodeURIComponent(c.email || c._id)}`;
 const displayStatus = (value?: string) => value ? value.replaceAll("_", " ") : "-";
@@ -166,6 +167,9 @@ const monthSpan = (start?: string) => {
   const now = new Date();
   return Math.max(0, (now.getFullYear() - startDate.getFullYear()) * 12 + now.getMonth() - startDate.getMonth() + 1);
 };
+const customerStartDate = (c: Customer) => c.firstPaidDate || c.subscriptionStartDate || c.firstOrderDate;
+const customerPaidMonths = (c: Customer) => Number(c.paidMonths ?? c.paidOrderCount ?? 0);
+const customerStayMonths = (c: Customer) => Number(c.stayWithUsMonths ?? monthSpan(customerStartDate(c)));
 
 const gatewayProviderLabel: Record<string, string> = {
   all: "All",
@@ -270,8 +274,8 @@ function CustomerTable({ rows, exportCustomerPdf }: { rows: Customer[]; exportCu
           <td className="px-3 py-3">{money(attemptedAmount(c))}</td>
           <td className="px-3 py-3">{c.paidOrderCount ?? 0}</td>
           <td className="px-3 py-3">{c.attemptedOrderCount ?? 0}</td>
-          <td className="px-3 py-3">{displayDate(c.firstOrderDate)}</td>
-          <td className="px-3 py-3">{monthSpan(c.firstOrderDate)} mo</td>
+          <td className="px-3 py-3">{displayDate(customerStartDate(c))}</td>
+          <td className="px-3 py-3">{customerStayMonths(c)} mo</td>
           <td className="px-3 py-3">{displayStatus(c.paymentStatus)}</td>
           <td className="px-3 py-3">{displayStatus(c.leadStatus)}</td>
           <td className="px-3 py-3">{displayDate(c.lastPaidDate)}</td>
@@ -355,9 +359,9 @@ function ValueIndex({ rows, rankOffset = 0 }: { rows: Customer[]; rankOffset?: n
           <td className="px-3 py-3 font-semibold">#{rankOffset + index + 1}</td>
           <td className="px-3 py-3"><p className="font-semibold">{c.name}</p><p className="text-xs text-zinc-400">{c.email}</p></td>
           <td className="px-3 py-3 font-semibold">{money(paidAmount(c))}</td>
-          <td className="px-3 py-3">{displayDate(c.firstOrderDate)}</td>
-          <td className="px-3 py-3">{c.paidOrderCount ?? 0}</td>
-          <td className="px-3 py-3">{monthSpan(c.firstOrderDate)} months</td>
+          <td className="px-3 py-3">{displayDate(customerStartDate(c))}</td>
+          <td className="px-3 py-3">{customerPaidMonths(c)}</td>
+          <td className="px-3 py-3">{customerStayMonths(c)} months</td>
           <td className="px-3 py-3">{displayDate(c.lastPaidDate || c.lastOrderDate)}</td>
           <td className="px-3 py-3">{money(attemptedAmount(c))}</td>
           <td className="px-3 py-3"><span className={`inline-flex rounded border px-2 py-1 text-xs ${badgeClass[cat]}`}>{categoryLabel[cat]}</span></td>
@@ -567,7 +571,6 @@ function GatewayAnalyticsView({
 }
 
 export default function AdminPage() {
-  const router = useRouter();
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [summary, setSummary] = useState<Record<string, unknown>>({});
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
@@ -905,11 +908,6 @@ export default function AdminPage() {
     await loadActiveTab(tab, { page: 1, query: appliedSearch });
   };
 
-  const logout = async () => {
-    await fetch("/api/auth/logout", { method: "POST" });
-    router.replace("/login");
-  };
-
   const runOrderBackfill = async (dryRun: boolean) => {
     setError("");
     setMessage(dryRun ? "Testing WooCommerce order import..." : "Importing WooCommerce orders...");
@@ -1094,7 +1092,7 @@ export default function AdminPage() {
         ["Last Attempt Date", displayDate(c.lastAttemptDate)],
         ["Subscription Status", c.subscriptionStatus || "unknown"],
         ["Customer Lifetime Value", money(paidAmount(c))],
-        ["Tenure", `${monthSpan(c.firstOrderDate)} months`],
+        ["Tenure", `${customerStayMonths(c)} months`],
       ],
     });
     doc.save(`customer-${c.email}.pdf`);
@@ -1103,7 +1101,6 @@ export default function AdminPage() {
   const customerStart = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const customerEnd = Math.min(total, page * pageSize);
   const customerMaxPage = Math.max(1, Math.ceil(total / pageSize));
-  const highValueRows = useMemo(() => customers.filter((c) => paidAmount(c) >= highValueThreshold).sort((a, b) => paidAmount(b) - paidAmount(a)), [customers]);
   const hotLeadFailedThisMonth = useMemo(() => {
     const now = new Date();
     return hotLeadRows.filter((row) => {
@@ -1112,7 +1109,6 @@ export default function AdminPage() {
     }).reduce((sum, row) => sum + Number(row.attemptedOrderCount ?? 0), 0);
   }, [hotLeadRows]);
   const riskDisplayRows = riskRows.length ? riskRows : customers.filter((c) => c.riskLevel === "high" || c.failedPayments > 0 || c.chargebacks > 0);
-  const highValuePage = usePagedRows(highValueRows, pageSize);
   const hotLeadPage = usePagedRows(hotLeadRows, pageSize);
   const riskPage = usePagedRows(riskDisplayRows, pageSize);
   const subPage = usePagedRows(subscriptions, pageSize);
@@ -1120,25 +1116,13 @@ export default function AdminPage() {
   const upcomingPage = usePagedRows(upcomingBills, pageSize);
   const salesPage = usePagedRows(salesHistory, pageSize);
 
-  return <main className="min-h-screen bg-[radial-gradient(circle_at_top,#22070b_0,#09090b_34%,#000_100%)] p-4 text-base text-zinc-100 md:p-8">
-    <div className="mx-auto max-w-7xl space-y-5">
-      <header className="rounded-2xl border border-red-950/60 bg-zinc-950/90 p-5 shadow-xl shadow-black/30">
-        <div className="flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-4">
-            <Image src="/Images/the-red-spectrum-full-logo-1.svg" alt="Red Spectrum" width={180} height={48} className="h-12 w-auto" style={{ width: "auto", height: "auto" }} priority />
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.22em] text-red-400">Red Spectrum</p>
-              <h1 className="mt-2 text-3xl font-bold text-white md:text-4xl">Customer Intelligence</h1>
-              <p className="mt-1 text-sm text-zinc-400">Paid revenue, subscription status, checkout pipeline, and customer risk.</p>
-              <p className="mt-2 text-xs text-zinc-500">{syncStatus?.lastSyncAt ? `Last synced: ${displayDateTime(syncStatus.lastSyncAt)}` : syncStatus?.dataFreshness || "Data sync needed"}</p>
-            </div>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <button onClick={() => handleTabChange("Sync Center")} className="rounded-lg bg-red-600 px-5 py-3 font-semibold text-white shadow-lg shadow-red-950/30 transition hover:bg-red-500">Sync Center</button>
-            <button onClick={logout} className="rounded-lg border border-zinc-700 bg-zinc-900 px-5 py-3 font-semibold text-zinc-200 transition hover:border-red-800 hover:bg-zinc-800">Logout</button>
-          </div>
-        </div>
-      </header>
+  return <AdminLayout header={<AdminHeader
+    title="Customer Intelligence"
+    description="Paid revenue, subscription status, checkout pipeline, and customer risk."
+    meta={syncStatus?.lastSyncAt ? `Last synced: ${displayDateTime(syncStatus.lastSyncAt)}` : syncStatus?.dataFreshness || "Data sync needed"}
+    showDashboardActions
+    onOpenSyncCenter={() => handleTabChange("Sync Center")}
+  />}>
       <nav className="sticky top-0 z-10 flex gap-2 overflow-auto rounded-xl border border-red-950/40 bg-zinc-950/95 p-3 shadow-lg shadow-black/30 backdrop-blur">{tabs.map((t) => <button key={t} onClick={() => handleTabChange(t)} className={`whitespace-nowrap rounded-lg px-4 py-2 text-sm font-semibold transition ${tab === t ? "bg-red-600 text-white shadow-lg shadow-red-950/50 ring-1 ring-red-400/30" : "border border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-red-900 hover:bg-zinc-800 hover:text-white"}`}>{t}</button>)}</nav>
       <div className="flex flex-wrap items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-950/80 p-3">
         <input value={search} onChange={(e) => handleSearchChange(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") handleApplySearch(); }} className="min-w-64 rounded bg-zinc-950 px-3 py-2 text-sm outline-none ring-1 ring-zinc-800" placeholder="Search customers by name, email, phone" />
@@ -1173,7 +1157,7 @@ export default function AdminPage() {
       {tab === "Customers" && <><CustomerTable rows={customers} exportCustomerPdf={exportCustomerPdf} /><Pager start={customerStart} end={customerEnd} total={total} page={page} maxPage={customerMaxPage} setPage={loadCustomers} /></>}
 
       {tab === "Subscriptions" && <>
-        <section className="grid gap-3 sm:grid-cols-3"><Card label="Total Subscriptions" value={Number(summary.totalSubscriptions ?? 0)} helper="Excludes placeholders and candidates" /><Card label="MRR" value={money(Number(summary.monthlyRecurringRevenue ?? 0))} helper="Active real subscriptions only" /><Card label="Subscription Candidates" value={Number(summary.subscriptionCandidates ?? 0)} helper="Recurring-like WooCommerce orders, not active subscriptions" /></section>
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"><Card label="Total Subscriptions" value={Number(summary.totalSubscriptions ?? 0)} helper="All imported WooCommerce subscriptions" /><Card label="Active Subscriptions" value={Number(summary.activeSubscriptions ?? 0)} helper="WooCommerce status active" /><Card label="MRR" value={money(Number(summary.monthlyRecurringRevenue ?? 0))} helper="Active real subscriptions only" /><Card label="Subscription Candidates" value={Number(summary.subscriptionCandidates ?? 0)} helper="Recurring-like WooCommerce orders, not active subscriptions" /></section>
         <h2 className="text-xl font-semibold text-zinc-100">Active Subscriptions</h2><SubscriptionTable rows={subPage.rows} /><Pager {...subPage} />
         <div>
           <h2 className="text-xl font-semibold text-zinc-100">Subscription Candidates</h2>
@@ -1196,7 +1180,7 @@ export default function AdminPage() {
         </section>
       </>}
 
-      {tab === "High Value" && <><Card label="High Value Paid Customers" value={Number(summary.highValueCustomers ?? 0)} helper="Unpaid leads excluded" /><ValueIndex rows={highValuePage.rows} /><Pager {...highValuePage} /></>}
+      {tab === "High Value" && <><Card label="High Value Paid Customers" value={Number(summary.highValueCustomers ?? 0)} helper="Unpaid leads excluded" /><ValueIndex rows={customers} rankOffset={(page - 1) * pageSize} /><Pager start={customerStart} end={customerEnd} total={total} page={page} maxPage={customerMaxPage} setPage={loadCustomers} /></>}
 
       {tab === "Hot Leads" && <>
         <section className="grid gap-3 sm:grid-cols-3"><Card label="Hot Checkout Leads" value={hotLeadRows.length} helper="Unpaid checkout/payment attempts and newer failed attempts after last paid order" /><Card label="Attempted Pipeline" value={money(hotLeadRows.reduce((sum, row) => sum + attemptedAmount(row), 0))} /><Card label="Failed/Pending Attempts This Month" value={hotLeadFailedThisMonth} /></section>
@@ -1252,6 +1236,5 @@ export default function AdminPage() {
         </div>
         {syncResult?.failedRequests?.length ? <p className="rounded border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-100">Failed requests: {syncResult.failedRequests.length}</p> : null}
       </section>}
-    </div>
-  </main>;
+  </AdminLayout>;
 }

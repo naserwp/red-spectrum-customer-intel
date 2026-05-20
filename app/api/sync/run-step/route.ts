@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { isAuthorizeNetConfigured, fetchSettledBatchIds, fetchTransactionDetails, fetchTransactionIdsForBatch, fetchUnsettledTransactionIds, normalizeAuthorizeNetTransaction } from "@/lib/authorizeNet";
 import { reconcileAuthorizeNetTransaction } from "@/lib/authorizeNetReconciliation";
 import { calculateCustomerScore, scoreToStars, type CustomerScoreInput } from "@/lib/customerScore";
+import { monthsSince } from "@/lib/customerValue";
 import { buildProductJourneySummary } from "@/lib/productClassification";
 import { connectToDatabase } from "@/lib/mongodb";
 import { fetchWooCommerceOrders, fetchWooCommerceSubscriptions, isWooCommerceConfigured, wooCommerceOrderStatuses, wooCommerceSubscriptionStatuses } from "@/lib/woocommerce";
@@ -64,6 +65,8 @@ function buildCustomerFromOrders(key: string, orders: WooCommerceOrderDocument[]
   const latestPaid = paidOrders[0];
   const latestAttempt = attemptedOrders[0];
   const first = [...history].sort((a, b) => new Date(a.dateCreated).getTime() - new Date(b.dateCreated).getTime())[0];
+  const firstPaid = [...paidOrders].sort((a, b) => new Date(a.dateCreated).getTime() - new Date(b.dateCreated).getTime())[0];
+  const paidMonths = new Set(paidOrders.map((order) => (order.paidDate || order.dateCreated).slice(0, 7)).filter(Boolean)).size;
   const email = sorted.find((order) => order.normalizedEmail)?.normalizedEmail || fallbackEmail(key);
   const failedPayments = history.filter((order) => ["failed", "payment_pending", "crypto_pending"].includes(order.status)).length;
   const refunds = history.reduce((sum, order) => sum + order.refundsCount, 0);
@@ -88,10 +91,21 @@ function buildCustomerFromOrders(key: string, orders: WooCommerceOrderDocument[]
     phone: latest?.billingPhone || "",
     paidTotal,
     totalPaid: paidTotal,
+    lifetimeValue: paidTotal,
+    rankingPaidTotal: paidTotal,
+    wooPaidTotal: paidTotal,
+    authorizeNetPaidTotal: 0,
+    gatewayOnlyPaidTotal: 0,
+    subscriptionPaidTotal: 0,
     attemptedTotal,
     orderCount: history.length,
     paidOrderCount: paidOrders.length,
+    gatewayPaidCount: 0,
     attemptedOrderCount: attemptedOrders.length,
+    paidMonths: Math.max(paidMonths, paidOrders.length),
+    firstPaidDate: firstPaid?.dateCreated ?? "",
+    subscriptionStartDate: "",
+    stayWithUsMonths: monthsSince(firstPaid?.dateCreated ?? first?.dateCreated ?? ""),
     firstOrderDate: first?.dateCreated ?? rebuildAt,
     lastOrderDate: latest?.dateCreated ?? rebuildAt,
     lastPaidDate: latestPaid?.dateCreated ?? "",
@@ -179,6 +193,24 @@ async function rebuildCustomerStep(cursor: SyncCursor) {
     const orders = await WooCommerceOrderRecord.find({ _id: { $in: group.ids } }).sort({ dateCreated: -1 }).lean<WooCommerceOrderDocument[]>();
     if (!orders.length) continue;
     const customer = buildCustomerFromOrders(group._id, orders, rebuildAt);
+    const subscriptions = customer.normalizedEmail
+      ? await WooCommerceSubscriptionRecord.find({ normalizedEmail: customer.normalizedEmail }).lean<Array<{ status?: string; startDate?: string; lastPaymentDate?: string; relatedOrderIds?: number[]; amount?: number }>>()
+      : [];
+    const activeSubscriptions = subscriptions.filter((subscription) => String(subscription.status ?? "").toLowerCase() === "active");
+    const subscriptionStartDate = subscriptions.map((subscription) => subscription.startDate).filter(Boolean).sort()[0] ?? "";
+    const relatedOrderIds = new Set(subscriptions.flatMap((subscription) => subscription.relatedOrderIds ?? []).map(String));
+    const subscriptionPaidTotal = orders.reduce((sum, order) => {
+      if (!order.isPaid) return sum;
+      return relatedOrderIds.has(String(order.wooOrderId)) || relatedOrderIds.has(String(order.orderNumber)) ? sum + Number(order.paidAmount ?? order.total ?? 0) : sum;
+    }, 0);
+    if (subscriptions.length) {
+      customer.activeSubscriptions = activeSubscriptions.length;
+      customer.subscriptionStatus = activeSubscriptions.length ? "active" : "inactive";
+      customer.subscriptionStartDate = subscriptionStartDate;
+      customer.firstPaidDate = [subscriptionStartDate, customer.firstPaidDate].filter(Boolean).sort()[0] ?? customer.firstPaidDate;
+      customer.stayWithUsMonths = monthsSince(customer.firstPaidDate || subscriptionStartDate || customer.firstOrderDate);
+      customer.subscriptionPaidTotal = subscriptionPaidTotal;
+    }
     const existing = await Customer.findOne({ $or: [{ normalizedEmail: customer.normalizedEmail }, { email: customer.normalizedEmail }, { externalCustomerKey: customer.externalCustomerKey }] }, { orderCount: 1 }).lean<{ orderCount?: number } | null>();
     if ((existing?.orderCount ?? 0) > customer.orderCount) continue;
     await Customer.findOneAndUpdate(

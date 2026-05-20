@@ -2,6 +2,7 @@ import mongoose, { Schema } from "mongoose";
 
 export interface WooCommerceSubscriptionDocument {
   wooSubscriptionId: number;
+  subscriptionId: string;
   subscriptionNumber: string;
   status: string;
   customerId: number;
@@ -11,6 +12,7 @@ export interface WooCommerceSubscriptionDocument {
   customerPhone: string;
   productNames: string[];
   amount: number;
+  recurringTotal: number;
   currency: string;
   billingInterval: string;
   billingPeriod: string;
@@ -28,6 +30,7 @@ export interface WooCommerceSubscriptionDocument {
 const wooCommerceSubscriptionSchema = new Schema<WooCommerceSubscriptionDocument>(
   {
     wooSubscriptionId: { type: Number, required: true, unique: true, index: true },
+    subscriptionId: { type: String, default: "", index: true },
     subscriptionNumber: { type: String, default: "" },
     status: { type: String, default: "", index: true },
     customerId: { type: Number, default: 0, index: true },
@@ -37,6 +40,7 @@ const wooCommerceSubscriptionSchema = new Schema<WooCommerceSubscriptionDocument
     customerPhone: { type: String, default: "" },
     productNames: { type: [String], default: [] },
     amount: { type: Number, default: 0 },
+    recurringTotal: { type: Number, default: 0 },
     currency: { type: String, default: "" },
     billingInterval: { type: String, default: "" },
     billingPeriod: { type: String, default: "" },

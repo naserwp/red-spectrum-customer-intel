@@ -18,8 +18,13 @@ export async function GET(request: Request) {
   const dashboard = searchParams.get("dashboard") === "1";
   if (dashboard) {
     return cachedJson(`subscriptions-dashboard:${page}:${limit}:${search}`, async () => {
-      const [total, records, candidateRows] = await Promise.all([
+      const [total, activeSubscriptions, activeMrr, records, candidateRows] = await Promise.all([
         WooCommerceSubscriptionRecord.countDocuments({}),
+        WooCommerceSubscriptionRecord.countDocuments({ status: "active" }),
+        WooCommerceSubscriptionRecord.aggregate<{ _id: null; mrr: number }>([
+          { $match: { status: "active" } },
+          { $group: { _id: null, mrr: { $sum: { $ifNull: ["$recurringTotal", "$amount"] } } } },
+        ]),
         WooCommerceSubscriptionRecord.find(search ? { $or: [{ customerName: { $regex: search, $options: "i" } }, { customerEmail: { $regex: search, $options: "i" } }, { subscriptionNumber: { $regex: search, $options: "i" } }] } : {}).sort({ nextPaymentDate: 1 }).skip((page - 1) * limit).limit(limit).lean<LeanWooSubscription[]>(),
         Subscription.find({ isPlaceholder: { $ne: true }, recordType: "subscription_candidate" }).sort({ nextBillingDate: 1 }).limit(limit).lean(),
       ]);
@@ -32,8 +37,8 @@ export async function GET(request: Request) {
         customerName: record.customerName,
         customerPhone: record.customerPhone,
         status: record.status,
-        amount: record.amount,
-        monthlyRecurringRevenue: record.status === "active" ? record.amount : 0,
+        amount: record.recurringTotal || record.amount,
+        monthlyRecurringRevenue: record.status === "active" ? (record.recurringTotal || record.amount) : 0,
         billingInterval: [record.billingInterval, record.billingPeriod].filter(Boolean).join(" "),
         nextBillingDate: record.nextPaymentDate,
         lastBillingDate: record.lastPaymentDate,
@@ -51,8 +56,8 @@ export async function GET(request: Request) {
         candidateRows,
         summary: {
           totalSubscriptions: total,
-          activeSubscriptions: records.filter((record) => record.status === "active").length,
-          monthlyRecurringRevenue: records.filter((record) => record.status === "active").reduce((sum, record) => sum + Number(record.amount ?? 0), 0),
+          activeSubscriptions,
+          monthlyRecurringRevenue: Number(activeMrr[0]?.mrr ?? 0),
           subscriptionCandidates: candidateRows.length,
         },
       };
@@ -78,8 +83,8 @@ export async function GET(request: Request) {
       customerName: record.customerName,
       customerPhone: record.customerPhone,
       status: record.status,
-      amount: record.amount,
-      monthlyRecurringRevenue: record.status === "active" ? record.amount : 0,
+      amount: record.recurringTotal || record.amount,
+      monthlyRecurringRevenue: record.status === "active" ? (record.recurringTotal || record.amount) : 0,
       billingInterval: [record.billingInterval, record.billingPeriod].filter(Boolean).join(" "),
       nextBillingDate: record.nextPaymentDate,
       lastBillingDate: record.lastPaymentDate,

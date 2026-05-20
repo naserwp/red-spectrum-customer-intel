@@ -1,10 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import Image from "next/image";
 import { useParams } from "next/navigation";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AdminHeader } from "@/app/admin/_components/AdminHeader";
+import { AdminLayout, AdminLoadingState } from "@/app/admin/_components/AdminLayout";
 
 type OrderLineItem = {
   productId: number;
@@ -332,40 +333,26 @@ function buildTemplates(customer: CustomerDetail, actualPaid: number, attempted:
   };
 }
 
-function DetailShell({ children }: { children: ReactNode }) {
-  return <main className="min-h-screen bg-black p-4 text-base text-zinc-100 md:p-8">
-    <div className="mx-auto max-w-6xl space-y-5">
-      <header className="flex flex-col gap-3 border-b border-zinc-900 pb-4 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex items-center gap-4">
-          <Image src="/Images/the-red-spectrum-full-logo-1.svg" alt="Red Spectrum" width={180} height={48} className="h-12 w-auto" style={{ width: "auto", height: "auto" }} priority />
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-wide text-red-400">Red Spectrum Customer Intelligence</p>
-            <h1 className="mt-1 text-2xl font-bold text-zinc-100 md:text-3xl">Customer Details</h1>
-          </div>
-        </div>
-        <Link href="/admin?tab=customers" className="w-fit rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-semibold text-zinc-100 hover:border-red-500/60 hover:bg-zinc-800">
-          Back to Customer List
-        </Link>
-      </header>
-      {children}
-    </div>
-  </main>;
+function BackToCustomersLink() {
+  return <Link href="/admin?tab=customers" className="w-fit rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-semibold text-zinc-100 transition hover:border-red-500/60 hover:bg-zinc-800">
+    Back to Customer List
+  </Link>;
+}
+
+function DetailShell({ children, title = "Customer Details", description, actions }: { children: ReactNode; title?: string; description?: string; actions?: ReactNode }) {
+  return <AdminLayout maxWidthClass="max-w-6xl" header={<AdminHeader
+    eyebrow="Red Spectrum Customer Intelligence"
+    title={title}
+    description={description}
+    actions={actions ?? <BackToCustomersLink />}
+  />}>
+    {children}
+  </AdminLayout>;
 }
 
 function CustomerLoadingState() {
   return <DetailShell>
-    <section className="flex min-h-[420px] items-center justify-center rounded-xl border border-zinc-800 bg-zinc-950/80 p-6">
-      <div className="w-full max-w-xl text-center">
-        <div className="mx-auto h-12 w-12 animate-spin rounded-full border-2 border-zinc-700 border-t-red-500" />
-        <h2 className="mt-5 text-xl font-semibold text-zinc-100">Loading customer details...</h2>
-        <p className="mt-2 text-sm text-zinc-400">Fetching customer profile, payment history, and order timeline...</p>
-        <div className="mx-auto mt-6 max-w-md space-y-3">
-          <div className="h-4 animate-pulse rounded bg-zinc-800" />
-          <div className="h-4 animate-pulse rounded bg-zinc-800/80" />
-          <div className="h-4 w-2/3 animate-pulse rounded bg-zinc-800/60" />
-        </div>
-      </div>
-    </section>
+    <AdminLoadingState title="Loading customer details..." subtext="Fetching customer profile, payment history, and order timeline..." />
   </DetailShell>;
 }
 
@@ -649,22 +636,15 @@ export default function CustomerDetailPage() {
         detail: "Suggest upsell or cross-sell based on purchased products and use renewal/retention flow if an active subscription exists.",
       };
 
-  return <main className="min-h-screen bg-black p-4 text-base text-zinc-100 md:p-8">
-    <div className="mx-auto max-w-6xl space-y-5">
-      <header className="flex flex-col gap-3 border-b border-zinc-900 pb-4 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex items-center gap-4">
-          <Image src="/Images/the-red-spectrum-full-logo-1.svg" alt="Red Spectrum" width={180} height={48} className="h-12 w-auto" style={{ width: "auto", height: "auto" }} priority />
-          <div>
-            <h1 className="text-3xl font-bold text-red-400">{customer.name}</h1>
-            <p className="text-zinc-400">{customer.email} - {customer.phone || "N/A"}</p>
-          </div>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <button onClick={backToCustomerList} className="w-fit rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-semibold text-zinc-100 hover:border-red-500/60 hover:bg-zinc-800">Back to Customer List</button>
-          <button onClick={downloadPdf} className="w-fit rounded border border-orange-500/50 bg-orange-600/20 px-4 py-2 text-sm font-semibold text-orange-100 hover:bg-orange-600/30">Download Customer PDF</button>
-          <button onClick={repairGatewayPayments} className="w-fit rounded bg-red-700 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600">Repair Gateway Payments</button>
-        </div>
-      </header>
+  return <DetailShell
+    title={customer.name}
+    description={`${customer.email} - ${customer.phone || "N/A"}`}
+    actions={<>
+      <button onClick={backToCustomerList} className="w-fit rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-semibold text-zinc-100 transition hover:border-red-500/60 hover:bg-zinc-800">Back to Customer List</button>
+      <button onClick={downloadPdf} className="w-fit rounded border border-orange-500/50 bg-orange-600/20 px-4 py-2 text-sm font-semibold text-orange-100 transition hover:bg-orange-600/30">Download Customer PDF</button>
+      <button onClick={repairGatewayPayments} className="w-fit rounded bg-red-700 px-4 py-2 text-sm font-semibold text-white transition hover:bg-red-600">Repair Gateway Payments</button>
+    </>}
+  >
 
       <section className="grid gap-3 md:grid-cols-4">
         {[
@@ -880,6 +860,5 @@ export default function CustomerDetailPage() {
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4"><h2 className="font-semibold text-red-300">Internal Review</h2><input className="mt-2 w-full rounded bg-zinc-800 p-2" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="tags, separated, by commas" /><textarea className="mt-2 h-32 w-full rounded bg-zinc-800 p-2" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Internal notes" /><button className="mt-2 rounded bg-red-700 px-4 py-2" onClick={save}>Save Notes</button>{message && <p className="mt-2 text-emerald-300">{message}</p>}</section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4"><h2 className="font-semibold text-amber-300">Subscriptions and Candidates</h2><div className="mt-2 space-y-2">{subscriptions.length === 0 ? <p className="text-zinc-400">No linked subscription or recurring product candidate records.</p> : subscriptions.map((sub) => <div key={String(sub.subscriptionId)} className="rounded border border-zinc-700 p-2 text-sm"><p className="font-semibold">{String(sub.source)} - {String(sub.subscriptionId)}</p><p>Status: {String(sub.status)} | Amount: {String(sub.amount)} | Next Bill: {String(sub.nextBillingDate || "N/A")}</p></div>)}</div></section>
-    </div>
-  </main>;
+  </DetailShell>;
 }

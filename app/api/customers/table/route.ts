@@ -13,9 +13,20 @@ const customerProjection = {
   phoneNormalized: 1,
   totalPaid: 1,
   paidTotal: 1,
+  lifetimeValue: 1,
+  rankingPaidTotal: 1,
+  wooPaidTotal: 1,
+  authorizeNetPaidTotal: 1,
+  gatewayOnlyPaidTotal: 1,
+  subscriptionPaidTotal: 1,
   attemptedTotal: 1,
   paidOrderCount: 1,
+  gatewayPaidCount: 1,
   attemptedOrderCount: 1,
+  paidMonths: 1,
+  firstPaidDate: 1,
+  subscriptionStartDate: 1,
+  stayWithUsMonths: 1,
   leadStatus: 1,
   paymentStatus: 1,
   lastPaidDate: 1,
@@ -192,7 +203,7 @@ export async function GET(request: Request) {
     }
   }
   const query: Record<string, unknown> = and.length ? { $and: and } : {};
-  const sort: Record<string, 1 | -1> = { paidTotal: -1, attemptedTotal: -1 };
+  const sort: Record<string, 1 | -1> = { lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1, attemptedTotal: -1 };
   const queryPromise = (async () => {
     const rowsPromise = Customer.find(query, customerProjection).sort(sort).skip((page - 1) * limit).limit(limit).maxTimeMS(7500).lean();
     if (q) {

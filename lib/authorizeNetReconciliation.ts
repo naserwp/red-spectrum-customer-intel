@@ -1,4 +1,5 @@
 import { isDeclinedOrFailed, isSettledSuccessful } from "@/lib/authorizeNet";
+import { monthsSince } from "@/lib/customerValue";
 import { normalizePhone } from "@/lib/wooOrderImport";
 import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer, type CustomerDocument, type CustomerGatewayPayment, type CustomerOrderHistoryItem, type CustomerProductJourneyItem } from "@/models/Customer";
@@ -238,7 +239,10 @@ export function buildReconciledCustomerUpdate(customer: LeanCustomer, transactio
   const paidIncrement = countedNewPaid ? transaction.amount : 0;
   const paidTotal = Number(customer.paidTotal ?? customer.totalPaid ?? 0) + paidIncrement;
   const paidOrderCount = Number(customer.paidOrderCount ?? 0) + (countedNewPaid ? 1 : 0);
+  const gatewayPaidCount = Number(customer.gatewayPaidCount ?? 0) + (countedNewPaid && source === "authorize_net_only" ? 1 : 0);
   const lastPaidDate = settled && transactionDate(transaction) > (customer.lastPaidDate ?? "") ? transactionDate(transaction) : customer.lastPaidDate;
+  const firstPaidDate = customer.firstPaidDate || customer.firstOrderDate || (settled ? transactionDate(transaction) : "");
+  const paidMonths = Math.max(Number(customer.paidMonths ?? 0), new Set(orders.filter((order) => order.isPaid).map((order) => (order.paidDate || order.dateCreated).slice(0, 7)).filter(Boolean)).size);
   const gatewayOnlyPaymentsAttached = orders.filter((order) => order.source === "authorize_net_only").length;
   const authorizeNetTransactionsFound = gatewayPayments.filter((payment) => payment.provider === "authorize_net").length;
   const sourceCoverage = {
@@ -260,7 +264,15 @@ export function buildReconciledCustomerUpdate(customer: LeanCustomer, transactio
       paidProducts,
       paidTotal,
       totalPaid: paidTotal,
+      lifetimeValue: paidTotal,
+      rankingPaidTotal: paidTotal,
+      authorizeNetPaidTotal: Number(customer.authorizeNetPaidTotal ?? 0) + (countedNewPaid && source !== "authorize_net_only" ? transaction.amount : 0),
+      gatewayOnlyPaidTotal: Number(customer.gatewayOnlyPaidTotal ?? 0) + (countedNewPaid && source === "authorize_net_only" ? transaction.amount : 0),
+      gatewayPaidCount,
       paidOrderCount,
+      paidMonths,
+      firstPaidDate,
+      stayWithUsMonths: monthsSince(firstPaidDate),
       orderCount: orders.length,
       lastPaidDate,
       lastOrderDate: orders[0]?.dateCreated ?? customer.lastOrderDate,
