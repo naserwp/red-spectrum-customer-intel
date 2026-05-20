@@ -1,5 +1,6 @@
 import { isDeclinedOrFailed, isSettledSuccessful } from "@/lib/authorizeNet";
 import { monthsSince } from "@/lib/customerValue";
+import { customerLedgerRecords, detectAuthorizeNetRecurring } from "@/lib/revenueAnalytics";
 import { normalizePhone } from "@/lib/wooOrderImport";
 import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer, type CustomerDocument, type CustomerGatewayPayment, type CustomerOrderHistoryItem, type CustomerProductJourneyItem } from "@/models/Customer";
@@ -245,6 +246,7 @@ export function buildReconciledCustomerUpdate(customer: LeanCustomer, transactio
   const paidMonths = Math.max(Number(customer.paidMonths ?? 0), new Set(orders.filter((order) => order.isPaid).map((order) => (order.paidDate || order.dateCreated).slice(0, 7)).filter(Boolean)).size);
   const gatewayOnlyPaymentsAttached = orders.filter((order) => order.source === "authorize_net_only").length;
   const authorizeNetTransactionsFound = gatewayPayments.filter((payment) => payment.provider === "authorize_net").length;
+  const recurring = detectAuthorizeNetRecurring(customerLedgerRecords({ ...customer, orders, gatewayPayments }));
   const sourceCoverage = {
     ...(customer.sourceCoverage ?? {}),
     ordersStored: orders.length,
@@ -268,6 +270,13 @@ export function buildReconciledCustomerUpdate(customer: LeanCustomer, transactio
       rankingPaidTotal: paidTotal,
       authorizeNetPaidTotal: Number(customer.authorizeNetPaidTotal ?? 0) + (countedNewPaid && source !== "authorize_net_only" ? transaction.amount : 0),
       gatewayOnlyPaidTotal: Number(customer.gatewayOnlyPaidTotal ?? 0) + (countedNewPaid && source === "authorize_net_only" ? transaction.amount : 0),
+      isGatewayRecurring: recurring.isGatewayRecurring,
+      recurringSource: recurring.recurringSource,
+      recurringAmount: recurring.recurringAmount,
+      recurringFrequencyEstimate: recurring.recurringFrequencyEstimate,
+      recurringLastPayment: recurring.recurringLastPayment,
+      recurringNextEstimatedPayment: recurring.recurringNextEstimatedPayment,
+      recurringPaymentCount: recurring.recurringPaymentCount,
       gatewayPaidCount,
       paidOrderCount,
       paidMonths,

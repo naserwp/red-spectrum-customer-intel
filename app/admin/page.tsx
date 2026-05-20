@@ -8,9 +8,10 @@ import { AdminHeader } from "@/app/admin/_components/AdminHeader";
 import { AdminLayout } from "@/app/admin/_components/AdminLayout";
 
 type Customer = {
-  _id: string; name: string; email: string; phone: string; totalPaid: number; paidTotal?: number; attemptedTotal?: number;
+  _id: string; name: string; email: string; phone: string; rank?: number; totalPaid: number; paidTotal?: number; attemptedTotal?: number;
+  lifetimeSpent?: number; periodSpent?: number; monthlySpent?: number; yearlySpent?: number; attemptedPipeline?: number;
   lifetimeValue?: number; rankingPaidTotal?: number; paidOrderCount?: number; gatewayPaidCount?: number; attemptedOrderCount?: number; paidMonths?: number;
-  firstPaidDate?: string; subscriptionStartDate?: string; stayWithUsMonths?: number; leadStatus?: string; paymentStatus?: string; lastPaidDate?: string; lastAttemptDate?: string;
+  firstPaidDate?: string; latestPaidDate?: string; subscriptionStartDate?: string; stayWithUsMonths?: number; activeSubscriptionCount?: number; estimatedMRR?: number; category?: string; leadStatus?: string; paymentStatus?: string; lastPaidDate?: string; lastAttemptDate?: string;
   activeSubscriptions: number; failedPayments: number; chargebacks: number; estimatedCreditLimit: number; tier: string; riskLevel: string;
   score: number; stars: number; aiSummaryPreview: string; aiSummary: string; subscriptionStatus: string; orderCount: number; averageOrderValue: number;
   firstOrderDate: string; lastOrderDate: string; refunds: number; riskExplanation: string; recommendedAction: string;
@@ -20,7 +21,7 @@ type Customer = {
 type Subscription = {
   _id?: string; subscriptionId: string; source: string; customerEmail: string; customerName: string; status: string; amount: number;
   monthlyRecurringRevenue?: number; billingInterval?: string; nextBillingDate?: string; lastBillingDate?: string; failedPaymentCount?: number;
-  lastPaymentStatus?: string; sourceStatus?: string; recordType?: string; productNames?: string[]; startDate?: string; paymentMethodTitle?: string;
+  lastPaymentStatus?: string; sourceStatus?: string; recordType?: string; productNames?: string[]; startDate?: string; paymentMethodTitle?: string; churnRisk?: string; action?: string;
 };
 
 type RecurringCandidate = {
@@ -142,12 +143,12 @@ type DashboardRequestInit = RequestInit & {
 
 const tabs = ["Overview", "Customers", "Subscriptions", "Upcoming Bills", "High Value", "Hot Leads", "Risk Review", "Gateway Analytics", "5-Year Sales", "Sync Center"] as const;
 const pageSizes = [25, 50, 100] as const;
+const highValuePeriods = ["all", "yearly", "monthly"] as const;
 const rebuildBatchSize = 50;
-const slowRequestMessage = "This request is taking longer than expected. Try again or narrow the search.";
 const highValueThreshold = 2000;
 const money = (n: number) => `$${n.toFixed(2)}`;
-const paidAmount = (c: Customer) => Number(c.lifetimeValue ?? c.rankingPaidTotal ?? c.paidTotal ?? c.totalPaid ?? 0);
-const attemptedAmount = (c: Customer) => Number(c.attemptedTotal ?? 0);
+const paidAmount = (c: Customer) => Number(c.lifetimeSpent ?? c.lifetimeValue ?? c.rankingPaidTotal ?? c.paidTotal ?? c.totalPaid ?? 0);
+const attemptedAmount = (c: Customer) => Number(c.attemptedPipeline ?? c.attemptedTotal ?? 0);
 const customerDetailHref = (c: Customer) => `/admin/customers/${encodeURIComponent(c.email || c._id)}`;
 const displayStatus = (value?: string) => value ? value.replaceAll("_", " ") : "-";
 const displayDate = (value?: string) => {
@@ -330,10 +331,11 @@ function SubscriptionTable({ rows }: { rows: Subscription[] }) {
   if (rows.length === 0) return <p className="rounded-xl border border-zinc-800 bg-zinc-900 p-4 text-zinc-400">No subscription records found.</p>;
   return <div className="overflow-x-auto rounded-xl border border-zinc-800">
     <table className="min-w-[1200px] text-sm">
-      <thead className="sticky top-0 bg-zinc-950"><tr>{["Customer", "Product", "Status", "Amount", "MRR", "Start Date", "Next Payment", "Last Payment", "Payment Method", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
+      <thead className="sticky top-0 bg-zinc-950"><tr>{["Customer", "Source", "Product/Plan", "Status", "Amount", "MRR", "Start Date", "Next Payment", "Last Payment", "Payment Method", "Churn Risk", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
       <tbody>{rows.map((s) => {
         return <tr key={s._id ?? s.subscriptionId} className="border-t border-zinc-800">
           <td className="px-3 py-3"><p className="font-semibold">{s.customerName || "-"}</p><p className="text-xs text-zinc-400">{s.customerEmail}</p></td>
+          <td className="px-3 py-3">{s.source === "authorize_net" ? "Authorize.net" : "WooCommerce"}</td>
           <td className="px-3 py-3">{s.productNames?.join(", ") || s.source}</td>
           <td className="px-3 py-3">{displayStatus(s.status)}</td>
           <td className="px-3 py-3">{money(Number(s.amount ?? 0))}</td>
@@ -342,7 +344,8 @@ function SubscriptionTable({ rows }: { rows: Subscription[] }) {
           <td className="px-3 py-3">{displayDate(s.nextBillingDate)}</td>
           <td className="px-3 py-3">{displayDate(s.lastBillingDate)}</td>
           <td className="px-3 py-3">{displayStatus(s.paymentMethodTitle || s.lastPaymentStatus)}</td>
-          <td className="px-3 py-3"><Link className="rounded bg-zinc-700 px-2 py-1" href={`/admin/customers/${encodeURIComponent(s.customerEmail || s.subscriptionId)}`}>View</Link></td>
+          <td className="px-3 py-3">{displayStatus(s.churnRisk)}</td>
+          <td className="px-3 py-3"><div className="flex flex-wrap items-center gap-2"><span>{s.action || "Review customer"}</span><Link className="rounded bg-zinc-700 px-2 py-1" href={`/admin/customers/${encodeURIComponent(s.customerEmail || s.subscriptionId)}`}>View</Link></div></td>
         </tr>;
       })}</tbody>
     </table>
@@ -351,20 +354,25 @@ function SubscriptionTable({ rows }: { rows: Subscription[] }) {
 
 function ValueIndex({ rows, rankOffset = 0 }: { rows: Customer[]; rankOffset?: number }) {
   return <div className="overflow-x-auto rounded-xl border border-zinc-800">
-    <table className="min-w-[1150px] text-sm">
-      <thead className="sticky top-0 bg-zinc-950"><tr>{["Rank", "Customer", "Customer Lifetime Value", "Start", "Paid Months", "Stay With Us", "Last Paid", "Attempted Pipeline", "Category", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
+    <table className="min-w-[1550px] text-sm">
+      <thead className="sticky top-0 bg-zinc-950"><tr>{["Rank", "Customer", "Lifetime Spent", "Period Spent", "Monthly", "Yearly", "Paid Months", "First Paid", "Latest Paid", "Active Subs", "Estimated MRR", "Stay With Us", "Attempted Pipeline", "Category", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
       <tbody>{rows.map((c, index) => {
         const cat = getCustomerCategory(c);
         return <tr key={c._id} className="border-t border-zinc-800">
-          <td className="px-3 py-3 font-semibold">#{rankOffset + index + 1}</td>
+          <td className="px-3 py-3 font-semibold">#{c.rank ?? rankOffset + index + 1}</td>
           <td className="px-3 py-3"><p className="font-semibold">{c.name}</p><p className="text-xs text-zinc-400">{c.email}</p></td>
           <td className="px-3 py-3 font-semibold">{money(paidAmount(c))}</td>
-          <td className="px-3 py-3">{displayDate(customerStartDate(c))}</td>
+          <td className="px-3 py-3">{money(Number(c.periodSpent ?? paidAmount(c)))}</td>
+          <td className="px-3 py-3">{money(Number(c.monthlySpent ?? 0))}</td>
+          <td className="px-3 py-3">{money(Number(c.yearlySpent ?? 0))}</td>
           <td className="px-3 py-3">{customerPaidMonths(c)}</td>
+          <td className="px-3 py-3">{displayDate(customerStartDate(c))}</td>
+          <td className="px-3 py-3">{displayDate(c.latestPaidDate || c.lastPaidDate || c.lastOrderDate)}</td>
+          <td className="px-3 py-3">{Number(c.activeSubscriptionCount ?? c.activeSubscriptions ?? 0)}</td>
+          <td className="px-3 py-3">{money(Number(c.estimatedMRR ?? 0))}</td>
           <td className="px-3 py-3">{customerStayMonths(c)} months</td>
-          <td className="px-3 py-3">{displayDate(c.lastPaidDate || c.lastOrderDate)}</td>
           <td className="px-3 py-3">{money(attemptedAmount(c))}</td>
-          <td className="px-3 py-3"><span className={`inline-flex rounded border px-2 py-1 text-xs ${badgeClass[cat]}`}>{categoryLabel[cat]}</span></td>
+          <td className="px-3 py-3"><span className={`inline-flex rounded border px-2 py-1 text-xs ${badgeClass[cat]}`}>{c.category || categoryLabel[cat]}</span></td>
           <td className="px-3 py-3"><Link className="rounded bg-zinc-700 px-2 py-1" href={customerDetailHref(c)}>View</Link></td>
         </tr>;
       })}</tbody>
@@ -587,6 +595,7 @@ export default function AdminPage() {
   const [gatewayInterval, setGatewayInterval] = useState<GatewayInterval>("month");
   const [gatewayProvider, setGatewayProvider] = useState<GatewayProvider>("all");
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>("all");
+  const [highValuePeriod, setHighValuePeriod] = useState<(typeof highValuePeriods)[number]>("all");
   const [upcomingMeta, setUpcomingMeta] = useState<Record<string, unknown>>({});
   const [riskMeta, setRiskMeta] = useState<Record<string, unknown>>({});
   const [error, setError] = useState("");
@@ -630,9 +639,7 @@ export default function AdminPage() {
 
     const controller = new AbortController();
     requestControllers.current.set(scope, { controller, key });
-    let timedOut = false;
     const timeout = window.setTimeout(() => {
-      timedOut = true;
       controller.abort();
     }, init?.timeoutMs ?? 15000);
     try {
@@ -643,10 +650,7 @@ export default function AdminPage() {
       if (!response.ok) throw new Error(data.error || "Request failed.");
       return data;
     } catch (fetchError) {
-      if (controller.signal.aborted) {
-        if (timedOut) setRequestWarning(slowRequestMessage);
-        return null;
-      }
+      if (controller.signal.aborted) return null;
       throw fetchError;
     } finally {
       window.clearTimeout(timeout);
@@ -675,6 +679,15 @@ export default function AdminPage() {
     setPage(data.page || nextPage);
   }, [fetchJson, pageSize]);
 
+  const loadHighValue = useCallback(async (nextPage = 1, nextPageSize = pageSize, period = highValuePeriod) => {
+    const params = new URLSearchParams({ page: String(nextPage), limit: String(nextPageSize), period });
+    const data = await fetchJson("high-value", `/api/analytics/high-value?${params.toString()}`);
+    if (!data) return;
+    setCustomers(data.rows || []);
+    setTotal(data.total || 0);
+    setPage(data.page || nextPage);
+  }, [fetchJson, highValuePeriod, pageSize]);
+
   const loadHotLeads = useCallback(async (query = appliedSearchRef.current) => {
     const params = new URLSearchParams({ kind: "hot-leads", limit: "100" });
     if (query.trim()) params.set("q", query.trim());
@@ -684,9 +697,12 @@ export default function AdminPage() {
   }, [fetchJson]);
 
   const loadSummary = useCallback(async () => {
-    const summaryData = await fetchJson("summary", "/api/customers/summary");
+    const [summaryData, revenueData] = await Promise.all([
+      fetchJson("summary", "/api/customers/summary"),
+      fetchJson("revenue-overview", "/api/analytics/revenue-overview"),
+    ]);
     if (!summaryData) return;
-    setSummary(summaryData || {});
+    setSummary({ ...(summaryData || {}), ...(revenueData || {}) });
     if (summaryData.lastSyncAt) setSyncStatus({ lastSyncAt: String(summaryData.lastSyncAt), dataFreshness: "Fresh" });
   }, [fetchJson]);
 
@@ -774,7 +790,7 @@ export default function AdminPage() {
     try {
       if (activeTab === "Overview") {
         await loadSummary();
-        await loadCustomers(nextPage, query, nextPageSize);
+        await loadHighValue(nextPage, nextPageSize);
       }
       else if (activeTab === "Customers") await loadCustomers(nextPage, query, nextPageSize);
       else if (activeTab === "Subscriptions") await loadSubscriptions();
@@ -783,11 +799,11 @@ export default function AdminPage() {
       else if (activeTab === "Risk Review") await loadRiskRows();
       else if (activeTab === "Gateway Analytics") await loadGatewayData();
       else if (activeTab === "5-Year Sales") await loadSalesHistory();
-      else if (activeTab === "High Value") await loadCustomers(nextPage, query, nextPageSize);
+      else if (activeTab === "High Value") await loadHighValue(nextPage, nextPageSize);
     } finally {
       setTabLoading((current) => ({ ...current, [activeTab]: false }));
     }
-  }, [loadCustomers, loadGatewayData, loadHotLeads, loadRiskRows, loadSalesHistory, loadSubscriptions, loadSummary, loadUpcomingBills, pageSize]);
+  }, [loadCustomers, loadGatewayData, loadHighValue, loadHotLeads, loadRiskRows, loadSalesHistory, loadSubscriptions, loadSummary, loadUpcomingBills, pageSize]);
 
   useEffect(() => {
     loadActiveTabRef.current = loadActiveTab;
@@ -1120,6 +1136,7 @@ export default function AdminPage() {
     title="Customer Intelligence"
     description="Paid revenue, subscription status, checkout pipeline, and customer risk."
     meta={syncStatus?.lastSyncAt ? `Last synced: ${displayDateTime(syncStatus.lastSyncAt)}` : syncStatus?.dataFreshness || "Data sync needed"}
+    actions={<Link href="/admin/funding-ready" className="rounded-lg border border-red-800/70 bg-zinc-900 px-5 py-3 font-semibold text-zinc-200 transition hover:border-red-500 hover:bg-zinc-800">Funding Ready</Link>}
     showDashboardActions
     onOpenSyncCenter={() => handleTabChange("Sync Center")}
   />}>
@@ -1150,14 +1167,14 @@ export default function AdminPage() {
         <section className="space-y-3">
           <h2 className="text-xl font-semibold text-zinc-100">High-To-Low Customer Value</h2>
           <ValueIndex rows={customers} rankOffset={(page - 1) * pageSize} />
-          <Pager start={customerStart} end={customerEnd} total={total} page={page} maxPage={customerMaxPage} setPage={loadCustomers} />
+          <Pager start={customerStart} end={customerEnd} total={total} page={page} maxPage={customerMaxPage} setPage={(nextPage) => loadHighValue(nextPage, pageSize)} />
         </section>
       </>}
 
       {tab === "Customers" && <><CustomerTable rows={customers} exportCustomerPdf={exportCustomerPdf} /><Pager start={customerStart} end={customerEnd} total={total} page={page} maxPage={customerMaxPage} setPage={loadCustomers} /></>}
 
       {tab === "Subscriptions" && <>
-        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"><Card label="Total Subscriptions" value={Number(summary.totalSubscriptions ?? 0)} helper="All imported WooCommerce subscriptions" /><Card label="Active Subscriptions" value={Number(summary.activeSubscriptions ?? 0)} helper="WooCommerce status active" /><Card label="MRR" value={money(Number(summary.monthlyRecurringRevenue ?? 0))} helper="Active real subscriptions only" /><Card label="Subscription Candidates" value={Number(summary.subscriptionCandidates ?? 0)} helper="Recurring-like WooCommerce orders, not active subscriptions" /></section>
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"><Card label="Total Subscriptions" value={Number(summary.totalSubscriptions ?? 0)} helper="All imported WooCommerce subscriptions" /><Card label="Active Subscriptions" value={Number(summary.activeSubscriptions ?? 0)} helper={`${Number(summary.activeWooSubscriptions ?? 0)} WooCommerce + ${Number(summary.activeGatewayRecurringCustomers ?? 0)} Authorize.net recurring`} /><Card label="MRR" value={money(Number(summary.monthlyRecurringRevenue ?? 0))} helper="WooCommerce active subscriptions plus gateway recurring estimates" /><Card label="Subscription Candidates" value={Number(summary.subscriptionCandidates ?? 0)} helper="Recurring-like WooCommerce orders, not active subscriptions" /></section>
         <h2 className="text-xl font-semibold text-zinc-100">Active Subscriptions</h2><SubscriptionTable rows={subPage.rows} /><Pager {...subPage} />
         <div>
           <h2 className="text-xl font-semibold text-zinc-100">Subscription Candidates</h2>
@@ -1167,7 +1184,7 @@ export default function AdminPage() {
       </>}
 
       {tab === "Upcoming Bills" && <>
-        <section className="grid gap-3 sm:grid-cols-3"><Card label="Upcoming 30D" value={upcomingBills.length} helper="Active subscriptions with real next billing date" /><Card label="Estimated Upcoming Revenue" value={money(Number(upcomingMeta.estimatedUpcomingRevenue ?? 0))} /><Card label="High Risk Upcoming" value={Number(upcomingMeta.highRiskCount ?? 0)} /></section>
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"><Card label="Upcoming Customers This Month" value={Number(upcomingMeta.upcomingCustomerCountThisMonth ?? upcomingBills.length)} helper="WooCommerce and Authorize.net recurring" /><Card label="Upcoming Revenue This Month" value={money(Number(upcomingMeta.upcomingRevenueThisMonth ?? upcomingMeta.estimatedUpcomingRevenue ?? 0))} /><Card label="Upcoming Today" value={Number(upcomingMeta.upcomingToday ?? 0)} /><Card label="Upcoming Next 7 Days" value={Number(upcomingMeta.upcomingNext7Days ?? 0)} /></section>
         <section className="space-y-3">
           <h2 className="text-xl font-semibold text-zinc-100">Active Subscriptions With Next Billing Date</h2>
           {typeof upcomingMeta.message === "string" && upcomingMeta.message && <p className="rounded border border-zinc-800 bg-zinc-900 p-3 text-zinc-400">{upcomingMeta.message}</p>}
@@ -1180,7 +1197,7 @@ export default function AdminPage() {
         </section>
       </>}
 
-      {tab === "High Value" && <><Card label="High Value Paid Customers" value={Number(summary.highValueCustomers ?? 0)} helper="Unpaid leads excluded" /><ValueIndex rows={customers} rankOffset={(page - 1) * pageSize} /><Pager start={customerStart} end={customerEnd} total={total} page={page} maxPage={customerMaxPage} setPage={loadCustomers} /></>}
+      {tab === "High Value" && <><div className="flex flex-wrap items-center justify-between gap-3"><Card label="High Value Paid Customers" value={Number(summary.highValueCustomers ?? total)} helper="Unpaid leads excluded" /><select value={highValuePeriod} onChange={(e) => { const next = e.target.value as (typeof highValuePeriods)[number]; setHighValuePeriod(next); loadHighValue(1, pageSize, next); }} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">{highValuePeriods.map((period) => <option key={period} value={period}>{period === "all" ? "All time" : period === "yearly" ? "This year" : "This month"}</option>)}</select></div><ValueIndex rows={customers} rankOffset={(page - 1) * pageSize} /><Pager start={customerStart} end={customerEnd} total={total} page={page} maxPage={customerMaxPage} setPage={(nextPage) => loadHighValue(nextPage, pageSize)} /></>}
 
       {tab === "Hot Leads" && <>
         <section className="grid gap-3 sm:grid-cols-3"><Card label="Hot Checkout Leads" value={hotLeadRows.length} helper="Unpaid checkout/payment attempts and newer failed attempts after last paid order" /><Card label="Attempted Pipeline" value={money(hotLeadRows.reduce((sum, row) => sum + attemptedAmount(row), 0))} /><Card label="Failed/Pending Attempts This Month" value={hotLeadFailedThisMonth} /></section>

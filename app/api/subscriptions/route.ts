@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { cachedJson } from "@/lib/apiCache";
+import { readAnalyticsSnapshot } from "@/lib/analyticsCache";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Subscription } from "@/models/Subscription";
 import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
@@ -18,13 +19,14 @@ export async function GET(request: Request) {
   const dashboard = searchParams.get("dashboard") === "1";
   if (dashboard) {
     return cachedJson(`subscriptions-dashboard:${page}:${limit}:${search}`, async () => {
-      const [total, activeSubscriptions, activeMrr, records, candidateRows] = await Promise.all([
+      const [total, activeWooSubscriptions, activeWooMrr, snapshot, records, candidateRows] = await Promise.all([
         WooCommerceSubscriptionRecord.countDocuments({}),
         WooCommerceSubscriptionRecord.countDocuments({ status: "active" }),
         WooCommerceSubscriptionRecord.aggregate<{ _id: null; mrr: number }>([
           { $match: { status: "active" } },
           { $group: { _id: null, mrr: { $sum: { $ifNull: ["$recurringTotal", "$amount"] } } } },
         ]),
+        readAnalyticsSnapshot<Record<string, unknown>>("dashboard_analytics", {}),
         WooCommerceSubscriptionRecord.find(search ? { $or: [{ customerName: { $regex: search, $options: "i" } }, { customerEmail: { $regex: search, $options: "i" } }, { subscriptionNumber: { $regex: search, $options: "i" } }] } : {}).sort({ nextPaymentDate: 1 }).skip((page - 1) * limit).limit(limit).lean<LeanWooSubscription[]>(),
         Subscription.find({ isPlaceholder: { $ne: true }, recordType: "subscription_candidate" }).sort({ nextBillingDate: 1 }).limit(limit).lean(),
       ]);
@@ -55,10 +57,15 @@ export async function GET(request: Request) {
         rows,
         candidateRows,
         summary: {
-          totalSubscriptions: total,
-          activeSubscriptions,
-          monthlyRecurringRevenue: Number(activeMrr[0]?.mrr ?? 0),
+          totalSubscriptions: Number(snapshot.totalSubscriptions ?? total),
+          activeWooSubscriptions: Number(snapshot.activeWooSubscriptions ?? activeWooSubscriptions),
+          activeGatewayRecurringCustomers: Number(snapshot.activeGatewayRecurringCustomers ?? 0),
+          totalActiveRecurringCustomers: Number(snapshot.totalActiveRecurringCustomers ?? activeWooSubscriptions),
+          activeSubscriptions: Number(snapshot.totalActiveRecurringCustomers ?? activeWooSubscriptions),
+          monthlyRecurringRevenue: Number(snapshot.totalMonthlyRecurringRevenue ?? snapshot.activeMRR ?? activeWooMrr[0]?.mrr ?? 0),
+          totalMonthlyRecurringRevenue: Number(snapshot.totalMonthlyRecurringRevenue ?? snapshot.activeMRR ?? activeWooMrr[0]?.mrr ?? 0),
           subscriptionCandidates: candidateRows.length,
+          analyticsCacheReady: Boolean(snapshot.analyticsCacheReady),
         },
       };
     });

@@ -57,5 +57,6 @@ const wooCommerceSubscriptionSchema = new Schema<WooCommerceSubscriptionDocument
 );
 
 wooCommerceSubscriptionSchema.index({ status: 1, nextPaymentDate: 1 });
+wooCommerceSubscriptionSchema.index({ createdAt: -1 });
 
 export const WooCommerceSubscriptionRecord = mongoose.models.WooCommerceSubscriptionRecord || mongoose.model<WooCommerceSubscriptionDocument>("WooCommerceSubscriptionRecord", wooCommerceSubscriptionSchema);

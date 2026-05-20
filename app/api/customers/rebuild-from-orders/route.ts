@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { calculateCustomerScore, scoreToStars, type CustomerScoreInput } from "@/lib/customerScore";
 import { monthsSince } from "@/lib/customerValue";
+import { customerLedgerRecords, detectAuthorizeNetRecurring } from "@/lib/revenueAnalytics";
 import { buildProductJourneySummary } from "@/lib/productClassification";
 import { countBy, normalizeText, orderHistoryItemFromStoredOrder, unique } from "@/lib/wooOrderImport";
 import { connectToDatabase } from "@/lib/mongodb";
@@ -319,6 +320,16 @@ export async function POST(request: Request) {
       }, 0);
     }
     const existing = await findExisting(customer);
+    const recurring = detectAuthorizeNetRecurring(customerLedgerRecords({ ...customer, gatewayPayments: existing?.gatewayPayments ?? [] }));
+    Object.assign(customer, {
+      isGatewayRecurring: recurring.isGatewayRecurring,
+      recurringSource: recurring.recurringSource,
+      recurringAmount: recurring.recurringAmount,
+      recurringFrequencyEstimate: recurring.recurringFrequencyEstimate,
+      recurringLastPayment: recurring.recurringLastPayment,
+      recurringNextEstimatedPayment: recurring.recurringNextEstimatedPayment,
+      recurringPaymentCount: recurring.recurringPaymentCount,
+    });
     customersProcessed += 1;
     const existingOrderCount = existing?.orders?.length ?? existing?.orderCount ?? 0;
     if (!allowReplaceWithSmallerHistory && existingOrderCount > customer.orders.length) {

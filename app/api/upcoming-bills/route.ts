@@ -1,76 +1,77 @@
 import { NextResponse } from "next/server";
-import { isInRange } from "@/lib/businessMetrics";
+import { readAnalyticsSnapshot } from "@/lib/analyticsCache";
 import { connectToDatabase } from "@/lib/mongodb";
-import { Customer, type CustomerDocument, type CustomerProductJourneyItem } from "@/models/Customer";
-import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
-
-type LeanWooSubscription = WooCommerceSubscriptionDocument & { _id: unknown };
-
-function isBusinessBuilderProduct(name: string) {
-  const normalized = name.toLowerCase();
-  return normalized.includes("business builder") || normalized.includes("build your business credit");
-}
-
-function monthKey(value: string) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "";
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
-}
-
-function recurringCandidates(customers: CustomerDocument[]) {
-  return customers.flatMap((customer) => {
-    const paidBusinessBuilder = (customer.productJourney ?? [])
-      .filter((item: CustomerProductJourneyItem) => item.type === "paid" && isBusinessBuilderProduct(item.productName))
-      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-    const paidMonths = Array.from(new Set(paidBusinessBuilder.map((item) => monthKey(item.date)).filter(Boolean)));
-    if (paidMonths.length < 2) return [];
-    const total = paidBusinessBuilder.reduce((sum, item) => sum + Number(item.amount ?? 0), 0);
-    return [{
-      customerName: customer.name,
-      customerEmail: customer.email,
-      product: paidBusinessBuilder[0]?.productName ?? "Business Builder",
-      paidMonths: paidMonths.length,
-      lastPaid: paidBusinessBuilder[0]?.date ?? customer.lastPaidDate ?? "",
-      averageAmount: paidBusinessBuilder.length > 0 ? total / paidBusinessBuilder.length : 0,
-      suggestedReview: "Review for recurring billing or subscription source connection.",
-    }];
-  }).sort((a, b) => new Date(b.lastPaid).getTime() - new Date(a.lastPaid).getTime());
-}
+import { monthEnd, monthStart, dateInRange } from "@/lib/revenueAnalytics";
+import { Customer } from "@/models/Customer";
+import { WooCommerceSubscriptionRecord } from "@/models/WooCommerceSubscription";
 
 export async function GET() {
+  const started = Date.now();
   await connectToDatabase();
-  const now = new Date();
-  const next30 = new Date(now.getTime() + 30 * 86400000);
-  const [subs, customers] = await Promise.all([
-    WooCommerceSubscriptionRecord.find({ status: "active", nextPaymentDate: { $ne: "" } }).sort({ nextPaymentDate: 1 }).lean<LeanWooSubscription[]>(),
-    Customer.find({ paidOrderCount: { $gt: 1 } }, { name: 1, email: 1, productJourney: 1, lastPaidDate: 1 }).lean<CustomerDocument[]>(),
-  ]);
-  const rows = subs.filter((sub) => isInRange(sub.nextPaymentDate ?? "", now, next30)).map((record) => ({
-    _id: String(record._id),
-    subscriptionId: String(record.wooSubscriptionId),
-    subscriptionNumber: record.subscriptionNumber,
-    source: "woocommerce",
-    customerEmail: record.customerEmail,
-    customerName: record.customerName,
-    customerPhone: record.customerPhone,
-    status: record.status,
-    amount: record.amount,
-    monthlyRecurringRevenue: record.amount,
-    billingInterval: [record.billingInterval, record.billingPeriod].filter(Boolean).join(" "),
-    nextBillingDate: record.nextPaymentDate,
-    lastBillingDate: record.lastPaymentDate,
-    startDate: record.startDate,
-    paymentMethodTitle: record.paymentMethodTitle || record.paymentMethod,
-    productNames: record.productNames,
-    sourceStatus: "real",
-    recordType: "subscription",
-  }));
-  const highRisk = rows.filter((r) => r.status === "pending" || r.status === "on-hold");
-  return NextResponse.json({
-    rows,
-    recurringCandidates: recurringCandidates(customers),
-    highRiskCount: highRisk.length,
-    estimatedUpcomingRevenue: rows.reduce((a, r) => a + (r.amount ?? 0), 0),
-    message: subs.length === 0 ? "No WooCommerce subscription records imported yet. Go to Sync Center and run Import WooCommerce Subscriptions." : rows.length === 0 ? "No active subscriptions with a next billing date are available in the next 30 days." : "",
+  const dbStarted = Date.now();
+  const snapshot = await readAnalyticsSnapshot<Record<string, unknown>>("dashboard_analytics", {
+    upcomingRows: [],
+    recurringCandidates: [],
+    totalUpcomingThisMonth: 0,
+    totalUpcomingAmountThisMonth: 0,
+    upcomingToday: 0,
+    upcomingNext7Days: 0,
   });
+  let rows = (Array.isArray(snapshot.upcomingRows) ? snapshot.upcomingRows : []) as Array<Record<string, unknown>>;
+  if (!snapshot.analyticsCacheReady) {
+    const now = new Date();
+    const start = monthStart(now);
+    const end = monthEnd(now);
+    const [wooRows, gatewayRows] = await Promise.all([
+      WooCommerceSubscriptionRecord.find({ status: "active", nextPaymentDate: { $ne: "" } }).sort({ nextPaymentDate: 1 }).limit(100).lean(),
+      Customer.find({ isGatewayRecurring: true, recurringNextEstimatedPayment: { $ne: "" } }, { name: 1, email: 1, phone: 1, recurringAmount: 1, recurringNextEstimatedPayment: 1, recurringLastPayment: 1, riskLevel: 1 }).sort({ recurringNextEstimatedPayment: 1 }).limit(100).lean(),
+    ]);
+    rows = [
+      ...wooRows.filter((row) => dateInRange(String(row.nextPaymentDate ?? ""), start, end)).map((row) => ({
+        _id: String(row._id),
+        subscriptionId: String(row.wooSubscriptionId),
+        source: "woocommerce",
+        customerEmail: row.customerEmail,
+        customerName: row.customerName,
+        status: row.status,
+        amount: Number(row.recurringTotal ?? row.amount ?? 0),
+        nextBillingDate: row.nextPaymentDate,
+        lastBillingDate: row.lastPaymentDate,
+        paymentMethodTitle: row.paymentMethodTitle || row.paymentMethod,
+        productNames: row.productNames,
+        churnRisk: "low",
+        action: "Review subscription renewal",
+      })),
+      ...gatewayRows.filter((row) => dateInRange(String(row.recurringNextEstimatedPayment ?? ""), start, end)).map((row) => ({
+        _id: String(row._id),
+        subscriptionId: `authorize-net-${String(row._id)}`,
+        source: "authorize_net",
+        customerEmail: row.email,
+        customerName: row.name,
+        status: "estimated_recurring",
+        amount: Number(row.recurringAmount ?? 0),
+        nextBillingDate: row.recurringNextEstimatedPayment,
+        lastBillingDate: row.recurringLastPayment,
+        paymentMethodTitle: "Credit Card Payment",
+        productNames: ["Authorize.net Recurring Payment"],
+        churnRisk: row.riskLevel ?? "low",
+        action: "Review Authorize.net recurring payment",
+      })),
+    ];
+  }
+  const payload = {
+    rows,
+    recurringCandidates: Array.isArray(snapshot.recurringCandidates) ? snapshot.recurringCandidates : [],
+    highRiskCount: rows.filter((row) => row.churnRisk === "high").length,
+    estimatedUpcomingRevenue: Number(snapshot.totalUpcomingAmountThisMonth ?? 0),
+    upcomingCustomerCountThisMonth: Number(snapshot.totalUpcomingThisMonth ?? rows.length),
+    upcomingRevenueThisMonth: Number(snapshot.upcomingRevenueThisMonth ?? snapshot.totalUpcomingAmountThisMonth ?? 0),
+    upcomingToday: Number(snapshot.upcomingToday ?? 0),
+    upcomingNext7Days: Number(snapshot.upcomingNext7Days ?? 0),
+    message: snapshot.analyticsCacheReady ? "" : "Analytics cache is rebuilding...",
+  };
+  if (process.env.NODE_ENV === "development") {
+    console.log(`[api] upcoming-bills durationMs=${Date.now() - started} mongoMs=${Date.now() - dbStarted} cache=stored responseBytes=${JSON.stringify(payload).length}`);
+  }
+  return NextResponse.json(payload);
 }

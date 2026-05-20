@@ -136,6 +136,12 @@ export interface CustomerBusinessProfile {
   net30Status: string;
   accountStatus: string;
   businessType: string;
+  industry: string;
+  industryClassification: string;
+  naicsCode: string;
+  sicCode: string;
+  fundingReadinessScore: number;
+  fundingReadinessTier: string;
   source: string;
   importedAt: string;
 }
@@ -172,6 +178,13 @@ export interface CustomerDocument {
   averageOrderValue: number;
   subscriptionStatus: SubscriptionStatus;
   activeSubscriptions: number;
+  isGatewayRecurring: boolean;
+  recurringSource: string;
+  recurringAmount: number;
+  recurringFrequencyEstimate: string;
+  recurringLastPayment: string;
+  recurringNextEstimatedPayment: string;
+  recurringPaymentCount: number;
   failedPayments: number;
   refunds: number;
   chargebacks: number;
@@ -431,6 +444,12 @@ const customerBusinessProfileSchema = new Schema<CustomerBusinessProfile>(
     net30Status: { type: String, default: "" },
     accountStatus: { type: String, default: "" },
     businessType: { type: String, default: "" },
+    industry: { type: String, default: "" },
+    industryClassification: { type: String, default: "" },
+    naicsCode: { type: String, default: "" },
+    sicCode: { type: String, default: "" },
+    fundingReadinessScore: { type: Number, default: 0 },
+    fundingReadinessTier: { type: String, default: "" },
     source: { type: String, default: "" },
     importedAt: { type: String, default: "" },
   },
@@ -470,6 +489,13 @@ const customerSchema = new Schema<CustomerDocument>(
     averageOrderValue: { type: Number, required: true },
     subscriptionStatus: { type: String, enum: ["active", "inactive", "canceled", "past_due", "unknown"], required: true },
     activeSubscriptions: { type: Number, required: true },
+    isGatewayRecurring: { type: Boolean, default: false, index: true },
+    recurringSource: { type: String, default: "" },
+    recurringAmount: { type: Number, default: 0 },
+    recurringFrequencyEstimate: { type: String, default: "" },
+    recurringLastPayment: { type: String, default: "" },
+    recurringNextEstimatedPayment: { type: String, default: "", index: true },
+    recurringPaymentCount: { type: Number, default: 0 },
     failedPayments: { type: Number, required: true },
     refunds: { type: Number, required: true },
     chargebacks: { type: Number, required: true },
@@ -536,7 +562,12 @@ customerSchema.pre("validate", function () {
 });
 
 customerSchema.index({ normalizedEmail: 1 });
+customerSchema.index({ emailNormalized: 1 });
 customerSchema.index({ phoneNormalized: 1 });
+customerSchema.index({ rankingPaidTotal: -1 });
+customerSchema.index({ lifetimeValue: -1 });
+customerSchema.index({ isGatewayRecurring: 1, recurringNextEstimatedPayment: 1 });
+customerSchema.index({ createdAt: -1 });
 customerSchema.index({ "orders.transactionId": 1 });
 customerSchema.index({ "orders.orderNumber": 1 });
 customerSchema.index({ "orders.gatewayVerification.customerProfileId": 1 });

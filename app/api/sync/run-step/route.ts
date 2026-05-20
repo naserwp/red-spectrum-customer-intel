@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
 import { isAuthorizeNetConfigured, fetchSettledBatchIds, fetchTransactionDetails, fetchTransactionIdsForBatch, fetchUnsettledTransactionIds, normalizeAuthorizeNetTransaction } from "@/lib/authorizeNet";
 import { reconcileAuthorizeNetTransaction } from "@/lib/authorizeNetReconciliation";
+import { rebuildAnalyticsCache } from "@/lib/analyticsCache";
 import { calculateCustomerScore, scoreToStars, type CustomerScoreInput } from "@/lib/customerScore";
 import { monthsSince } from "@/lib/customerValue";
+import { customerLedgerRecords, detectAuthorizeNetRecurring } from "@/lib/revenueAnalytics";
 import { buildProductJourneySummary } from "@/lib/productClassification";
 import { connectToDatabase } from "@/lib/mongodb";
 import { fetchWooCommerceOrders, fetchWooCommerceSubscriptions, isWooCommerceConfigured, wooCommerceOrderStatuses, wooCommerceSubscriptionStatuses } from "@/lib/woocommerce";
@@ -25,7 +27,7 @@ const reconcileLimit = 50;
 const wordpressProfileLimit = 25;
 
 type SyncCursor = {
-  phase?: "orders" | "customers" | "subscriptions" | "wordpress_profiles" | "authorize_net_import" | "authorize_net_reconcile" | "done";
+  phase?: "orders" | "customers" | "subscriptions" | "wordpress_profiles" | "authorize_net_import" | "authorize_net_reconcile" | "analytics" | "done";
   orderStatusIndex?: number;
   orderPage?: number;
   rebuildOffset?: number;
@@ -193,6 +195,7 @@ async function rebuildCustomerStep(cursor: SyncCursor) {
     const orders = await WooCommerceOrderRecord.find({ _id: { $in: group.ids } }).sort({ dateCreated: -1 }).lean<WooCommerceOrderDocument[]>();
     if (!orders.length) continue;
     const customer = buildCustomerFromOrders(group._id, orders, rebuildAt);
+    const existingFull = await Customer.findOne({ $or: [{ normalizedEmail: customer.normalizedEmail }, { email: customer.normalizedEmail }, { externalCustomerKey: customer.externalCustomerKey }] }, { gatewayPayments: 1, orders: 1, orderCount: 1 }).lean<{ gatewayPayments?: []; orders?: []; orderCount?: number } | null>();
     const subscriptions = customer.normalizedEmail
       ? await WooCommerceSubscriptionRecord.find({ normalizedEmail: customer.normalizedEmail }).lean<Array<{ status?: string; startDate?: string; lastPaymentDate?: string; relatedOrderIds?: number[]; amount?: number }>>()
       : [];
@@ -211,8 +214,17 @@ async function rebuildCustomerStep(cursor: SyncCursor) {
       customer.stayWithUsMonths = monthsSince(customer.firstPaidDate || subscriptionStartDate || customer.firstOrderDate);
       customer.subscriptionPaidTotal = subscriptionPaidTotal;
     }
-    const existing = await Customer.findOne({ $or: [{ normalizedEmail: customer.normalizedEmail }, { email: customer.normalizedEmail }, { externalCustomerKey: customer.externalCustomerKey }] }, { orderCount: 1 }).lean<{ orderCount?: number } | null>();
-    if ((existing?.orderCount ?? 0) > customer.orderCount) continue;
+    const recurring = detectAuthorizeNetRecurring(customerLedgerRecords({ ...customer, gatewayPayments: existingFull?.gatewayPayments ?? [] }));
+    Object.assign(customer, {
+      isGatewayRecurring: recurring.isGatewayRecurring,
+      recurringSource: recurring.recurringSource,
+      recurringAmount: recurring.recurringAmount,
+      recurringFrequencyEstimate: recurring.recurringFrequencyEstimate,
+      recurringLastPayment: recurring.recurringLastPayment,
+      recurringNextEstimatedPayment: recurring.recurringNextEstimatedPayment,
+      recurringPaymentCount: recurring.recurringPaymentCount,
+    });
+    if ((existingFull?.orderCount ?? 0) > customer.orderCount) continue;
     await Customer.findOneAndUpdate(
       { $or: [{ normalizedEmail: customer.normalizedEmail }, { email: customer.normalizedEmail }, { externalCustomerKey: customer.externalCustomerKey }] },
       { $set: customer },
@@ -352,9 +364,18 @@ async function reconcileAuthorizeNetStep(cursor: SyncCursor) {
   }
   const hasMore = transactions.length === reconcileLimit;
   return {
-    cursor: hasMore ? nextCursor(cursor, { phase: "authorize_net_reconcile", reconcileOffset: offset + transactions.length }) : nextCursor(cursor, { phase: "done", completedSteps: ["authorize_net_reconcile"] }),
+    cursor: hasMore ? nextCursor(cursor, { phase: "authorize_net_reconcile", reconcileOffset: offset + transactions.length }) : nextCursor(cursor, { phase: "analytics", completedSteps: ["authorize_net_reconcile"] }),
     authorizeNetPaymentsReconciled,
     label: `Reconciling Authorize.net payments ${offset}-${offset + transactions.length}...`,
+  };
+}
+
+async function rebuildAnalyticsStep(cursor: SyncCursor) {
+  const result = await rebuildAnalyticsCache();
+  return {
+    cursor: nextCursor(cursor, { phase: "done", completedSteps: ["analytics"] }),
+    analyticsRecordsUpdated: result.rankingUpdated,
+    label: `Rebuilt dashboard analytics cache for ${result.rankingUpdated} ranked customers.`,
   };
 }
 
@@ -373,6 +394,7 @@ export async function POST(request: Request) {
     wordpressProfilesImported?: number;
     authorizeNetTransactionsImported?: number;
     authorizeNetPaymentsReconciled?: number;
+    analyticsRecordsUpdated?: number;
   };
 
   if (cursor.phase === "orders") result = await importOrderStep(cursor);
@@ -381,6 +403,7 @@ export async function POST(request: Request) {
   else if (cursor.phase === "wordpress_profiles") result = await importWordPressProfilesStep(cursor);
   else if (cursor.phase === "authorize_net_import") result = await importAuthorizeNetStep(cursor);
   else if (cursor.phase === "authorize_net_reconcile") result = await reconcileAuthorizeNetStep(cursor);
+  else if (cursor.phase === "analytics") result = await rebuildAnalyticsStep(cursor);
   else result = { cursor: nextCursor(cursor, { phase: "done" }), label: "Sync complete." };
   if (result.warning) warnings.push(result.warning);
 
@@ -393,7 +416,7 @@ export async function POST(request: Request) {
     progress: hasMore ? 50 : 100,
     totalPages: 1,
     pagesFetched: 1,
-    recordsProcessed: (result.ordersImported ?? 0) + (result.customersUpdated ?? 0) + (result.subscriptionsImported ?? 0) + (result.wordpressProfilesImported ?? 0) + (result.authorizeNetTransactionsImported ?? 0) + (result.authorizeNetPaymentsReconciled ?? 0),
+    recordsProcessed: (result.ordersImported ?? 0) + (result.customersUpdated ?? 0) + (result.subscriptionsImported ?? 0) + (result.wordpressProfilesImported ?? 0) + (result.authorizeNetTransactionsImported ?? 0) + (result.authorizeNetPaymentsReconciled ?? 0) + (result.analyticsRecordsUpdated ?? 0),
     errors: [],
     warnings,
     lastCursor: { page: result.cursor.orderPage ?? result.cursor.rebuildOffset ?? result.cursor.subscriptionPage ?? result.cursor.wordpressProfileOffset ?? result.cursor.authorizeNetOffset ?? result.cursor.reconcileOffset ?? 0, status: result.cursor.phase ?? "" },
@@ -412,6 +435,7 @@ export async function POST(request: Request) {
     wordpressProfilesImported: result.wordpressProfilesImported ?? 0,
     authorizeNetTransactionsImported: result.authorizeNetTransactionsImported ?? 0,
     authorizeNetPaymentsReconciled: result.authorizeNetPaymentsReconciled ?? 0,
+    analyticsRecordsUpdated: result.analyticsRecordsUpdated ?? 0,
     warnings,
   });
 }

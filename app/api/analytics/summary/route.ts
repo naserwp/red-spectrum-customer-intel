@@ -1,101 +1,73 @@
-import { highValueThreshold, isInRange, monthStart, rollingDaysStart } from "@/lib/businessMetrics";
-import { cachedJson } from "@/lib/apiCache";
+import { highValueThreshold } from "@/lib/businessMetrics";
+import { readAnalyticsSnapshot } from "@/lib/analyticsCache";
 import { connectToDatabase } from "@/lib/mongodb";
-import { Customer, type CustomerDocument } from "@/models/Customer";
-import { SalesHistory, type SalesHistoryDocument } from "@/models/SalesHistory";
-import { Subscription, type SubscriptionDocument } from "@/models/Subscription";
-import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
-import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
+import { Customer } from "@/models/Customer";
+import { CustomerRanking } from "@/models/CustomerRanking";
 import { SyncJob } from "@/models/SyncJob";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
+  const started = Date.now();
   await connectToDatabase();
-  return cachedJson("customers-summary", async () => {
-    const [customers, subs, wooSubscriptions, salesHistory, lastJob] = await Promise.all([
-    Customer.find({}).lean<CustomerDocument[]>(),
-    Subscription.find({}).lean<SubscriptionDocument[]>(),
-    WooCommerceSubscriptionRecord.find({}).lean<WooCommerceSubscriptionDocument[]>(),
-    SalesHistory.findOne({ source: "woocommerce" }).lean<SalesHistoryDocument | null>(),
+  const dbStarted = Date.now();
+  const [customerCount, highValueCustomers, lastJob, snapshot, fallbackAgg] = await Promise.all([
+    Customer.estimatedDocumentCount(),
+    CustomerRanking.countDocuments({ lifetimeSpent: { $gte: highValueThreshold } }),
     SyncJob.findOne({}).sort({ finishedAt: -1, updatedAt: -1 }).lean<{ finishedAt?: string; updatedAt?: Date | string } | null>(),
-    ]);
-    const storedOrders = await WooCommerceOrderRecord.find({}).lean<WooCommerceOrderDocument[]>();
-
-  const now = new Date();
-  const startOfMonth = monthStart(now);
-  const last30 = rollingDaysStart(30, now);
-  const next30 = new Date(now.getTime() + 30 * 86400000);
-  const subscriptionCandidates = subs.filter((s) => !s.isPlaceholder && s.recordType === "subscription_candidate");
-  const activeSubs = wooSubscriptions.filter((s) => s.status === "active");
-  const upcomingActiveSubs30d = activeSubs.filter((s) => isInRange(s.nextPaymentDate ?? "", now, next30));
-  const failedSubs = wooSubscriptions.filter((s) => ["pending", "on-hold", "past_due", "failed"].includes(s.status));
-  const failedSubsThisMonth = failedSubs.filter((s) => isInRange(s.lastPaymentDate ?? s.updatedAt?.toISOString?.() ?? "", startOfMonth, now));
-  const failedSubsLast30Days = failedSubs.filter((s) => isInRange(s.lastPaymentDate ?? s.updatedAt?.toISOString?.() ?? "", last30, now));
-  const currentMonthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-  const currentMonthSales = salesHistory?.monthly?.find((m) => m.period === currentMonthKey);
-  const paidStoredOrdersThisMonth = storedOrders.filter((order) => order.isPaid && isInRange(order.dateCreated, startOfMonth, now));
-  const attemptedStoredOrdersThisMonth = storedOrders.filter((order) => order.isAttempted && isInRange(order.dateCreated, startOfMonth, now));
-  const failedPendingStoredOrdersThisMonth = attemptedStoredOrdersThisMonth.filter((order) => ["failed", "pending", "pending payment", "on-hold", "checkout-draft", "payment_pending", "crypto_pending"].includes(order.status));
-  const gatewayOnlyCustomerOrders = customers.flatMap((customer) => customer.orders ?? []).filter((order) => order.source === "authorize_net_only" && order.isPaid);
-  const gatewayOnlyPaidRevenue = gatewayOnlyCustomerOrders.reduce((sum, order) => sum + Number(order.total ?? 0), 0);
-  const gatewayOnlyPaidRevenueThisMonth = gatewayOnlyCustomerOrders
-    .filter((order) => isInRange(order.paidDate || order.dateCreated, startOfMonth, now))
-    .reduce((sum, order) => sum + Number(order.total ?? 0), 0);
-
-  const paidRevenue = storedOrders.length > 0 ? storedOrders.reduce((a, order) => a + Number(order.paidAmount ?? 0), 0) + gatewayOnlyPaidRevenue : customers.reduce((a, c) => a + (c.lifetimeValue ?? c.rankingPaidTotal ?? c.paidTotal ?? c.totalPaid ?? 0), 0);
-  const attemptedRevenue = storedOrders.length > 0 ? storedOrders.reduce((a, order) => a + Number(order.attemptedAmount ?? 0), 0) : customers.reduce((a, c) => a + (c.attemptedTotal ?? 0), 0);
-  const newCustomersThisMonth = customers.filter((c) => isInRange(c.firstOrderDate ?? "", startOfMonth, now)).length;
-  const newPaidCustomersThisMonth = customers.filter((c) => (c.lifetimeValue ?? c.rankingPaidTotal ?? c.paidTotal ?? c.totalPaid ?? 0) > 0 && isInRange(c.firstOrderDate ?? "", startOfMonth, now)).length;
-  const attemptedEmailsThisMonth = new Set(attemptedStoredOrdersThisMonth.map((order) => order.normalizedEmail).filter(Boolean));
-  const paidEmails = new Set(storedOrders.filter((order) => order.isPaid).map((order) => order.normalizedEmail).filter(Boolean));
-  const newHotLeadsThisMonth = storedOrders.length > 0
-    ? Array.from(attemptedEmailsThisMonth).filter((email) => !paidEmails.has(email)).length
-    : customers.filter((c) => (c.paidTotal ?? c.totalPaid ?? 0) === 0 && (c.attemptedTotal ?? 0) > 0 && isInRange(c.lastAttemptDate ?? c.firstOrderDate ?? "", startOfMonth, now)).length;
-  const highValueCustomers = customers.filter((c) => (c.lifetimeValue ?? c.rankingPaidTotal ?? c.paidTotal ?? c.totalPaid ?? 0) >= highValueThreshold);
-  const highValueCustomersThisMonth = highValueCustomers.filter((c) => isInRange(c.lastPaidDate ?? c.lastOrderDate ?? "", startOfMonth, now)).length;
-  const failedCheckoutAttemptsThisMonth = storedOrders.length > 0
-    ? failedPendingStoredOrdersThisMonth.length
-    : customers
-      .filter((c) => (c.failedPayments ?? 0) > 0 && isInRange(c.lastAttemptDate ?? c.lastOrderDate ?? "", startOfMonth, now))
-      .reduce((a, c) => a + (c.failedPayments ?? 0), 0);
-  const mrr = activeSubs.reduce((a, s) => a + (s.recurringTotal ?? s.amount ?? 0), 0);
-  const sourceBreakdown = ["woocommerce", "stripe", "authorize_net", "nmi", "manual"].reduce<Record<string, number>>((acc, source) => {
-    acc[source] = source === "woocommerce" ? activeSubs.reduce((a, s) => a + (s.recurringTotal ?? s.amount ?? 0), 0) : 0;
-    return acc;
-  }, {});
-
-  return {
-    customerCount: customers.length,
-    totalRevenue: paidRevenue,
-    paidRevenue,
-    attemptedRevenue,
-    totalSubscriptions: wooSubscriptions.length,
-    activeSubscriptions: activeSubs.length,
-    inactiveSubscriptions: wooSubscriptions.filter((s) => ["cancelled", "canceled", "expired"].includes(s.status)).length,
-    pendingSubscriptions: wooSubscriptions.filter((s) => s.status === "pending" || s.status === "on-hold").length,
-    subscriptionCandidates: subscriptionCandidates.length,
-    subscriptionNote: activeSubs.length === 0 ? "No active subscriptions detected." : "",
-    failedPayments: failedSubsThisMonth.length,
-    failedPaymentsTotal: failedSubs.length,
-    failedPaymentsThisMonth: failedSubsThisMonth.length,
-    failedPaymentsLast30Days: failedSubsLast30Days.length,
-    failedCheckoutAttemptsThisMonth,
-    upcomingBills7d: activeSubs.filter((s) => isInRange(s.nextPaymentDate ?? "", now, new Date(now.getTime() + 7 * 86400000))).length,
-    upcomingBills30d: upcomingActiveSubs30d.length,
-    estimatedUpcomingRevenue30d: upcomingActiveSubs30d.reduce((a, s) => a + (s.amount ?? 0), 0),
-    monthlyRecurringRevenue: mrr,
-    newCustomersThisMonth,
-    newPaidCustomersThisMonth,
-    newHotLeadsThisMonth,
-    checkoutAttemptsThisMonth: storedOrders.length > 0 ? attemptedStoredOrdersThisMonth.length : currentMonthSales?.attemptedOrders ?? customers.filter((c) => isInRange(c.lastAttemptDate ?? "", startOfMonth, now)).reduce((a, c) => a + (c.attemptedOrderCount ?? 0), 0),
-    paidRevenueThisMonth: storedOrders.length > 0 ? paidStoredOrdersThisMonth.reduce((a, order) => a + Number(order.paidAmount ?? 0), 0) + gatewayOnlyPaidRevenueThisMonth : currentMonthSales?.paidRevenue ?? customers.filter((c) => isInRange(c.lastPaidDate ?? "", startOfMonth, now)).reduce((a, c) => a + (c.paidTotal ?? c.totalPaid ?? 0), 0),
-    attemptedPipelineThisMonth: storedOrders.length > 0 ? attemptedStoredOrdersThisMonth.reduce((a, order) => a + Number(order.attemptedAmount ?? 0), 0) : currentMonthSales?.attemptedPipeline ?? customers.filter((c) => isInRange(c.lastAttemptDate ?? "", startOfMonth, now)).reduce((a, c) => a + (c.attemptedTotal ?? 0), 0),
-    highValueCustomers: highValueCustomers.length,
-    highValueCustomersThisMonth,
-    sourceBreakdown,
-    salesHistoryUpdatedAt: salesHistory?.generatedAt ?? "",
-    lastSyncAt: String(lastJob?.finishedAt || lastJob?.updatedAt || ""),
+    readAnalyticsSnapshot<Record<string, unknown>>("dashboard_analytics", {}),
+    Customer.aggregate<{ _id: null; paidRevenue: number; attemptedRevenue: number; activeSubscriptions: number; activeGatewayRecurringCustomers: number; monthlyRecurringRevenue: number; highValueCustomers: number }>([
+      {
+        $group: {
+          _id: null,
+          paidRevenue: { $sum: { $ifNull: ["$lifetimeValue", { $ifNull: ["$rankingPaidTotal", { $ifNull: ["$paidTotal", "$totalPaid"] }] }] } },
+          attemptedRevenue: { $sum: { $ifNull: ["$attemptedTotal", 0] } },
+          activeSubscriptions: { $sum: { $ifNull: ["$activeSubscriptions", 0] } },
+          activeGatewayRecurringCustomers: { $sum: { $cond: ["$isGatewayRecurring", 1, 0] } },
+          monthlyRecurringRevenue: { $sum: { $cond: ["$isGatewayRecurring", { $ifNull: ["$recurringAmount", 0] }, 0] } },
+          highValueCustomers: { $sum: { $cond: [{ $gte: [{ $ifNull: ["$lifetimeValue", { $ifNull: ["$rankingPaidTotal", { $ifNull: ["$paidTotal", "$totalPaid"] }] }] }, highValueThreshold] }, 1, 0] } },
+        },
+      },
+    ]),
+  ]);
+  const fallback = fallbackAgg[0];
+  const cacheReady = Boolean(snapshot.analyticsCacheReady);
+  const fallbackPaidRevenue = Number(fallback?.paidRevenue ?? 0);
+  const fallbackActiveSubscriptions = Number(fallback?.activeSubscriptions ?? 0) + Number(fallback?.activeGatewayRecurringCustomers ?? 0);
+  const fallbackMrr = Number(fallback?.monthlyRecurringRevenue ?? 0);
+  const payload = {
+    customerCount,
+    totalRevenue: Number(snapshot.currentYearRevenue ?? fallbackPaidRevenue),
+    paidRevenue: Number(snapshot.rolling12MonthRevenue ?? snapshot.currentYearRevenue ?? fallbackPaidRevenue),
+    attemptedRevenue: Number(snapshot.attemptedRevenue ?? fallback?.attemptedRevenue ?? 0),
+    totalSubscriptions: Number(snapshot.totalSubscriptions ?? 0),
+    activeWooSubscriptions: Number(snapshot.activeWooSubscriptions ?? 0),
+    activeGatewayRecurringCustomers: Number(snapshot.activeGatewayRecurringCustomers ?? fallback?.activeGatewayRecurringCustomers ?? 0),
+    totalActiveRecurringCustomers: Number(snapshot.totalActiveRecurringCustomers ?? fallbackActiveSubscriptions),
+    activeSubscriptions: Number(snapshot.totalActiveRecurringCustomers ?? fallbackActiveSubscriptions),
+    monthlyRecurringRevenue: Number(snapshot.totalMonthlyRecurringRevenue ?? snapshot.activeMRR ?? fallbackMrr),
+    totalMonthlyRecurringRevenue: Number(snapshot.totalMonthlyRecurringRevenue ?? snapshot.activeMRR ?? fallbackMrr),
+    subscriptionCandidates: 0,
+    subscriptionNote: cacheReady ? "Cached subscription analytics" : "Analytics cache is rebuilding...",
+    upcomingBills30d: Number(snapshot.totalUpcomingThisMonth ?? 0),
+    estimatedUpcomingRevenue30d: Number(snapshot.totalUpcomingAmountThisMonth ?? 0),
+    paidRevenueThisMonth: Number(snapshot.currentMonthRevenue ?? 0),
+    attemptedPipelineThisMonth: 0,
+    checkoutAttemptsThisMonth: 0,
+    highValueCustomers: cacheReady ? highValueCustomers : Number(fallback?.highValueCustomers ?? 0),
+    highValueCustomersThisMonth: 0,
+    failedPaymentsThisMonth: 0,
+    newCustomersThisMonth: 0,
+    newPaidCustomersThisMonth: 0,
+    newHotLeadsThisMonth: 0,
+    sourceBreakdown: { woocommerce: Number(snapshot.totalMonthlyRecurringRevenue ?? 0) },
+    salesHistoryUpdatedAt: String(snapshot.analyticsGeneratedAt ?? ""),
+    lastSyncAt: String(lastJob?.finishedAt || lastJob?.updatedAt || snapshot.analyticsGeneratedAt || ""),
+    analyticsCacheReady: cacheReady,
+    message: cacheReady ? "" : "Analytics cache is rebuilding...",
   };
-  });
+  if (process.env.NODE_ENV === "development") {
+    console.log(`[api] customers-summary durationMs=${Date.now() - started} mongoMs=${Date.now() - dbStarted} cache=stored responseBytes=${JSON.stringify(payload).length}`);
+  }
+  return Response.json(payload);
 }

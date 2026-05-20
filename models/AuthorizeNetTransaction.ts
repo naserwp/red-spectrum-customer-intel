@@ -79,5 +79,7 @@ const authorizeNetTransactionSchema = new Schema<AuthorizeNetTransactionDocument
 );
 
 authorizeNetTransactionSchema.index({ normalizedEmail: 1, submittedAt: -1 });
+authorizeNetTransactionSchema.index({ invoiceNumber: 1, amount: 1, submittedAt: -1 });
+authorizeNetTransactionSchema.index({ createdAt: -1 });
 
 export const AuthorizeNetTransaction = mongoose.models.AuthorizeNetTransaction || mongoose.model<AuthorizeNetTransactionDocument>("AuthorizeNetTransaction", authorizeNetTransactionSchema);
