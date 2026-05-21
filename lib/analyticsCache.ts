@@ -1,10 +1,15 @@
 import { dateInRange, monthEnd, monthStart, monthsBetween, wooSubscriptionMrr } from "@/lib/revenueAnalytics";
+import { calculateCustomerValueMetrics } from "@/lib/customerValue";
 import { AnalyticsSnapshot } from "@/models/AnalyticsSnapshot";
+import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking } from "@/models/CustomerRanking";
+import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
 import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
 
 type LeanWooSubscription = WooCommerceSubscriptionDocument & { _id: unknown };
+type LeanAuthorizeNetTransaction = AuthorizeNetTransactionDocument & { _id: unknown };
+type LeanNmiQuickPayTransaction = NmiQuickPayTransactionDocument & { _id: unknown };
 
 function category(lifetimeSpent: number, attemptedPipeline: number) {
   if (lifetimeSpent >= 2000) return "VIP Paid Customer";
@@ -41,7 +46,7 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
     Customer.find({}, {
       name: 1, email: 1, normalizedEmail: 1, phone: 1, attemptedTotal: 1, attemptedOrderCount: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaidDate: 1, lastOrderDate: 1,
       activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, recurringNextEstimatedPayment: 1, recurringLastPayment: 1, paidMonths: 1, stayWithUsMonths: 1, riskLevel: 1,
-      lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1,
+      lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, orders: 1, gatewayPayments: 1, paidOrderCount: 1,
     }).sort({ lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1 }).skip(safeOffset).limit(safeLimit).lean<Array<CustomerDocument & { _id: unknown }>>(),
     Customer.estimatedDocumentCount(),
     WooCommerceSubscriptionRecord.find({}).lean<LeanWooSubscription[]>(),
@@ -59,13 +64,79 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
     ]),
   ]);
   const summary = summaryAgg[0];
+  const batchEmails = Array.from(new Set(customers.map((customer) => customer.normalizedEmail || customer.email?.trim().toLowerCase()).filter(Boolean)));
+  const batchIds = customers.map((customer) => String(customer._id));
+  const authConditions = [
+    ...(batchEmails.length ? [{ normalizedEmail: { $in: batchEmails } }, { emailNormalized: { $in: batchEmails } }, { customerEmail: { $in: batchEmails } }] : []),
+    ...(batchIds.length ? [{ matchedCustomerId: { $in: batchIds } }] : []),
+  ];
+  const authTransactions = authConditions.length ? await AuthorizeNetTransaction.find({ $or: authConditions }, {
+    transactionId: 1, transactionStatus: 1, invoiceNumber: 1, amount: 1, settledAt: 1, submittedAt: 1, normalizedEmail: 1, emailNormalized: 1, customerEmail: 1,
+    matchedCustomerId: 1, wooOrderNumberMatched: 1, wooOrderIdMatched: 1, customerName: 1,
+  }).limit(Math.max(100, customers.length * 25)).lean<LeanAuthorizeNetTransaction[]>() : [];
+  const authByCustomerId = new Map<string, LeanAuthorizeNetTransaction[]>();
+  const authByEmail = new Map<string, LeanAuthorizeNetTransaction[]>();
+  for (const transaction of authTransactions) {
+    if (transaction.matchedCustomerId) authByCustomerId.set(transaction.matchedCustomerId, [...(authByCustomerId.get(transaction.matchedCustomerId) ?? []), transaction]);
+    const email = transaction.normalizedEmail || transaction.emailNormalized || transaction.customerEmail;
+    if (email) authByEmail.set(email, [...(authByEmail.get(email) ?? []), transaction]);
+  }
+  const nmiConditions = [
+    ...(batchEmails.length ? [{ normalizedEmail: { $in: batchEmails } }, { emailNormalized: { $in: batchEmails } }, { customerEmail: { $in: batchEmails } }] : []),
+    ...(batchIds.length ? [{ matchedCustomerId: { $in: batchIds } }] : []),
+  ];
+  const nmiTransactions = nmiConditions.length ? await NmiQuickPayTransaction.find({ $or: nmiConditions }, {
+    transactionId: 1, transactionStatus: 1, invoiceNumber: 1, amount: 1, settledAt: 1, submittedAt: 1, normalizedEmail: 1, emailNormalized: 1, customerEmail: 1,
+    matchedCustomerId: 1, wooOrderNumberMatched: 1, wooOrderIdMatched: 1, customerName: 1,
+  }).limit(Math.max(100, customers.length * 25)).lean<LeanNmiQuickPayTransaction[]>() : [];
+  const nmiByCustomerId = new Map<string, LeanNmiQuickPayTransaction[]>();
+  const nmiByEmail = new Map<string, LeanNmiQuickPayTransaction[]>();
+  for (const transaction of nmiTransactions) {
+    if (transaction.matchedCustomerId) nmiByCustomerId.set(transaction.matchedCustomerId, [...(nmiByCustomerId.get(transaction.matchedCustomerId) ?? []), transaction]);
+    const email = transaction.normalizedEmail || transaction.emailNormalized || transaction.customerEmail;
+    if (email) nmiByEmail.set(email, [...(nmiByEmail.get(email) ?? []), transaction]);
+  }
   const rankingRows = [];
+  const customerMetricUpdates = [];
   for (const customer of customers) {
-    if (Date.now() - started > maxRuntimeMs - 500) break;
-    const lifetimeSpent = paidValue(customer);
-    const firstPaidDate = customer.firstPaidDate || customer.firstOrderDate || "";
-    const latestPaidDate = customer.lastPaidDate || customer.lastOrderDate || "";
-    const attemptedPipeline = Number(customer.attemptedTotal ?? 0);
+    if (rankingRows.length > 0 && Date.now() - started > maxRuntimeMs - 500) break;
+    const customerEmail = customer.normalizedEmail || customer.email?.trim().toLowerCase() || "";
+    const customerAuthTransactions = [
+      ...(authByCustomerId.get(String(customer._id)) ?? []),
+      ...(customerEmail ? authByEmail.get(customerEmail) ?? [] : []),
+    ].filter((transaction, index, rows) => rows.findIndex((row) => row.transactionId === transaction.transactionId) === index);
+    const customerNmiTransactions = [
+      ...(nmiByCustomerId.get(String(customer._id)) ?? []),
+      ...(customerEmail ? nmiByEmail.get(customerEmail) ?? [] : []),
+    ].filter((transaction, index, rows) => rows.findIndex((row) => row.transactionId === transaction.transactionId) === index);
+    const metrics = calculateCustomerValueMetrics({ customer, authorizeNetTransactions: customerAuthTransactions, nmiTransactions: customerNmiTransactions, subscriptions: subscriptions.filter((sub) => sub.normalizedEmail === customerEmail) });
+    const lifetimeSpent = metrics.rankingTotal || paidValue(customer);
+    const firstPaidDate = metrics.firstPaidDate || customer.firstPaidDate || customer.firstOrderDate || "";
+    const latestPaidDate = metrics.lastPaidDate || customer.lastPaidDate || customer.lastOrderDate || "";
+    const attemptedPipeline = metrics.attemptedTotal;
+    customerMetricUpdates.push({
+      updateOne: {
+        filter: { _id: customer._id },
+        update: {
+          $set: {
+            lifetimeValue: lifetimeSpent,
+            rankingPaidTotal: lifetimeSpent,
+            paidTotal: lifetimeSpent,
+            totalPaid: lifetimeSpent,
+            wooPaidTotal: metrics.wooPaidTotal,
+            authorizeNetPaidTotal: metrics.authorizeNetPaidTotal,
+            gatewayOnlyPaidTotal: metrics.gatewayOnlyPaidTotal,
+            nmiQuickPayPaidTotal: metrics.nmiQuickPayPaidTotal,
+            subscriptionPaidTotal: metrics.subscriptionPaidTotal,
+            attemptedTotal: attemptedPipeline,
+            paidMonths: metrics.paidMonths,
+            firstPaidDate,
+            lastPaidDate: latestPaidDate,
+            stayWithUsMonths: metrics.stayWithUsMonths,
+          },
+        },
+      },
+    });
     rankingRows.push({
       customerId: String(customer._id),
       name: customer.name,
@@ -92,6 +163,9 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
     await CustomerRanking.bulkWrite(filteredRankingRows.map((row) => ({
       updateOne: { filter: { customerId: row.customerId }, update: { $set: row }, upsert: true },
     })), { ordered: false });
+  }
+  if (customerMetricUpdates.length) {
+    await Customer.bulkWrite(customerMetricUpdates, { ordered: false });
   }
 
   const activeWooSubscriptions = subscriptions.filter((subscription) => subscription.status === "active");

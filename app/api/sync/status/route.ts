@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { connectToDatabase } from "@/lib/mongodb";
 import { AuthorizeNetTransaction } from "@/models/AuthorizeNetTransaction";
 import { Customer } from "@/models/Customer";
+import { NmiQuickPayTransaction } from "@/models/NmiQuickPayTransaction";
 import { SyncJob } from "@/models/SyncJob";
 import { WooCommerceOrderRecord } from "@/models/WooCommerceOrder";
 import { WooCommerceSubscriptionRecord } from "@/models/WooCommerceSubscription";
@@ -19,15 +20,16 @@ function freshness(lastSyncAt: string, counts: { customers: number; wooOrders: n
 
 export async function GET() {
   await connectToDatabase();
-  const [lastJob, customers, wooOrders, wooSubscriptions, authorizeNetTransactions] = await Promise.all([
+  const [lastJob, customers, wooOrders, wooSubscriptions, authorizeNetTransactions, nmiQuickPayTransactions] = await Promise.all([
     SyncJob.findOne({}).sort({ finishedAt: -1, updatedAt: -1 }).lean<LeanSyncJob | null>(),
     Customer.countDocuments({}),
     WooCommerceOrderRecord.countDocuments({}),
     WooCommerceSubscriptionRecord.countDocuments({}),
     AuthorizeNetTransaction.countDocuments({}),
+    NmiQuickPayTransaction.countDocuments({}),
   ]);
   const lastSyncAt = String(lastJob?.finishedAt || lastJob?.updatedAt || "");
-  const counts = { customers, wooOrders, wooSubscriptions, authorizeNetTransactions };
+  const counts = { customers, wooOrders, wooSubscriptions, authorizeNetTransactions, nmiQuickPayTransactions };
   return NextResponse.json({
     lastSyncAt,
     lastSuccessfulStep: lastJob?.status === "completed" ? lastJob.jobType : "",

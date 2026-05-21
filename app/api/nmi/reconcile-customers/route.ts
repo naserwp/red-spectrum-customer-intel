@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
-import { isSettledSuccessful } from "@/lib/authorizeNet";
-import { reconcileAuthorizeNetTransaction } from "@/lib/authorizeNetReconciliation";
+import { reconcileNmiTransaction } from "@/lib/nmiReconciliation";
 import { connectToDatabase } from "@/lib/mongodb";
-import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
+import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
 
 export const dynamic = "force-dynamic";
 
@@ -14,6 +13,10 @@ function safeNumber(value: unknown, fallback: number, max: number) {
   return Math.min(max, Math.floor(parsed));
 }
 
+export async function GET() {
+  return NextResponse.json({ error: "Method not allowed. Use POST to reconcile NMI Quick Pay transactions." }, { status: 405 });
+}
+
 export async function POST(request: Request) {
   const started = Date.now();
   const body = await request.json().catch(() => ({})) as { limit?: number; offset?: number; dryRun?: boolean };
@@ -21,69 +24,53 @@ export async function POST(request: Request) {
   const offset = safeNumber(body.offset, 0, 1000000);
   const dryRun = body.dryRun === true;
   await connectToDatabase();
-
   const [transactions, total] = await Promise.all([
-    AuthorizeNetTransaction.find({}).sort({ submittedAt: -1 }).skip(offset).limit(limit).lean<AuthorizeNetTransactionDocument[]>().exec(),
-    AuthorizeNetTransaction.countDocuments({}),
+    NmiQuickPayTransaction.find({}).sort({ submittedAt: -1 }).skip(offset).limit(limit).lean<NmiQuickPayTransactionDocument[]>(),
+    NmiQuickPayTransaction.countDocuments({}),
   ]);
   const warnings: string[] = dryRun ? ["Dry run: no Customer records were written."] : [];
   let processed = 0;
   let matched = 0;
-  let attachedAuthorizeNetOnly = 0;
+  let attachedGatewayOnly = 0;
   let verifiedWooOrders = 0;
   let skippedDuplicates = 0;
   let unmatched = 0;
-  let unmatchedSettledTransactions = 0;
   let updated = 0;
 
   for (const transaction of transactions) {
     if (Date.now() - started > runtimeBudgetMs - 1000) {
-      warnings.push(`Stopped Authorize.net reconciliation batch at ${processed} processed transactions to stay within runtime budget.`);
+      warnings.push(`Stopped NMI reconciliation batch at ${processed} processed transactions to stay within runtime budget.`);
       break;
     }
     processed += 1;
-    const result = await reconcileAuthorizeNetTransaction(transaction, dryRun);
+    const result = await reconcileNmiTransaction(transaction, dryRun);
     if (!result.matched) {
       unmatched += 1;
-      if (isSettledSuccessful(transaction.transactionStatus)) unmatchedSettledTransactions += 1;
       continue;
     }
     matched += 1;
-    if (result.attachedAuthorizeNetOnly) attachedAuthorizeNetOnly += 1;
+    if (result.attachedGatewayOnly) attachedGatewayOnly += 1;
     if (result.verifiedWooOrder) verifiedWooOrders += 1;
     if (result.skippedDuplicate) skippedDuplicates += 1;
     if (result.updated) updated += 1;
   }
 
   const nextOffset = offset + processed;
-  const stoppedForBudget = warnings.some((warning) => warning.includes("runtime budget"));
-  const hasMore = nextOffset < total || stoppedForBudget;
+  const hasMore = nextOffset < total || warnings.some((warning) => warning.includes("runtime budget"));
   return NextResponse.json({
     dryRun,
     processed,
     matched,
-    attachedAuthorizeNetOnly,
+    attachedGatewayOnly,
     verifiedWooOrders,
     skippedDuplicates,
     unmatched,
-    unmatchedSettledTransactions,
     customersUpdated: dryRun ? 0 : updated,
     hasMore,
     nextOffset,
     warnings,
-    transactionsProcessed: processed,
-    transactionsMatched: matched,
-    debug: {
-      fetchedFromGateway: 0,
-      insertedIntoMongo: 0,
-      skippedDuplicates,
-      matchedCustomers: matched,
-      unmatchedSettledTransactions,
-      rejectedRecords: 0,
-      latestImportedTransactionId: transactions[0]?.transactionId ?? "",
-    },
     message: hasMore
-      ? `Processed ${processed} Authorize.net transactions. Continue reconciliation to process next batch.`
-      : `Processed ${processed} Authorize.net transactions. Reconciliation batch is complete.`,
+      ? `Processed ${processed} NMI Quick Pay transactions. Continue reconciliation to process next batch.`
+      : `Processed ${processed} NMI Quick Pay transactions. Reconciliation batch is complete.`,
   });
 }

@@ -1,6 +1,7 @@
 import { cachedJson } from "@/lib/apiCache";
 import { connectToDatabase } from "@/lib/mongodb";
 import { AuthorizeNetTransaction } from "@/models/AuthorizeNetTransaction";
+import { NmiQuickPayTransaction } from "@/models/NmiQuickPayTransaction";
 import { SalesHistory, type SalesHistoryDocument } from "@/models/SalesHistory";
 import type { SalesPeriodMetricDocument } from "@/models/SalesHistory";
 
@@ -45,7 +46,7 @@ export async function GET(request: Request) {
   const minYear = new Date().getFullYear() - years + 1;
   const history = await SalesHistory.findOne({ source: "woocommerce" }).lean<SalesHistoryDocument | null>();
   const minDate = `${minYear}-01-01`;
-  const [authorizeYearly, authorizeMonthly] = await Promise.all([
+  const [authorizeYearly, authorizeMonthly, nmiYearly, nmiMonthly] = await Promise.all([
     AuthorizeNetTransaction.aggregate<AuthorizeNetSalesMetric>([
       { $addFields: { authDate: { $cond: [{ $ne: ["$settledAt", ""] }, "$settledAt", "$submittedAt"] } } },
       { $match: { transactionStatus: { $regex: "settled|captured", $options: "i" }, authDate: { $gte: minDate }, $or: [{ wooOrderNumberMatched: "" }, { wooOrderNumberMatched: { $exists: false } }], $and: [{ $or: [{ wooOrderIdMatched: 0 }, { wooOrderIdMatched: { $exists: false } }] }] } },
@@ -56,11 +57,23 @@ export async function GET(request: Request) {
       { $match: { transactionStatus: { $regex: "settled|captured", $options: "i" }, authDate: { $gte: minDate }, $or: [{ wooOrderNumberMatched: "" }, { wooOrderNumberMatched: { $exists: false } }], $and: [{ $or: [{ wooOrderIdMatched: 0 }, { wooOrderIdMatched: { $exists: false } }] }] } },
       { $group: { _id: { $substr: ["$authDate", 0, 7] }, paidRevenue: { $sum: "$amount" }, paidOrders: { $sum: 1 } } },
     ]),
+    NmiQuickPayTransaction.aggregate<AuthorizeNetSalesMetric>([
+      { $addFields: { txDate: { $cond: [{ $ne: ["$settledAt", ""] }, "$settledAt", "$submittedAt"] } } },
+      { $match: { transactionStatus: { $regex: "success|settled|approved|complete", $options: "i" }, txDate: { $gte: minDate }, $or: [{ wooOrderNumberMatched: "" }, { wooOrderNumberMatched: { $exists: false } }], $and: [{ $or: [{ wooOrderIdMatched: 0 }, { wooOrderIdMatched: { $exists: false } }] }] } },
+      { $group: { _id: { $substr: ["$txDate", 0, 4] }, paidRevenue: { $sum: "$amount" }, paidOrders: { $sum: 1 } } },
+    ]),
+    NmiQuickPayTransaction.aggregate<AuthorizeNetSalesMetric>([
+      { $addFields: { txDate: { $cond: [{ $ne: ["$settledAt", ""] }, "$settledAt", "$submittedAt"] } } },
+      { $match: { transactionStatus: { $regex: "success|settled|approved|complete", $options: "i" }, txDate: { $gte: minDate }, $or: [{ wooOrderNumberMatched: "" }, { wooOrderNumberMatched: { $exists: false } }], $and: [{ $or: [{ wooOrderIdMatched: 0 }, { wooOrderIdMatched: { $exists: false } }] }] } },
+      { $group: { _id: { $substr: ["$txDate", 0, 7] }, paidRevenue: { $sum: "$amount" }, paidOrders: { $sum: 1 } } },
+    ]),
   ]);
   const yearly = history?.yearly.filter((row) => Number(row.period) >= minYear).map((row) => ({ ...row })) ?? [];
   const monthly = history?.monthly.filter((row) => Number(row.period.slice(0, 4)) >= minYear).map((row) => ({ ...row })) ?? [];
   for (const row of authorizeYearly) applyAuthorizeNetOnlyPaid(yearly, row._id, Number(row.paidRevenue ?? 0), Number(row.paidOrders ?? 0));
   for (const row of authorizeMonthly) applyAuthorizeNetOnlyPaid(monthly, row._id, Number(row.paidRevenue ?? 0), Number(row.paidOrders ?? 0));
+  for (const row of nmiYearly) applyAuthorizeNetOnlyPaid(yearly, row._id, Number(row.paidRevenue ?? 0), Number(row.paidOrders ?? 0));
+  for (const row of nmiMonthly) applyAuthorizeNetOnlyPaid(monthly, row._id, Number(row.paidRevenue ?? 0), Number(row.paidOrders ?? 0));
   yearly.sort((a, b) => a.period.localeCompare(b.period));
   monthly.sort((a, b) => a.period.localeCompare(b.period));
   return {

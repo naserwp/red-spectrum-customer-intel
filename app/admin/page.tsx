@@ -12,6 +12,7 @@ type Customer = {
   lifetimeSpent?: number; periodSpent?: number; monthlySpent?: number; yearlySpent?: number; attemptedPipeline?: number;
   lifetimeValue?: number; rankingPaidTotal?: number; paidOrderCount?: number; gatewayPaidCount?: number; attemptedOrderCount?: number; paidMonths?: number;
   firstPaidDate?: string; latestPaidDate?: string; subscriptionStartDate?: string; stayWithUsMonths?: number; activeSubscriptionCount?: number; estimatedMRR?: number; category?: string; leadStatus?: string; paymentStatus?: string; lastPaidDate?: string; lastAttemptDate?: string;
+  businessName?: string;
   activeSubscriptions: number; failedPayments: number; chargebacks: number; estimatedCreditLimit: number; tier: string; riskLevel: string;
   score: number; stars: number; aiSummaryPreview: string; aiSummary: string; subscriptionStatus: string; orderCount: number; averageOrderValue: number;
   firstOrderDate: string; lastOrderDate: string; refunds: number; riskExplanation: string; recommendedAction: string;
@@ -84,6 +85,26 @@ type SyncRunResult = {
   transactionsUpserted?: number;
   transactionsProcessed?: number;
   transactionsMatched?: number;
+  transactionsDiscovered?: number;
+  transactionsInserted?: number;
+  transactionsModified?: number;
+  skippedDuplicates?: number;
+  rejectedRecords?: number;
+  latestImportedTransactionId?: string;
+  unmatchedSettledTransactions?: number;
+  debug?: {
+    fetchedFromGateway?: number;
+    insertedIntoMongo?: number;
+    upsertedIntoMongo?: number;
+    skippedDuplicates?: number;
+    matchedCustomers?: number;
+    unmatchedSettledTransactions?: number;
+    rejectedRecords?: number;
+    latestImportedTransactionId?: string;
+    windowsScanned?: number;
+    batchesFetched?: number;
+    gatewayFetchFailures?: number;
+  };
   customersUpdated?: number;
   customersProcessed?: number;
   customersRebuilt?: number;
@@ -116,7 +137,8 @@ type RebuildBatchState = {
 type AuthNetBatchState = {
   hasMore: boolean;
   nextOffset: number;
-  action: "import" | "reconcile";
+  nextCursor?: { windowStart?: string; transactionOffset?: number };
+  action: "import" | "reconcile" | "nmi_import" | "nmi_reconcile" | "analytics_rebuild";
 };
 
 type SyncStepResult = {
@@ -128,13 +150,15 @@ type SyncStepResult = {
   subscriptionsImported?: number;
   authorizeNetTransactionsImported?: number;
   authorizeNetPaymentsReconciled?: number;
+  nmiTransactionsImported?: number;
+  nmiPaymentsReconciled?: number;
   warnings?: string[];
 };
 
 type SyncStatus = {
   lastSyncAt?: string;
   dataFreshness?: string;
-  counts?: { customers?: number; wooOrders?: number; wooSubscriptions?: number; authorizeNetTransactions?: number };
+  counts?: { customers?: number; wooOrders?: number; wooSubscriptions?: number; authorizeNetTransactions?: number; nmiQuickPayTransactions?: number };
 };
 
 type DashboardRequestInit = RequestInit & {
@@ -247,6 +271,29 @@ function Card({ label, value, helper }: { label: string; value: string | number;
   </div>;
 }
 
+function GatewayDebugPanel({ result }: { result: SyncRunResult | null }) {
+  if (!result) return null;
+  const debug = result.debug ?? {};
+  const rows = [
+    ["Fetched from gateway", debug.fetchedFromGateway ?? result.transactionsFetched ?? result.transactionsDiscovered ?? "-"],
+    ["Inserted into Mongo", debug.insertedIntoMongo ?? result.transactionsInserted ?? result.transactionsUpserted ?? "-"],
+    ["Skipped duplicates", debug.skippedDuplicates ?? result.skippedDuplicates ?? "-"],
+    ["Matched customers", debug.matchedCustomers ?? result.transactionsMatched ?? "-"],
+    ["Unmatched settled transactions", debug.unmatchedSettledTransactions ?? result.unmatchedSettledTransactions ?? "-"],
+    ["Rejected records", debug.rejectedRecords ?? result.rejectedRecords ?? "-"],
+    ["Latest imported transaction ID", debug.latestImportedTransactionId ?? result.latestImportedTransactionId ?? "-"],
+  ];
+  return <div className="rounded-xl border border-red-950/40 bg-zinc-950 p-4">
+    <h3 className="text-sm font-semibold uppercase tracking-wide text-red-300">Gateway Import Debug</h3>
+    <div className="mt-3 grid gap-2 md:grid-cols-2">
+      {rows.map(([label, value]) => <div key={label} className="rounded border border-zinc-800 bg-zinc-900 p-3 text-sm">
+        <p className="text-xs uppercase text-zinc-500">{label}</p>
+        <p className="mt-1 break-all font-semibold text-zinc-100">{String(value)}</p>
+      </div>)}
+    </div>
+  </div>;
+}
+
 function LoadingSkeleton() {
   return <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
     {[0, 1, 2, 3].map((item) => <div key={item} className="h-24 animate-pulse rounded-xl border border-zinc-800 bg-zinc-900/70" />)}
@@ -263,16 +310,17 @@ function Pager({ start, end, total, page, maxPage, setPage }: { start: number; e
 function CustomerTable({ rows, exportCustomerPdf }: { rows: Customer[]; exportCustomerPdf: (c: Customer) => void }) {
   if (rows.length === 0) return <p className="rounded-xl border border-zinc-800 bg-zinc-900 p-4 text-zinc-400">No customer profiles found. Go to Sync Center and run Import WooCommerce Orders, then Update Customer Profiles.</p>;
   return <div className="overflow-x-auto rounded-xl border border-zinc-800">
-    <table className="min-w-[1750px] table-fixed text-sm">
-      <thead className="sticky top-0 bg-zinc-950"><tr>{["Customer", "Category", "Tier", "Actual Paid", "Attempted Pipeline", "Paid Orders", "Attempted Orders", "Start", "Tenure", "Payment Status", "Lead Status", "Last Paid", "Last Attempt", "Risk", "Score", "Preview", "Actions"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
+    <table className="min-w-[1700px] table-fixed text-sm">
+      <thead className="sticky top-0 bg-zinc-950"><tr>{["Customer", "Category", "Tier", "Actual Paid", "Credit Limit", "Paid Orders", "Attempted Orders", "Start", "Tenure", "Payment Status", "Lead Status", "Last Paid", "Last Attempt", "Risk", "Score", "Preview", "Actions"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
       <tbody>{rows.map((c) => {
         const cat = getCustomerCategory(c);
+        const creditLimit = Number(c.estimatedCreditLimit ?? 0);
         return <tr key={c._id} className={`border-t border-zinc-800 ${cat === "vip_paid" ? "bg-amber-500/5" : cat.includes("hot") ? "bg-orange-500/5" : ""}`}>
           <td className="w-56 px-3 py-3"><p className="truncate font-semibold">{c.name}</p><p className="truncate text-xs text-zinc-400">{c.email}</p></td>
           <td className="px-3 py-3"><span className={`inline-flex rounded border px-2 py-1 text-xs ${badgeClass[cat]}`}>{categoryLabel[cat]}</span></td>
           <td className="px-3 py-3">{paidAmount(c) > 0 ? c.tier : "Lead"}</td>
           <td className="px-3 py-3 font-semibold">{money(paidAmount(c))}</td>
-          <td className="px-3 py-3">{money(attemptedAmount(c))}</td>
+          <td className="px-3 py-3">{creditLimit > 0 ? money(creditLimit) : "-"}</td>
           <td className="px-3 py-3">{c.paidOrderCount ?? 0}</td>
           <td className="px-3 py-3">{c.attemptedOrderCount ?? 0}</td>
           <td className="px-3 py-3">{displayDate(customerStartDate(c))}</td>
@@ -354,24 +402,24 @@ function SubscriptionTable({ rows }: { rows: Subscription[] }) {
 
 function ValueIndex({ rows, rankOffset = 0 }: { rows: Customer[]; rankOffset?: number }) {
   return <div className="overflow-x-auto rounded-xl border border-zinc-800">
-    <table className="min-w-[1550px] text-sm">
-      <thead className="sticky top-0 bg-zinc-950"><tr>{["Rank", "Customer", "Lifetime Spent", "Period Spent", "Monthly", "Yearly", "Paid Months", "First Paid", "Latest Paid", "Active Subs", "Estimated MRR", "Stay With Us", "Attempted Pipeline", "Category", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
+    <table className="min-w-[1650px] text-sm">
+      <thead className="sticky top-0 bg-zinc-950"><tr>{["Rank", "Customer", "Business Name", "Lifetime Spent", "Tier", "Payment Status", "Risk", "Score", "Credit Limit", "Paid Months", "Latest Paid", "Stay With Us", "Category", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
       <tbody>{rows.map((c, index) => {
         const cat = getCustomerCategory(c);
+        const creditLimit = Number(c.estimatedCreditLimit ?? 0);
         return <tr key={c._id} className="border-t border-zinc-800">
           <td className="px-3 py-3 font-semibold">#{c.rank ?? rankOffset + index + 1}</td>
           <td className="px-3 py-3"><p className="font-semibold">{c.name}</p><p className="text-xs text-zinc-400">{c.email}</p></td>
+          <td className="px-3 py-3">{c.businessName || "-"}</td>
           <td className="px-3 py-3 font-semibold">{money(paidAmount(c))}</td>
-          <td className="px-3 py-3">{money(Number(c.periodSpent ?? paidAmount(c)))}</td>
-          <td className="px-3 py-3">{money(Number(c.monthlySpent ?? 0))}</td>
-          <td className="px-3 py-3">{money(Number(c.yearlySpent ?? 0))}</td>
+          <td className="px-3 py-3">{paidAmount(c) > 0 ? c.tier : "Lead"}</td>
+          <td className="px-3 py-3">{displayStatus(c.paymentStatus)}</td>
+          <td className="px-3 py-3">{c.riskLevel || "-"}</td>
+          <td className="px-3 py-3">{c.score ?? 0}</td>
+          <td className="px-3 py-3">{creditLimit > 0 ? money(creditLimit) : "-"}</td>
           <td className="px-3 py-3">{customerPaidMonths(c)}</td>
-          <td className="px-3 py-3">{displayDate(customerStartDate(c))}</td>
           <td className="px-3 py-3">{displayDate(c.latestPaidDate || c.lastPaidDate || c.lastOrderDate)}</td>
-          <td className="px-3 py-3">{Number(c.activeSubscriptionCount ?? c.activeSubscriptions ?? 0)}</td>
-          <td className="px-3 py-3">{money(Number(c.estimatedMRR ?? 0))}</td>
           <td className="px-3 py-3">{customerStayMonths(c)} months</td>
-          <td className="px-3 py-3">{money(attemptedAmount(c))}</td>
           <td className="px-3 py-3"><span className={`inline-flex rounded border px-2 py-1 text-xs ${badgeClass[cat]}`}>{c.category || categoryLabel[cat]}</span></td>
           <td className="px-3 py-3"><Link className="rounded bg-zinc-700 px-2 py-1" href={customerDetailHref(c)}>View</Link></td>
         </tr>;
@@ -856,7 +904,7 @@ export default function AdminPage() {
     setSyncRunning(true);
     stopSyncRef.current = false;
     let cursor: Record<string, unknown> | undefined;
-    const totals = { ordersImported: 0, customersUpdated: 0, subscriptionsImported: 0, authorizeNetTransactionsImported: 0, authorizeNetPaymentsReconciled: 0 };
+    const totals = { ordersImported: 0, customersUpdated: 0, subscriptionsImported: 0, authorizeNetTransactionsImported: 0, authorizeNetPaymentsReconciled: 0, nmiTransactionsImported: 0, nmiPaymentsReconciled: 0 };
     const warnings: string[] = [];
     try {
       for (let step = 0; step < 250; step += 1) {
@@ -879,11 +927,13 @@ export default function AdminPage() {
         totals.subscriptionsImported += Number(data.subscriptionsImported ?? 0);
         totals.authorizeNetTransactionsImported += Number(data.authorizeNetTransactionsImported ?? 0);
         totals.authorizeNetPaymentsReconciled += Number(data.authorizeNetPaymentsReconciled ?? 0);
+        totals.nmiTransactionsImported += Number(data.nmiTransactionsImported ?? 0);
+        totals.nmiPaymentsReconciled += Number(data.nmiPaymentsReconciled ?? 0);
         warnings.push(...(data.warnings ?? []).filter(Boolean));
         cursor = data.nextCursor;
         setMessage(data.progressLabel || "Sync step complete.");
         if (!data.hasMore) {
-          setMessage(`Sync complete. Orders: ${totals.ordersImported}. Customers updated: ${totals.customersUpdated}. Subscriptions: ${totals.subscriptionsImported}. Authorize.net transactions: ${totals.authorizeNetTransactionsImported}.`);
+          setMessage(`Sync complete. Orders: ${totals.ordersImported}. Customers updated: ${totals.customersUpdated}. Subscriptions: ${totals.subscriptionsImported}. Authorize.net transactions: ${totals.authorizeNetTransactionsImported}. NMI Quick Pay transactions: ${totals.nmiTransactionsImported}.`);
           break;
         }
         await new Promise((resolve) => window.setTimeout(resolve, 300));
@@ -893,7 +943,7 @@ export default function AdminPage() {
         status: warnings.length ? "Completed with warnings" : "Completed",
         ordersImported: totals.ordersImported,
         subscriptionsImported: totals.subscriptionsImported,
-        gatewayTransactionsImported: totals.authorizeNetTransactionsImported,
+        gatewayTransactionsImported: totals.authorizeNetTransactionsImported + totals.nmiTransactionsImported,
         customersUpdated: totals.customersUpdated,
         warnings,
         lastRunTime: new Date().toLocaleString(),
@@ -993,17 +1043,18 @@ export default function AdminPage() {
     await loadActiveTab(tab, { page: 1, query: appliedSearch });
   };
 
-  const runAuthorizeNetImport = async (offset = 0) => {
+  const runAuthorizeNetImport = async (offset = 0, cursor?: AuthNetBatchState["nextCursor"]) => {
     setError("");
-    setMessage("Importing Authorize.net transactions...");
+    setMessage("Importing Authorize.net historical transactions...");
     const res = await fetch("/api/authorize-net/backfill-transactions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        from: "2024-01-01",
+        from: "2019-01-01",
         to: dateInput(new Date()),
         limit: 50,
         offset,
+        cursor,
         dryRun: false,
       }),
     });
@@ -1011,14 +1062,87 @@ export default function AdminPage() {
     setSyncResult(data);
     if (!res.ok) return setError(data.error || "Authorize.net import failed");
     const imported = Number(data.transactionsUpserted ?? 0);
-    setMessage(data.hasMore ? `Imported ${imported} Authorize.net transactions. Continue import to process next batch.` : `Imported ${imported} Authorize.net transactions.`);
-    setAuthNetBatch(data.hasMore ? { hasMore: true, nextOffset: Number(data.nextOffset ?? offset + 50), action: "import" } : null);
+    setMessage(data.hasMore ? `Imported ${imported} Authorize.net historical transactions. Continue import to process next batch.` : `Imported ${imported} Authorize.net historical transactions.`);
+    setAuthNetBatch(data.hasMore ? { hasMore: true, nextOffset: Number(data.nextOffset ?? offset + 1), nextCursor: data.nextCursor, action: "import" } : null);
     setSyncLastRun({
-      action: "Import Authorize.net Transactions",
+      action: "Import Authorize.net Historical Transactions",
       status: data.warnings?.length ? "Completed with warnings" : "Completed",
       ordersImported: 0,
       customersUpdated: 0,
       gatewayTransactionsImported: imported,
+      warnings: data.warnings ?? [],
+      lastRunTime: new Date().toLocaleString(),
+    });
+    await loadActiveTab(tab, { page: 1, query: appliedSearch });
+  };
+
+  const runReconcileAllGatewayPayments = async () => {
+    setError("");
+    setMessage("Reconciling all gateway payments...");
+    const [authorizeNetRes, nmiRes] = await Promise.all([
+      fetch("/api/authorize-net/reconcile-customers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ limit: 50, offset: 0, dryRun: false }),
+      }),
+      fetch("/api/nmi/reconcile-customers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ limit: 50, offset: 0, dryRun: false }),
+      }),
+    ]);
+    const [authorizeNetData, nmiData] = await Promise.all([authorizeNetRes.json(), nmiRes.json()]);
+    const warnings = [
+      ...(authorizeNetData.warnings ?? []),
+      ...(nmiData.warnings ?? []),
+    ];
+    if (!authorizeNetRes.ok || !nmiRes.ok) {
+      setSyncResult({ warnings });
+      return setError(authorizeNetData.error || nmiData.error || "Gateway payment reconciliation failed");
+    }
+    const customersUpdated = Number(authorizeNetData.customersUpdated ?? 0) + Number(nmiData.customersUpdated ?? 0);
+    const processed = Number(authorizeNetData.processed ?? 0) + Number(nmiData.processed ?? 0);
+    const hasMore = Boolean(authorizeNetData.hasMore || nmiData.hasMore);
+    setSyncResult({
+      transactionsProcessed: processed,
+      customersUpdated,
+      hasMore,
+      warnings,
+      message: hasMore
+        ? "Reconciled one gateway payment batch. Continue individual gateway reconciliation to process remaining records."
+        : "Reconciled all available gateway payment batches.",
+    });
+    setMessage(hasMore ? `Updated ${customersUpdated} customer gateway payment records. Continue individual reconciliation to process remaining batches.` : `Updated ${customersUpdated} customer gateway payment records.`);
+    setSyncLastRun({
+      action: "Reconcile All Gateway Payments",
+      status: warnings.length ? "Completed with warnings" : "Completed",
+      ordersImported: 0,
+      customersUpdated,
+      warnings,
+      lastRunTime: new Date().toLocaleString(),
+    });
+    await loadActiveTab(tab, { page: 1, query: appliedSearch });
+  };
+
+  const runAnalyticsCacheRebuild = async (offset = 0) => {
+    setError("");
+    setMessage("Rebuilding customer analytics cache...");
+    const res = await fetch("/api/analytics/rebuild-cache", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: 100, offset }),
+    });
+    const data = await res.json();
+    setSyncResult(data);
+    if (!res.ok) return setError(data.error || "Analytics cache rebuild failed");
+    const processed = Number(data.customersProcessed ?? 0);
+    setMessage(data.hasMore ? `Processed ${processed} customers. Continue cache rebuild to process next batch.` : `Rebuilt analytics cache for ${processed} customers.`);
+    setAuthNetBatch(data.hasMore ? { hasMore: true, nextOffset: Number(data.nextOffset ?? offset + 100), action: "analytics_rebuild" } : null);
+    setSyncLastRun({
+      action: "Rebuild Customer Analytics Cache",
+      status: data.warnings?.length ? "Completed with warnings" : "Completed",
+      ordersImported: 0,
+      customersUpdated: processed,
       warnings: data.warnings ?? [],
       lastRunTime: new Date().toLocaleString(),
     });
@@ -1045,6 +1169,57 @@ export default function AdminPage() {
     setAuthNetBatch(data.hasMore ? { hasMore: true, nextOffset: Number(data.nextOffset ?? offset + 50), action: "reconcile" } : null);
     setSyncLastRun({
       action: "Reconcile Authorize.net Payments",
+      status: data.warnings?.length ? "Completed with warnings" : "Completed",
+      ordersImported: 0,
+      customersUpdated: updated,
+      warnings: data.warnings ?? [],
+      lastRunTime: new Date().toLocaleString(),
+    });
+    await loadActiveTab(tab, { page: 1, query: appliedSearch });
+  };
+
+  const runNmiImport = async (offset = 0) => {
+    setError("");
+    setMessage("Importing NMI Quick Pay transactions...");
+    const res = await fetch("/api/nmi/backfill-transactions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from: "2019-01-01", to: dateInput(new Date()), limit: 25, offset, dryRun: false, source: "both" }),
+    });
+    const data = await res.json();
+    setSyncResult(data);
+    if (!res.ok) return setError(data.error || "NMI Quick Pay import failed");
+    const imported = Number(data.transactionsUpserted ?? 0);
+    setMessage(data.hasMore ? `Imported ${imported} NMI Quick Pay transactions. Continue import to process next batch.` : `Imported ${imported} NMI Quick Pay transactions.`);
+    setAuthNetBatch(data.hasMore ? { hasMore: true, nextOffset: Number(data.nextOffset ?? offset + 25), action: "nmi_import" } : null);
+    setSyncLastRun({
+      action: "Import NMI Quick Pay Transactions",
+      status: data.warnings?.length ? "Completed with warnings" : "Completed",
+      ordersImported: 0,
+      customersUpdated: 0,
+      gatewayTransactionsImported: imported,
+      warnings: data.warnings ?? [],
+      lastRunTime: new Date().toLocaleString(),
+    });
+    await loadActiveTab(tab, { page: 1, query: appliedSearch });
+  };
+
+  const runNmiReconcile = async (offset = 0) => {
+    setError("");
+    setMessage("Reconciling NMI Quick Pay payments...");
+    const res = await fetch("/api/nmi/reconcile-customers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: 50, offset, dryRun: false }),
+    });
+    const data = await res.json();
+    setSyncResult(data);
+    if (!res.ok) return setError(data.error || "NMI Quick Pay reconciliation failed");
+    const updated = Number(data.customersUpdated ?? 0);
+    setMessage(String(data.message || `Updated ${updated} NMI Quick Pay customer payment records.`));
+    setAuthNetBatch(data.hasMore ? { hasMore: true, nextOffset: Number(data.nextOffset ?? offset + 50), action: "nmi_reconcile" } : null);
+    setSyncLastRun({
+      action: "Reconcile NMI Quick Pay Payments",
       status: data.warnings?.length ? "Completed with warnings" : "Completed",
       ordersImported: 0,
       customersUpdated: updated,
@@ -1240,9 +1415,13 @@ export default function AdminPage() {
               <button onClick={() => runSubscriptionBackfill(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Test WooCommerce Subscription Import</button>
               <button onClick={() => runSubscriptionBackfill(false)} className="rounded bg-red-700 px-5 py-3 font-semibold hover:bg-red-600">Import WooCommerce Subscriptions</button>
               <button onClick={syncWooCommerce} className="rounded bg-zinc-800 px-5 py-3 font-semibold text-zinc-200 hover:bg-zinc-700">Single Customer Repair Sync</button>
-              <button onClick={() => runAuthorizeNetImport()} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Import Authorize.net Transactions</button>
+              <button onClick={() => runAuthorizeNetImport()} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Import Authorize.net Historical Transactions</button>
               <button onClick={() => runAuthorizeNetReconcile()} className="rounded bg-red-800 px-5 py-3 font-semibold hover:bg-red-700">Reconcile Authorize.net Payments</button>
-              {authNetBatch?.hasMore && <button onClick={() => authNetBatch.action === "import" ? runAuthorizeNetImport(authNetBatch.nextOffset) : runAuthorizeNetReconcile(authNetBatch.nextOffset)} className="rounded bg-zinc-800 px-5 py-3 font-semibold hover:bg-zinc-700">Continue Authorize.net {authNetBatch.action === "import" ? "Import" : "Reconcile"}</button>}
+              <button onClick={() => runNmiImport()} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Import NMI Quick Pay Transactions</button>
+              <button onClick={() => runNmiReconcile()} className="rounded bg-red-800 px-5 py-3 font-semibold hover:bg-red-700">Reconcile NMI Quick Pay Payments</button>
+              <button onClick={runReconcileAllGatewayPayments} className="rounded bg-red-800 px-5 py-3 font-semibold hover:bg-red-700">Reconcile All Gateway Payments</button>
+              <button onClick={() => runAnalyticsCacheRebuild()} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Rebuild Customer Analytics Cache</button>
+              {authNetBatch?.hasMore && <button onClick={() => authNetBatch.action === "import" ? runAuthorizeNetImport(authNetBatch.nextOffset, authNetBatch.nextCursor) : authNetBatch.action === "reconcile" ? runAuthorizeNetReconcile(authNetBatch.nextOffset) : authNetBatch.action === "nmi_import" ? runNmiImport(authNetBatch.nextOffset) : authNetBatch.action === "nmi_reconcile" ? runNmiReconcile(authNetBatch.nextOffset) : runAnalyticsCacheRebuild(authNetBatch.nextOffset)} className="rounded bg-zinc-800 px-5 py-3 font-semibold hover:bg-zinc-700">Continue {authNetBatch.action === "analytics_rebuild" ? "Analytics Cache Rebuild" : authNetBatch.action.includes("nmi") ? "NMI Quick Pay" : "Authorize.net"} {authNetBatch.action === "analytics_rebuild" ? "" : authNetBatch.action.includes("import") ? "Import" : "Reconcile"}</button>}
             </div>
           </div>}
         </div>
@@ -1259,6 +1438,7 @@ export default function AdminPage() {
           <p><span className="font-semibold text-zinc-100">Last run time:</span> {syncLastRun?.lastRunTime ?? "-"}</p>
           <p className="mt-2"><span className="font-semibold text-zinc-100">Warnings:</span> {syncLastRun?.warnings?.length ? syncLastRun.warnings.slice(0, 5).join(" ") : "-"}</p>
         </div>
+        <GatewayDebugPanel result={syncResult} />
         {syncResult?.failedRequests?.length ? <p className="rounded border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-100">Failed requests: {syncResult.failedRequests.length}</p> : null}
       </section>}
   </AdminLayout>;

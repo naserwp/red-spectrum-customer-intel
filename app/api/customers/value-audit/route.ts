@@ -5,6 +5,7 @@ import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
+import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
 
 export const dynamic = "force-dynamic";
 
@@ -23,7 +24,7 @@ export async function GET(request: Request) {
   }).lean<(CustomerDocument & { _id: unknown }) | null>().exec();
 
   const orderNumbers = (customer?.orders ?? []).map((order) => order.orderNumber).filter(Boolean);
-  const [wooOrders, authorizeNetTransactions, subscriptions] = await Promise.all([
+  const [wooOrders, authorizeNetTransactions, nmiTransactions, subscriptions] = await Promise.all([
     WooCommerceOrderRecord.find({
       $or: [
         { normalizedEmail: email },
@@ -39,16 +40,26 @@ export async function GET(request: Request) {
         ...(orderNumbers.length ? [{ invoiceNumber: { $in: orderNumbers } }] : []),
       ],
     }).lean<AuthorizeNetTransactionDocument[]>(),
+    NmiQuickPayTransaction.find({
+      $or: [
+        { normalizedEmail: email },
+        { emailNormalized: email },
+        { customerEmail: email },
+        ...(customer?._id ? [{ matchedCustomerId: String(customer._id) }] : []),
+        ...(orderNumbers.length ? [{ invoiceNumber: { $in: orderNumbers } }] : []),
+      ],
+    }).lean<NmiQuickPayTransactionDocument[]>(),
     WooCommerceSubscriptionRecord.find({ normalizedEmail: email }).lean<WooCommerceSubscriptionDocument[]>(),
   ]);
 
-  const metrics = calculateCustomerValueMetrics({ customer, wooOrders, authorizeNetTransactions, subscriptions });
+  const metrics = calculateCustomerValueMetrics({ customer, wooOrders, authorizeNetTransactions, nmiTransactions, subscriptions });
   return NextResponse.json({
     email,
     customerFound: Boolean(customer),
     wooPaidTotal: metrics.wooPaidTotal,
     authorizeNetPaidTotal: metrics.authorizeNetPaidTotal,
     gatewayOnlyPaidTotal: metrics.gatewayOnlyPaidTotal,
+    nmiQuickPayPaidTotal: metrics.nmiQuickPayPaidTotal,
     subscriptionPaidTotal: metrics.subscriptionPaidTotal,
     attemptedTotal: metrics.attemptedTotal,
     duplicateSkipped: metrics.duplicateSkipped,
@@ -64,6 +75,7 @@ export async function GET(request: Request) {
       gatewayPayments: customer?.gatewayPayments?.length ?? 0,
       wooOrders: wooOrders.length,
       authorizeNetTransactions: authorizeNetTransactions.length,
+      nmiQuickPayTransactions: nmiTransactions.length,
       subscriptions: subscriptions.length,
     },
   });

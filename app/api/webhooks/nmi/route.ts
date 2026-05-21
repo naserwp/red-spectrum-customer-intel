@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
+import { normalizeNmiPaymentEvent } from "@/lib/nmiQuickPay";
+import { reconcileNmiTransaction } from "@/lib/nmiReconciliation";
 import { connectToDatabase } from "@/lib/mongodb";
 import { PaymentEvent } from "@/models/PaymentEvent";
-import { Customer } from "@/models/Customer";
-import { calculateCustomerScore, scoreToStars } from "@/lib/customerScore";
-import { generateCustomerAiSummary } from "@/lib/openai";
+import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
 
 const handledEvents = new Set([
   "transaction.sale.success",
@@ -22,25 +22,6 @@ const handledEvents = new Set([
   "settlement.batch.complete",
   "settlement.batch.failure",
 ]);
-
-function estimateCreditLimit(totalPaid: number, orderCount: number, failedPayments: number, refunds: number, score: number) {
-  const velocityFactor = Math.max(1, Math.min(3, orderCount / 4));
-  const riskPenalty = failedPayments * 180 + refunds * 120 + (100 - score) * 5;
-  return Math.max(300, Math.round(totalPaid * 0.8 * velocityFactor - riskPenalty));
-}
-
-function getTier(totalPaid: number) {
-  if (totalPaid >= 2500) return "Platinum";
-  if (totalPaid >= 999) return "Gold";
-  if (totalPaid >= 200) return "Silver";
-  return "Bronze";
-}
-
-function getRiskLevel(failedPayments: number, chargebacks: number, refunds: number, score: number): "low" | "medium" | "high" {
-  if (chargebacks > 0 || failedPayments > 2 || score < 45) return "high";
-  if (refunds > 1 || failedPayments > 0 || score < 70) return "medium";
-  return "low";
-}
 
 async function parsePayload(request: Request) {
   const contentType = request.headers.get("content-type") ?? "";
@@ -96,27 +77,15 @@ export async function POST(request: Request) {
   }
 
   try {
-    const customer = await Customer.findOne(customerEmail ? { email: customerEmail } : { phone: customerPhone });
-    if (customer) {
-      if (eventType.includes("failure")) customer.failedPayments = (customer.failedPayments ?? 0) + 1;
-      if (eventType.includes("refund")) customer.refunds = (customer.refunds ?? 0) + 1;
-      if (eventType.includes("chargeback")) customer.chargebacks = (customer.chargebacks ?? 0) + 1;
-      if (eventType.includes("sale.success") || eventType.includes("credit.success")) {
-        customer.totalPaid = (customer.totalPaid ?? 0) + Math.max(0, amount);
-      }
-
-      const score = calculateCustomerScore(customer);
-      const stars = scoreToStars(score);
-      customer.tier = getTier(customer.totalPaid ?? 0);
-      customer.riskLevel = getRiskLevel(customer.failedPayments ?? 0, customer.chargebacks ?? 0, customer.refunds ?? 0, score);
-      customer.estimatedCreditLimit = estimateCreditLimit(customer.totalPaid ?? 0, customer.orderCount ?? 0, customer.failedPayments ?? 0, customer.refunds ?? 0, score);
-      customer.lastSyncedAt = new Date().toISOString();
-      const ai = await generateCustomerAiSummary({ ...customer.toObject(), score, stars });
-      customer.aiSummary = ai.aiSummary;
-      customer.aiSummaryPreview = ai.aiSummaryPreview;
-      customer.riskExplanation = ai.riskExplanation;
-      customer.recommendedAction = ai.recommendedAction;
-      await customer.save();
+    const normalized = normalizeNmiPaymentEvent(paymentEvent, new Date().toISOString());
+    if (normalized.transactionId) {
+      await NmiQuickPayTransaction.updateOne(
+        { transactionId: normalized.transactionId },
+        { $set: normalized },
+        { upsert: true }
+      ).exec();
+      const stored = await NmiQuickPayTransaction.findOne({ transactionId: normalized.transactionId }).lean<NmiQuickPayTransactionDocument | null>();
+      if (stored) await reconcileNmiTransaction(stored, false);
     }
 
     await PaymentEvent.findByIdAndUpdate(paymentEvent._id, { $set: { processed: true } });

@@ -1,4 +1,5 @@
 import { isDeclinedOrFailed, isSettledSuccessful } from "@/lib/authorizeNet";
+import { calculateCustomerValueMetrics } from "@/lib/customerValue";
 import { monthsSince } from "@/lib/customerValue";
 import { customerLedgerRecords, detectAuthorizeNetRecurring } from "@/lib/revenueAnalytics";
 import { normalizePhone } from "@/lib/wooOrderImport";
@@ -57,6 +58,10 @@ function transactionDate(transaction: AuthorizeNetTransactionDocument) {
 function sameDay(a?: string, b?: string) {
   if (!a || !b) return false;
   return a.slice(0, 10) === b.slice(0, 10);
+}
+
+function escapeRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function duplicatePayment(customer: LeanCustomer, transaction: AuthorizeNetTransactionDocument) {
@@ -175,6 +180,19 @@ export async function findAuthorizeNetCustomerMatch(transaction: AuthorizeNetTra
     const customer = await Customer.findOne({ name: { $regex: parts.join(".*"), $options: "i" }, orders: { $elemMatch: { total: transaction.amount } } }).lean<LeanCustomer | null>().exec();
     if (customer) return { customer, matchedBy: "name_amount_date", confidence: "low" as const, wooOrderNumberMatched: "", wooOrderIdMatched: 0 };
   }
+  if (transaction.customerName) {
+    const parts = transaction.customerName.split(/\s+/).map((part) => part.trim()).filter((part) => part.length > 1).slice(0, 4);
+    if (parts.length >= 2) {
+      const nameRegex = `^${parts.map(escapeRegex).join("\\s+")}`;
+      const customer = await Customer.findOne({
+        $or: [
+          { name: { $regex: nameRegex, $options: "i" } },
+          { "orders.billingName": { $regex: nameRegex, $options: "i" } },
+        ],
+      }).sort({ lifetimeValue: -1, paidTotal: -1 }).lean<LeanCustomer | null>().exec();
+      if (customer) return { customer, matchedBy: "billing_name", confidence: "medium" as const, wooOrderNumberMatched: "", wooOrderIdMatched: 0 };
+    }
+  }
   if (transaction.cardLast4 && transaction.amount > 0) {
     const customer = await Customer.findOne({ "gatewayPayments.cardLast4": transaction.cardLast4, "gatewayPayments.amount": transaction.amount }).lean<LeanCustomer | null>().exec();
     if (customer) return { customer, matchedBy: "card_last4_amount_date", confidence: "low" as const, wooOrderNumberMatched: "", wooOrderIdMatched: 0 };
@@ -183,16 +201,17 @@ export async function findAuthorizeNetCustomerMatch(transaction: AuthorizeNetTra
 }
 
 function productJourneyItem(transaction: AuthorizeNetTransactionDocument): CustomerProductJourneyItem {
+  const settled = isSettledSuccessful(transaction.transactionStatus);
   return {
     date: transactionDate(transaction),
     orderNumber: transaction.invoiceNumber || transaction.transactionId,
-    status: "paid",
+    status: settled ? "paid" : isDeclinedOrFailed(transaction.transactionStatus) ? "failed" : "attempted",
     paymentMethod: "Credit Card Payment",
     productName: productName(transaction),
     category: "other",
     productType: "Authorize.net Payment",
     amount: transaction.amount,
-    type: "paid",
+    type: settled ? "paid" : "attempted",
   };
 }
 
@@ -201,49 +220,55 @@ export function buildReconciledCustomerUpdate(customer: LeanCustomer, transactio
   const gatewayPayments = [...(customer.gatewayPayments ?? [])];
   const productJourney = [...(customer.productJourney ?? [])];
   const paidProducts = [...(customer.paidProducts ?? [])];
+  const attemptedProducts = [...(customer.attemptedProducts ?? [])];
   const alreadyDuplicate = duplicatePayment(customer, transaction);
   const orderIndex = orders.findIndex((order) => order.orderNumber === transaction.invoiceNumber || order.transactionId === transaction.transactionId);
   const settled = isSettledSuccessful(transaction.transactionStatus);
-  let countedNewPaid = false;
   let attachedAuthorizeNetOnly = false;
   let verifiedWooOrder = false;
   let source = "authorize_net_reconciled";
 
   if (orderIndex >= 0) {
     const existing = orders[orderIndex];
+    const existingPaid = existing.isPaid || ["completed", "processing", "paid"].includes(String(existing.status ?? "").toLowerCase());
     verifiedWooOrder = true;
     orders[orderIndex] = {
       ...existing,
-      status: settled ? "paid" : isDeclinedOrFailed(transaction.transactionStatus) ? "failed" : existing.status,
+      status: settled ? "paid" : existingPaid ? existing.status : isDeclinedOrFailed(transaction.transactionStatus) ? "failed" : "attempted",
       transactionId: transaction.transactionId || existing.transactionId,
-      isPaid: settled || existing.isPaid,
-      isAttempted: settled ? false : existing.isAttempted,
+      isPaid: settled ? true : existingPaid,
+      isAttempted: settled ? false : existingPaid ? false : true,
       paidDate: settled ? transactionDate(transaction) : existing.paidDate,
+      attemptedDate: settled ? existing.attemptedDate : transaction.submittedAt || existing.attemptedDate,
       paymentMethod: "authorize_net",
       paymentMethodTitle: "Credit Card Payment",
       gatewayVerification: gatewayVerification(transaction, matchedBy, confidence),
     };
-    countedNewPaid = settled && !existing.isPaid && !alreadyDuplicate;
-  } else if (settled && !alreadyDuplicate) {
+  } else if (!alreadyDuplicate) {
     source = "authorize_net_only";
-    attachedAuthorizeNetOnly = true;
+    attachedAuthorizeNetOnly = settled;
     orders.unshift(syntheticOrder(transaction, matchedBy, confidence));
     productJourney.unshift(productJourneyItem(transaction));
-    if (!paidProducts.includes(productName(transaction))) paidProducts.unshift(productName(transaction));
-    countedNewPaid = true;
+    if (settled) {
+      if (!paidProducts.includes(productName(transaction))) paidProducts.unshift(productName(transaction));
+    } else if (!attemptedProducts.includes(productName(transaction))) {
+      attemptedProducts.unshift(productName(transaction));
+    }
   }
 
   if (!gatewayPayments.some((payment) => payment.transactionId === transaction.transactionId)) {
     gatewayPayments.unshift(gatewayPayment(transaction, matchedBy, confidence, source));
   }
 
-  const paidIncrement = countedNewPaid ? transaction.amount : 0;
-  const paidTotal = Number(customer.paidTotal ?? customer.totalPaid ?? 0) + paidIncrement;
-  const paidOrderCount = Number(customer.paidOrderCount ?? 0) + (countedNewPaid ? 1 : 0);
-  const gatewayPaidCount = Number(customer.gatewayPaidCount ?? 0) + (countedNewPaid && source === "authorize_net_only" ? 1 : 0);
+  const metrics = calculateCustomerValueMetrics({ customer: { ...customer, orders, gatewayPayments, productJourney } });
+  const paidTotal = metrics.rankingTotal;
+  const paidOrderCount = Math.max(Number(customer.paidOrderCount ?? 0), orders.filter((order) => order.isPaid).length);
+  const gatewayPaidCount = orders.filter((order) => order.source === "authorize_net_only" && order.isPaid).length;
+  const attemptedTotal = metrics.attemptedTotal;
+  const attemptedOrderCount = Math.max(Number(customer.attemptedOrderCount ?? 0), orders.filter((order) => order.isAttempted).length);
   const lastPaidDate = settled && transactionDate(transaction) > (customer.lastPaidDate ?? "") ? transactionDate(transaction) : customer.lastPaidDate;
-  const firstPaidDate = customer.firstPaidDate || customer.firstOrderDate || (settled ? transactionDate(transaction) : "");
-  const paidMonths = Math.max(Number(customer.paidMonths ?? 0), new Set(orders.filter((order) => order.isPaid).map((order) => (order.paidDate || order.dateCreated).slice(0, 7)).filter(Boolean)).size);
+  const firstPaidDate = metrics.firstPaidDate || customer.firstPaidDate || customer.firstOrderDate || (settled ? transactionDate(transaction) : "");
+  const paidMonths = metrics.paidMonths;
   const gatewayOnlyPaymentsAttached = orders.filter((order) => order.source === "authorize_net_only").length;
   const authorizeNetTransactionsFound = gatewayPayments.filter((payment) => payment.provider === "authorize_net").length;
   const recurring = detectAuthorizeNetRecurring(customerLedgerRecords({ ...customer, orders, gatewayPayments }));
@@ -264,12 +289,16 @@ export function buildReconciledCustomerUpdate(customer: LeanCustomer, transactio
       gatewayPayments,
       productJourney,
       paidProducts,
+      attemptedProducts,
       paidTotal,
       totalPaid: paidTotal,
       lifetimeValue: paidTotal,
       rankingPaidTotal: paidTotal,
-      authorizeNetPaidTotal: Number(customer.authorizeNetPaidTotal ?? 0) + (countedNewPaid && source !== "authorize_net_only" ? transaction.amount : 0),
-      gatewayOnlyPaidTotal: Number(customer.gatewayOnlyPaidTotal ?? 0) + (countedNewPaid && source === "authorize_net_only" ? transaction.amount : 0),
+      wooPaidTotal: metrics.wooPaidTotal,
+      authorizeNetPaidTotal: metrics.authorizeNetPaidTotal,
+      gatewayOnlyPaidTotal: metrics.gatewayOnlyPaidTotal,
+      subscriptionPaidTotal: metrics.subscriptionPaidTotal,
+      attemptedTotal,
       isGatewayRecurring: recurring.isGatewayRecurring,
       recurringSource: recurring.recurringSource,
       recurringAmount: recurring.recurringAmount,
@@ -279,9 +308,10 @@ export function buildReconciledCustomerUpdate(customer: LeanCustomer, transactio
       recurringPaymentCount: recurring.recurringPaymentCount,
       gatewayPaidCount,
       paidOrderCount,
+      attemptedOrderCount,
       paidMonths,
       firstPaidDate,
-      stayWithUsMonths: monthsSince(firstPaidDate),
+      stayWithUsMonths: metrics.stayWithUsMonths || monthsSince(firstPaidDate),
       orderCount: orders.length,
       lastPaidDate,
       lastOrderDate: orders[0]?.dateCreated ?? customer.lastOrderDate,
@@ -290,6 +320,7 @@ export function buildReconciledCustomerUpdate(customer: LeanCustomer, transactio
       gatewayVerification: gatewayVerification(transaction, matchedBy, confidence),
       lastPaymentMethod: settled ? "Credit Card Payment" : customer.lastPaymentMethod,
       lastPurchasedProduct: attachedAuthorizeNetOnly ? productName(transaction) : customer.lastPurchasedProduct,
+      lastAttemptedProduct: !settled ? productName(transaction) : customer.lastAttemptedProduct,
       sourceCoverage,
       lastSyncedAt: new Date().toISOString(),
     },

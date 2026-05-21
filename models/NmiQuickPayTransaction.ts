@@ -1,10 +1,9 @@
 import mongoose, { Schema } from "mongoose";
 
-export interface AuthorizeNetTransactionDocument {
+export interface NmiQuickPayTransactionDocument {
   transactionId: string;
   transactionStatus: string;
   responseCode: string;
-  authCode: string;
   invoiceNumber: string;
   description: string;
   amount: number;
@@ -19,10 +18,11 @@ export interface AuthorizeNetTransactionDocument {
   billingLastName: string;
   billingCompany: string;
   billingPhone: string;
+  normalizedPhone: string;
   cardType: string;
   cardLast4: string;
   paymentMethod: string;
-  customerProfileId: string;
+  customerVaultId: string;
   customerPaymentProfileId: string;
   wooOrderNumberMatched: string;
   wooOrderIdMatched: number;
@@ -42,12 +42,11 @@ const safeMetaSchema = new Schema(
   { _id: false }
 );
 
-const authorizeNetTransactionSchema = new Schema<AuthorizeNetTransactionDocument>(
+const nmiQuickPayTransactionSchema = new Schema<NmiQuickPayTransactionDocument>(
   {
     transactionId: { type: String, required: true, unique: true, index: true },
     transactionStatus: { type: String, default: "", index: true },
     responseCode: { type: String, default: "" },
-    authCode: { type: String, default: "" },
     invoiceNumber: { type: String, default: "", index: true },
     description: { type: String, default: "" },
     amount: { type: Number, default: 0 },
@@ -57,15 +56,16 @@ const authorizeNetTransactionSchema = new Schema<AuthorizeNetTransactionDocument
     customerEmail: { type: String, default: "" },
     normalizedEmail: { type: String, default: "", index: true },
     emailNormalized: { type: String, default: "", index: true },
-    customerName: { type: String, default: "" },
+    customerName: { type: String, default: "", index: true },
     billingFirstName: { type: String, default: "" },
     billingLastName: { type: String, default: "" },
-    billingCompany: { type: String, default: "" },
+    billingCompany: { type: String, default: "", index: true },
     billingPhone: { type: String, default: "" },
+    normalizedPhone: { type: String, default: "", index: true },
     cardType: { type: String, default: "" },
     cardLast4: { type: String, default: "", index: true },
     paymentMethod: { type: String, default: "card" },
-    customerProfileId: { type: String, default: "", index: true },
+    customerVaultId: { type: String, default: "", index: true },
     customerPaymentProfileId: { type: String, default: "", index: true },
     wooOrderNumberMatched: { type: String, default: "" },
     wooOrderIdMatched: { type: Number, default: 0 },
@@ -78,9 +78,9 @@ const authorizeNetTransactionSchema = new Schema<AuthorizeNetTransactionDocument
   { timestamps: true }
 );
 
-authorizeNetTransactionSchema.index({ normalizedEmail: 1, submittedAt: -1 });
-authorizeNetTransactionSchema.index({ invoiceNumber: 1, amount: 1, submittedAt: -1 });
-authorizeNetTransactionSchema.index({ customerName: 1, submittedAt: -1 });
-authorizeNetTransactionSchema.index({ createdAt: -1 });
+nmiQuickPayTransactionSchema.index({ normalizedEmail: 1, submittedAt: -1 });
+nmiQuickPayTransactionSchema.index({ invoiceNumber: 1, amount: 1, submittedAt: -1 });
+nmiQuickPayTransactionSchema.index({ customerName: 1, submittedAt: -1 });
+nmiQuickPayTransactionSchema.index({ createdAt: -1 });
 
-export const AuthorizeNetTransaction = mongoose.models.AuthorizeNetTransaction || mongoose.model<AuthorizeNetTransactionDocument>("AuthorizeNetTransaction", authorizeNetTransactionSchema);
+export const NmiQuickPayTransaction = mongoose.models.NmiQuickPayTransaction || mongoose.model<NmiQuickPayTransactionDocument>("NmiQuickPayTransaction", nmiQuickPayTransactionSchema);

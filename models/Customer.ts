@@ -122,13 +122,25 @@ export interface CustomerBusinessProfile {
   firstName: string;
   lastName: string;
   company: string;
+  dba: string;
+  email: string;
   phone: string;
   address1: string;
   address2: string;
+  shippingAddress1: string;
+  shippingAddress2: string;
+  shippingCity: string;
+  shippingState: string;
+  shippingZip: string;
+  shippingCountry: string;
   city: string;
   state: string;
   zip: string;
   country: string;
+  website: string;
+  sourcePlatform: string;
+  customerSince: string;
+  lastActivity: string;
   ein: string;
   potentialCreditLimit: number;
   creditLimit: number;
@@ -160,6 +172,7 @@ export interface CustomerDocument {
   wooPaidTotal: number;
   authorizeNetPaidTotal: number;
   gatewayOnlyPaidTotal: number;
+  nmiQuickPayPaidTotal: number;
   subscriptionPaidTotal: number;
   attemptedTotal: number;
   orderCount: number;
@@ -254,6 +267,7 @@ export interface CustomerSourceCoverage {
   wooCommerceCustomerOrdersStored: number;
   wooCommerceOrderRecordsFound: number;
   authorizeNetTransactionsFound: number;
+  nmiQuickPayTransactionsFound: number;
   gatewayOnlyPaymentsAttached: number;
   reconciledRecords: number;
   missingUnattachedRecords: number;
@@ -383,6 +397,7 @@ const customerSourceCoverageSchema = new Schema<CustomerSourceCoverage>(
     wooCommerceCustomerOrdersStored: { type: Number, default: 0 },
     wooCommerceOrderRecordsFound: { type: Number, default: 0 },
     authorizeNetTransactionsFound: { type: Number, default: 0 },
+    nmiQuickPayTransactionsFound: { type: Number, default: 0 },
     gatewayOnlyPaymentsAttached: { type: Number, default: 0 },
     reconciledRecords: { type: Number, default: 0 },
     missingUnattachedRecords: { type: Number, default: 0 },
@@ -430,13 +445,25 @@ const customerBusinessProfileSchema = new Schema<CustomerBusinessProfile>(
     firstName: { type: String, default: "" },
     lastName: { type: String, default: "" },
     company: { type: String, default: "" },
+    dba: { type: String, default: "" },
+    email: { type: String, default: "" },
     phone: { type: String, default: "" },
     address1: { type: String, default: "" },
     address2: { type: String, default: "" },
+    shippingAddress1: { type: String, default: "" },
+    shippingAddress2: { type: String, default: "" },
+    shippingCity: { type: String, default: "" },
+    shippingState: { type: String, default: "" },
+    shippingZip: { type: String, default: "" },
+    shippingCountry: { type: String, default: "" },
     city: { type: String, default: "" },
     state: { type: String, default: "" },
     zip: { type: String, default: "" },
     country: { type: String, default: "" },
+    website: { type: String, default: "" },
+    sourcePlatform: { type: String, default: "" },
+    customerSince: { type: String, default: "" },
+    lastActivity: { type: String, default: "" },
     ein: { type: String, default: "" },
     potentialCreditLimit: { type: Number, default: 0 },
     creditLimit: { type: Number, default: 0 },
@@ -471,6 +498,7 @@ const customerSchema = new Schema<CustomerDocument>(
     wooPaidTotal: { type: Number, default: 0 },
     authorizeNetPaidTotal: { type: Number, default: 0 },
     gatewayOnlyPaidTotal: { type: Number, default: 0 },
+    nmiQuickPayPaidTotal: { type: Number, default: 0 },
     subscriptionPaidTotal: { type: Number, default: 0 },
     attemptedTotal: { type: Number, required: true, default: 0 },
     orderCount: { type: Number, required: true },
@@ -564,12 +592,14 @@ customerSchema.pre("validate", function () {
 customerSchema.index({ normalizedEmail: 1 });
 customerSchema.index({ emailNormalized: 1 });
 customerSchema.index({ phoneNormalized: 1 });
+customerSchema.index({ name: 1 });
 customerSchema.index({ rankingPaidTotal: -1 });
 customerSchema.index({ lifetimeValue: -1 });
 customerSchema.index({ isGatewayRecurring: 1, recurringNextEstimatedPayment: 1 });
 customerSchema.index({ createdAt: -1 });
 customerSchema.index({ "orders.transactionId": 1 });
 customerSchema.index({ "orders.orderNumber": 1 });
+customerSchema.index({ "orders.billingName": 1 });
 customerSchema.index({ "orders.gatewayVerification.customerProfileId": 1 });
 customerSchema.index({ "gatewayPayments.transactionId": 1 });
 customerSchema.index({ "gatewayPayments.invoiceNumber": 1 });

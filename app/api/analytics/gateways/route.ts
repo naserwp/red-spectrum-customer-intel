@@ -3,6 +3,8 @@ import { isDeclinedOrFailed, isSettledSuccessful } from "@/lib/authorizeNet";
 import { connectToDatabase } from "@/lib/mongodb";
 import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer, type CustomerDocument, type CustomerOrderHistoryItem } from "@/models/Customer";
+import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
+import { isNmiDeclined, isNmiRefundOrChargeback, isNmiSuccessful } from "@/lib/nmiQuickPay";
 
 export const dynamic = "force-dynamic";
 
@@ -171,6 +173,19 @@ function includeTransactionStatus(transaction: AuthorizeNetTransactionDocument, 
   return true;
 }
 
+function includeNmiTransactionStatus(transaction: NmiQuickPayTransactionDocument, status: StatusFilter) {
+  const paid = isNmiSuccessful(transaction.transactionStatus);
+  const failed = isNmiDeclined(transaction.transactionStatus);
+  if (status === "all") return true;
+  if (status === "paid") return paid;
+  if (status === "attempted") return !paid;
+  if (status === "failed") return failed;
+  if (status === "refunded") return isNmiRefundOrChargeback(transaction.transactionStatus);
+  if (status === "verified") return Boolean(transaction.matchedCustomerId);
+  if (status === "not_verified") return !transaction.matchedCustomerId;
+  return true;
+}
+
 function latestDate(a: string, b: string) {
   if (!a) return b;
   if (!b) return a;
@@ -237,6 +252,36 @@ function applyAuthorizeNetTransaction(metric: Metric, transaction: AuthorizeNetT
   metric.lastTransactionDate = latestDate(metric.lastTransactionDate, transaction.settledAt || transaction.submittedAt);
 }
 
+function applyNmiTransaction(metric: Metric, transaction: NmiQuickPayTransactionDocument) {
+  const amount = money(transaction.amount);
+  const paid = isNmiSuccessful(transaction.transactionStatus);
+  const failed = isNmiDeclined(transaction.transactionStatus);
+  const refunded = isNmiRefundOrChargeback(transaction.transactionStatus);
+  metric.totalOrders += 1;
+  if (paid) {
+    metric.paidRevenue += amount;
+    metric.paidOrders += 1;
+    metric.verifiedRevenue += amount;
+  } else {
+    metric.attemptedPipeline += amount;
+    metric.attemptedOrders += 1;
+  }
+  if (failed) {
+    metric.failedAmount += amount;
+    metric.failedOrders += 1;
+  }
+  if (refunded) {
+    metric.refundedAmount += amount;
+    metric.paidRevenue -= amount;
+  }
+  if (transaction.matchedCustomerId) metric.matchedOrders += 1;
+  else {
+    metric.unmatchedOrders += 1;
+    metric.manualReviewRevenue += amount;
+  }
+  metric.lastTransactionDate = latestDate(metric.lastTransactionDate, transaction.settledAt || transaction.submittedAt);
+}
+
 function addSummary(target: Metric, source: Metric) {
   target.paidRevenue += source.paidRevenue;
   target.attemptedPipeline += source.attemptedPipeline;
@@ -284,9 +329,10 @@ export async function GET(request: Request) {
   const status = statusFilters.includes(statusParam as StatusFilter) ? statusParam as StatusFilter : "all";
   return cachedJson(`gateways:${from.toISOString()}:${to.toISOString()}:${interval}:${requestedProvider}:${status}`, async () => {
 
-  const [customers, authorizeNetTransactions] = await Promise.all([
+  const [customers, authorizeNetTransactions, nmiTransactions] = await Promise.all([
     Customer.find({}, { name: 1, email: 1, orders: 1 }).lean<Pick<CustomerDocument, "name" | "email" | "orders">[]>(),
     AuthorizeNetTransaction.find({}).lean<AuthorizeNetTransactionDocument[]>(),
+    NmiQuickPayTransaction.find({}).lean<NmiQuickPayTransactionDocument[]>(),
   ]);
   const providerMetrics = new Map<Provider, Metric>();
   const timelineMetrics = new Map<string, Metric>();
@@ -358,6 +404,39 @@ export async function GET(request: Request) {
       lastOrderDate: "",
     };
     if (isSettledSuccessful(transaction.transactionStatus)) customerMetric.paidRevenue += money(transaction.amount);
+    else customerMetric.attemptedPipeline += money(transaction.amount);
+    customerMetric.orderCount += 1;
+    customerMetric.lastOrderDate = latestDate(customerMetric.lastOrderDate, transaction.settledAt || transaction.submittedAt);
+    customerMetrics.set(customerKey, customerMetric);
+  }
+
+  for (const transaction of nmiTransactions) {
+    const date = new Date(transaction.settledAt || transaction.submittedAt || "");
+    if (Number.isNaN(date.getTime()) || date < from || date > to) continue;
+    if (requestedProvider !== "all" && requestedProvider !== "nmi") continue;
+    if (!includeNmiTransactionStatus(transaction, status)) continue;
+
+    const providerMetric = providerMetrics.get("nmi") ?? emptyMetric();
+    applyNmiTransaction(providerMetric, transaction);
+    providerMetrics.set("nmi", providerMetric);
+
+    const period = periodFor(date, interval);
+    const timelineKey = `${period}:nmi`;
+    const timelineMetric = timelineMetrics.get(timelineKey) ?? emptyMetric();
+    applyNmiTransaction(timelineMetric, transaction);
+    timelineMetrics.set(timelineKey, timelineMetric);
+
+    const customerKey = `nmi:${transaction.normalizedEmail || transaction.transactionId}`;
+    const customerMetric = customerMetrics.get(customerKey) ?? {
+      provider: "nmi" as const,
+      customerName: transaction.customerName || transaction.normalizedEmail,
+      email: transaction.normalizedEmail || transaction.customerEmail,
+      paidRevenue: 0,
+      attemptedPipeline: 0,
+      orderCount: 0,
+      lastOrderDate: "",
+    };
+    if (isNmiSuccessful(transaction.transactionStatus)) customerMetric.paidRevenue += money(transaction.amount);
     else customerMetric.attemptedPipeline += money(transaction.amount);
     customerMetric.orderCount += 1;
     customerMetric.lastOrderDate = latestDate(customerMetric.lastOrderDate, transaction.settledAt || transaction.submittedAt);

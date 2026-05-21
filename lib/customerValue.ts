@@ -1,6 +1,8 @@
-import { isSettledSuccessful } from "@/lib/authorizeNet";
+import { isDeclinedOrFailed, isRefundedOrChargeback, isSettledSuccessful } from "@/lib/authorizeNet";
+import { isNmiDeclined, isNmiRefundOrChargeback, isNmiSuccessful } from "@/lib/nmiQuickPay";
 import type { AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import type { CustomerDocument, CustomerGatewayPayment, CustomerOrderHistoryItem } from "@/models/Customer";
+import type { NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
 import type { WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 import type { WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
 
@@ -9,7 +11,7 @@ type ValueCustomer = Partial<CustomerDocument> & {
   gatewayPayments?: CustomerGatewayPayment[];
 };
 
-type PaidSource = "woocommerce" | "authorize_net" | "gateway_only" | "subscription";
+type PaidSource = "woocommerce" | "authorize_net" | "gateway_only" | "nmi_quick_pay" | "subscription";
 
 type PaidRecord = {
   amount: number;
@@ -25,8 +27,11 @@ export type CustomerValueMetrics = {
   wooPaidTotal: number;
   authorizeNetPaidTotal: number;
   gatewayOnlyPaidTotal: number;
+  nmiQuickPayPaidTotal: number;
   subscriptionPaidTotal: number;
   attemptedTotal: number;
+  attemptedGatewayTotal: number;
+  refundsAndChargebacksDetected: boolean;
   duplicateSkipped: number;
   firstPaidDate: string;
   lastPaidDate: string;
@@ -35,6 +40,7 @@ export type CustomerValueMetrics = {
   rankingTotal: number;
   subscriptionStartDate: string;
   stayWithUsMonths: number;
+  gatewayApprovalRate: number;
 };
 
 function roundMoney(value: number) {
@@ -65,22 +71,23 @@ function paidRecordKeys(record: PaidRecord) {
   const amount = roundMoney(record.amount).toFixed(2);
   const date = dateKey(record.date);
   const keys: string[] = [];
+  const adjustment = record.amount < 0 ? "adjustment:" : "";
   if (record.transactionId) keys.push(`tx:${record.provider ?? record.source}:${record.transactionId}`);
-  if (record.orderNumber) keys.push(`order:${record.orderNumber}`);
-  if (record.invoiceNumber) keys.push(`invoice:${record.invoiceNumber}`);
-  if (record.invoiceNumber && date) keys.push(`invoice-date:${record.invoiceNumber}:${amount}:${date}`);
+  if (record.orderNumber) keys.push(`${adjustment}order:${record.orderNumber}`);
+  if (record.invoiceNumber) keys.push(`${adjustment}invoice:${record.invoiceNumber}`);
+  if (record.invoiceNumber && date) keys.push(`${adjustment}invoice-date:${record.invoiceNumber}:${amount}:${date}`);
   if (!keys.length) keys.push(`fallback:${record.source}:${amount}:${date}`);
   return keys;
 }
 
 function addPaidRecord(record: PaidRecord, seen: Set<string>, totals: Record<PaidSource, number>, monthKeys: Set<string>) {
-  if (!record.amount || record.amount <= 0) return 0;
+  if (!record.amount) return 0;
   const keys = paidRecordKeys(record);
   if (keys.some((key) => seen.has(key))) return 1;
   keys.forEach((key) => seen.add(key));
   totals[record.source] += Number(record.amount);
   const month = monthKey(record.date);
-  if (month) monthKeys.add(month);
+  if (month && record.amount > 0) monthKeys.add(month);
   return 0;
 }
 
@@ -93,21 +100,34 @@ function maxDate(values: string[]) {
 }
 
 function isGatewayPaid(payment: CustomerGatewayPayment) {
-  return isSettledSuccessful(payment.status) || /paid|captured|settled/i.test(payment.status ?? "");
+  return isSettledSuccessful(payment.status) || /paid|settled/i.test(payment.status ?? "");
+}
+
+function signedGatewayAmount(status: string, amount: number) {
+  if (isRefundedOrChargeback(status)) return -Math.abs(amount);
+  if (isSettledSuccessful(status) || /paid|settled/i.test(status ?? "")) return Math.abs(amount);
+  return 0;
+}
+
+function isAttemptedGatewayStatus(status: string) {
+  return isDeclinedOrFailed(status) || /pending|captured|hold/i.test(status ?? "");
 }
 
 export function calculateCustomerValueMetrics(input: {
   customer?: ValueCustomer | null;
   wooOrders?: Partial<WooCommerceOrderDocument>[];
   authorizeNetTransactions?: Partial<AuthorizeNetTransactionDocument>[];
+  nmiTransactions?: Partial<NmiQuickPayTransactionDocument>[];
   subscriptions?: Partial<WooCommerceSubscriptionDocument>[];
 }): CustomerValueMetrics {
   const customer = input.customer ?? {};
   const seen = new Set<string>();
   const monthKeys = new Set<string>();
   const paidDates: string[] = [];
-  const totals: Record<PaidSource, number> = { woocommerce: 0, authorize_net: 0, gateway_only: 0, subscription: 0 };
+  const totals: Record<PaidSource, number> = { woocommerce: 0, authorize_net: 0, gateway_only: 0, nmi_quick_pay: 0, subscription: 0 };
   let duplicateSkipped = 0;
+  let attemptedGatewayTotal = 0;
+  let hasNegativeGatewayRecord = false;
 
   for (const order of input.wooOrders ?? []) {
     if (!order.isPaid) continue;
@@ -141,30 +161,70 @@ export function calculateCustomerValueMetrics(input: {
   }
 
   for (const payment of customer.gatewayPayments ?? []) {
-    if (!isGatewayPaid(payment)) continue;
-    const source: PaidSource = payment.source === "authorize_net_only" ? "gateway_only" : "authorize_net";
+    if (!isGatewayPaid(payment) && !isRefundedOrChargeback(payment.status)) {
+      if (isAttemptedGatewayStatus(payment.status)) attemptedGatewayTotal += Math.abs(Number(payment.amount ?? 0));
+      continue;
+    }
+    const source: PaidSource = payment.provider === "nmi" || payment.provider === "cliq" || payment.provider === "nmi_quick_pay" || payment.source === "nmi_quick_pay_only"
+      ? "nmi_quick_pay"
+      : payment.source === "authorize_net_only" ? "gateway_only" : "authorize_net";
+    const nmiPayment = source === "nmi_quick_pay";
+    if (nmiPayment && !isNmiSuccessful(payment.status) && !isNmiRefundOrChargeback(payment.status)) {
+      if (isNmiDeclined(payment.status)) attemptedGatewayTotal += Math.abs(Number(payment.amount ?? 0));
+      continue;
+    }
+    const signedAmount = nmiPayment
+      ? isNmiRefundOrChargeback(payment.status) ? -Math.abs(Number(payment.amount ?? 0)) : Math.abs(Number(payment.amount ?? 0))
+      : signedGatewayAmount(payment.status, Number(payment.amount ?? 0));
+    if (signedAmount < 0) hasNegativeGatewayRecord = true;
     paidDates.push(payment.date);
     duplicateSkipped += addPaidRecord({
-      amount: Number(payment.amount ?? 0),
+      amount: signedAmount,
       date: payment.date,
       transactionId: payment.transactionId,
       invoiceNumber: payment.invoiceNumber,
-      provider: payment.provider || "authorize_net",
+      provider: payment.provider || (nmiPayment ? "nmi_quick_pay" : "authorize_net"),
       source,
     }, seen, totals, monthKeys);
   }
 
   for (const transaction of input.authorizeNetTransactions ?? []) {
-    if (!isSettledSuccessful(transaction.transactionStatus ?? "")) continue;
+    const status = transaction.transactionStatus ?? "";
+    if (!isSettledSuccessful(status) && !isRefundedOrChargeback(status)) {
+      if (isAttemptedGatewayStatus(status)) attemptedGatewayTotal += Math.abs(Number(transaction.amount ?? 0));
+      continue;
+    }
     const date = transaction.settledAt || transaction.submittedAt || "";
+    const signedAmount = isRefundedOrChargeback(status) ? -Math.abs(Number(transaction.amount ?? 0)) : Math.abs(Number(transaction.amount ?? 0));
+    if (signedAmount < 0) hasNegativeGatewayRecord = true;
     paidDates.push(date);
     duplicateSkipped += addPaidRecord({
-      amount: Number(transaction.amount ?? 0),
+      amount: signedAmount,
       date,
       transactionId: transaction.transactionId,
       invoiceNumber: transaction.invoiceNumber,
       provider: "authorize_net",
       source: transaction.wooOrderNumberMatched || transaction.wooOrderIdMatched ? "authorize_net" : "gateway_only",
+    }, seen, totals, monthKeys);
+  }
+
+  for (const transaction of input.nmiTransactions ?? []) {
+    const status = transaction.transactionStatus ?? "";
+    if (!isNmiSuccessful(status) && !isNmiRefundOrChargeback(status)) {
+      if (isNmiDeclined(status)) attemptedGatewayTotal += Math.abs(Number(transaction.amount ?? 0));
+      continue;
+    }
+    const date = transaction.settledAt || transaction.submittedAt || "";
+    const signedAmount = isNmiRefundOrChargeback(status) ? -Math.abs(Number(transaction.amount ?? 0)) : Math.abs(Number(transaction.amount ?? 0));
+    if (signedAmount < 0) hasNegativeGatewayRecord = true;
+    paidDates.push(date);
+    duplicateSkipped += addPaidRecord({
+      amount: signedAmount,
+      date,
+      transactionId: transaction.transactionId,
+      invoiceNumber: transaction.invoiceNumber,
+      provider: "nmi_quick_pay",
+      source: "nmi_quick_pay",
     }, seen, totals, monthKeys);
   }
 
@@ -178,9 +238,9 @@ export function calculateCustomerValueMetrics(input: {
     return subscriptionOrderIds.has(orderId) || subscriptionOrderIds.has(orderNumber) ? sum + Number(order.paidAmount ?? order.total ?? 0) : sum;
   }, 0);
 
-  const dedupedTotal = totals.woocommerce + totals.authorize_net + totals.gateway_only;
+  const dedupedTotal = Math.max(0, totals.woocommerce + totals.authorize_net + totals.gateway_only + totals.nmi_quick_pay);
   const storedPaidTotal = Math.max(Number(customer.paidTotal ?? 0), Number(customer.totalPaid ?? 0));
-  const rankingTotal = roundMoney(Math.max(dedupedTotal, storedPaidTotal));
+  const rankingTotal = roundMoney(hasNegativeGatewayRecord ? dedupedTotal : Math.max(dedupedTotal, storedPaidTotal));
   const firstPaidDate = minDate([subscriptionStartDate, customer.firstSignupDate ?? "", customer.firstOrderDate ?? "", ...paidDates]);
   const lastPaidDate = maxDate([customer.lastPaidDate ?? "", ...paidDates, ...(input.subscriptions ?? []).map((sub) => String(sub.lastPaymentDate ?? ""))]);
 
@@ -188,8 +248,11 @@ export function calculateCustomerValueMetrics(input: {
     wooPaidTotal: roundMoney(totals.woocommerce),
     authorizeNetPaidTotal: roundMoney(totals.authorize_net),
     gatewayOnlyPaidTotal: roundMoney(totals.gateway_only),
+    nmiQuickPayPaidTotal: roundMoney(totals.nmi_quick_pay),
     subscriptionPaidTotal: roundMoney(subscriptionPaidTotal),
-    attemptedTotal: Number(customer.attemptedTotal ?? 0),
+    attemptedTotal: roundMoney(Math.max(Number(customer.attemptedTotal ?? 0), attemptedGatewayTotal)),
+    attemptedGatewayTotal: roundMoney(attemptedGatewayTotal),
+    refundsAndChargebacksDetected: hasNegativeGatewayRecord,
     duplicateSkipped,
     firstPaidDate,
     lastPaidDate,
@@ -198,5 +261,6 @@ export function calculateCustomerValueMetrics(input: {
     rankingTotal,
     subscriptionStartDate,
     stayWithUsMonths: monthsSince(firstPaidDate),
+    gatewayApprovalRate: Math.round(Math.max(0, ((totals.authorize_net + totals.gateway_only + totals.nmi_quick_pay) / Math.max(1, totals.authorize_net + totals.gateway_only + totals.nmi_quick_pay + attemptedGatewayTotal)) * 100)),
   };
 }

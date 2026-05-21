@@ -112,7 +112,7 @@ export function dedupePaidRecords(records: PaidLedgerRecord[]) {
 }
 
 function isGatewayPaid(payment: CustomerGatewayPayment) {
-  return isSettledSuccessful(payment.status) || /paid|captured|settled/i.test(payment.status ?? "");
+  return isSettledSuccessful(payment.status) || /paid|settled/i.test(payment.status ?? "");
 }
 
 export function customerLedgerRecords(customer: LedgerCustomer) {

@@ -35,7 +35,7 @@ export async function GET(request: Request) {
       Customer.countDocuments({ $or: [{ lifetimeValue: { $gt: 0 } }, { rankingPaidTotal: { $gt: 0 } }, { paidTotal: { $gt: 0 } }, { attemptedTotal: { $gt: 0 } }] }),
       Customer.find(
         { $or: [{ lifetimeValue: { $gt: 0 } }, { rankingPaidTotal: { $gt: 0 } }, { paidTotal: { $gt: 0 } }, { attemptedTotal: { $gt: 0 } }] },
-        { name: 1, email: 1, phone: 1, lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, attemptedTotal: 1, paidMonths: 1, paidOrderCount: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaidDate: 1, lastOrderDate: 1, activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, stayWithUsMonths: 1 },
+        { name: 1, email: 1, phone: 1, lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, attemptedTotal: 1, paidMonths: 1, paidOrderCount: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaidDate: 1, lastOrderDate: 1, activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, stayWithUsMonths: 1, tier: 1, paymentStatus: 1, riskLevel: 1, score: 1, estimatedCreditLimit: 1, actualCreditLimit: 1, businessProfile: 1 },
       ).sort({ lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1 }).skip((page - 1) * limit).limit(limit).lean<Array<CustomerDocument & { _id: unknown }>>(),
     ]);
     const rows = fallbackCustomers.map((customer, index) => {
@@ -59,6 +59,12 @@ export async function GET(request: Request) {
         stayWithUsMonths: Number(customer.stayWithUsMonths ?? 0),
         attemptedPipeline: Number(customer.attemptedTotal ?? 0),
         category: lifetimeSpent >= 2000 ? "VIP Paid Customer" : lifetimeSpent > 0 ? "Paying Customer" : "Hot Lead",
+        businessName: customer.businessProfile?.company || "",
+        tier: customer.tier,
+        paymentStatus: customer.paymentStatus,
+        riskLevel: customer.riskLevel,
+        score: customer.score,
+        estimatedCreditLimit: customer.businessProfile?.creditLimit || customer.actualCreditLimit || customer.businessProfile?.potentialCreditLimit || customer.estimatedCreditLimit || 0,
         paidTotal: lifetimeSpent,
         totalPaid: lifetimeSpent,
         attemptedTotal: Number(customer.attemptedTotal ?? 0),
@@ -78,7 +84,14 @@ export async function GET(request: Request) {
     };
     return NextResponse.json(payload);
   }
-  const rows = records.map((row, index) => ({
+  const customerIds = records.map((row) => row.customerId);
+  const customerDetails = customerIds.length ? await Customer.find({ _id: { $in: customerIds } }, {
+    businessProfile: 1, tier: 1, paymentStatus: 1, riskLevel: 1, score: 1, estimatedCreditLimit: 1, actualCreditLimit: 1,
+  }).lean<Array<CustomerDocument & { _id: unknown }>>() : [];
+  const customerDetailById = new Map(customerDetails.map((customer) => [String(customer._id), customer]));
+  const rows = records.map((row, index) => {
+    const detail = customerDetailById.get(row.customerId);
+    return ({
     _id: row.customerId,
     name: row.name,
     email: row.email,
@@ -97,10 +110,17 @@ export async function GET(request: Request) {
     stayWithUsMonths: row.stayWithUsMonths,
     attemptedPipeline: row.attemptedPipeline,
     category: row.category,
+    businessName: detail?.businessProfile?.company || "",
+    tier: detail?.tier || "",
+    paymentStatus: detail?.paymentStatus || "",
+    riskLevel: detail?.riskLevel || "",
+    score: detail?.score ?? 0,
+    estimatedCreditLimit: detail?.businessProfile?.creditLimit || detail?.actualCreditLimit || detail?.businessProfile?.potentialCreditLimit || detail?.estimatedCreditLimit || 0,
     paidTotal: row.lifetimeSpent,
     totalPaid: row.lifetimeSpent,
     attemptedTotal: row.attemptedPipeline,
-  }));
+  });
+  });
   const payload = {
     page,
     limit,

@@ -9,6 +9,18 @@ const endpoint = environment.includes("sandbox") || environment.includes("test")
 
 type AuthNetObject = Record<string, unknown>;
 
+export type AuthorizeNetCustomerProfileSummary = {
+  customerProfileId: string;
+  merchantCustomerId: string;
+  email: string;
+  firstName: string;
+  lastName: string;
+  company: string;
+  phone: string;
+  cardLast4s: string[];
+  customerPaymentProfileIds: string[];
+};
+
 function merchantAuthentication() {
   return { name: apiLoginId, transactionKey };
 }
@@ -85,7 +97,7 @@ async function authorizeNetRequest<T>(payload: AuthNetObject, signal?: AbortSign
 }
 
 export async function fetchSettledBatchIds(from: string, to: string, signal?: AbortSignal) {
-  const data = await authorizeNetRequest<{ getSettledBatchListResponse?: { batchList?: { batch?: unknown } } }>({
+  const data = await authorizeNetRequest<{ batchList?: unknown; getSettledBatchListResponse?: { batchList?: { batch?: unknown } | unknown } }>({
     getSettledBatchListRequest: {
       merchantAuthentication: merchantAuthentication(),
       includeStatistics: true,
@@ -93,20 +105,48 @@ export async function fetchSettledBatchIds(from: string, to: string, signal?: Ab
       lastSettlementDate: `${to}T23:59:59Z`,
     },
   }, signal);
-  return asArray(data.getSettledBatchListResponse?.batchList?.batch).map((batch) => ({
+  const batches = asArray(data.batchList).length
+    ? asArray(data.batchList)
+    : asArray(asRecord(data.getSettledBatchListResponse?.batchList).batch || data.getSettledBatchListResponse?.batchList);
+  return batches.map((batch) => ({
     batchId: asString(batch.batchId),
     settledAt: asString(batch.settlementTimeUTC || batch.settlementTimeLocal),
   })).filter((batch) => batch.batchId);
 }
 
 export async function fetchTransactionIdsForBatch(batchId: string, signal?: AbortSignal) {
-  const data = await authorizeNetRequest<{ getTransactionListResponse?: { transactions?: { transaction?: unknown } } }>({
+  const data = await authorizeNetRequest<{ transactions?: unknown; getTransactionListResponse?: { transactions?: { transaction?: unknown } | unknown } }>({
     getTransactionListRequest: {
       merchantAuthentication: merchantAuthentication(),
       batchId,
     },
   }, signal);
-  return asArray(data.getTransactionListResponse?.transactions?.transaction).map((transaction) => asString(transaction.transId)).filter(Boolean);
+  const transactions = asArray(data.transactions).length
+    ? asArray(data.transactions)
+    : asArray(asRecord(data.getTransactionListResponse?.transactions).transaction || data.getTransactionListResponse?.transactions);
+  return transactions.map((transaction) => asString(transaction.transId)).filter(Boolean);
+}
+
+export async function fetchBatchTransactionSummaries(batchId: string, signal?: AbortSignal) {
+  const data = await authorizeNetRequest<{ transactions?: unknown; getTransactionListResponse?: { transactions?: { transaction?: unknown } | unknown } }>({
+    getTransactionListRequest: {
+      merchantAuthentication: merchantAuthentication(),
+      batchId,
+    },
+  }, signal);
+  const transactions = asArray(data.transactions).length
+    ? asArray(data.transactions)
+    : asArray(asRecord(data.getTransactionListResponse?.transactions).transaction || data.getTransactionListResponse?.transactions);
+  return transactions.map((transaction) => ({
+    transactionId: asString(transaction.transId),
+    invoiceNumber: asString(transaction.invoiceNumber),
+    firstName: asString(transaction.firstName),
+    lastName: asString(transaction.lastName),
+    transactionStatus: asString(transaction.transactionStatus),
+    amount: asNumber(transaction.settleAmount || transaction.authAmount || transaction.amount),
+    cardLast4: last4(asString(transaction.accountNumber)),
+    customerProfileId: asString(asRecord(transaction.profile).customerProfileId),
+  })).filter((transaction) => transaction.transactionId);
 }
 
 export async function fetchUnsettledTransactionIds(signal?: AbortSignal) {
@@ -118,14 +158,80 @@ export async function fetchUnsettledTransactionIds(signal?: AbortSignal) {
   return asArray(data.getUnsettledTransactionListResponse?.transactions?.transaction).map((transaction) => asString(transaction.transId)).filter(Boolean);
 }
 
+export async function fetchTransactionIdsForCustomerProfile(customerProfileId: string, limit = 100, offset = 1, signal?: AbortSignal) {
+  const data = await authorizeNetRequest<{ transactions?: unknown; getTransactionListForCustomerResponse?: { transactions?: { transaction?: unknown } } }>({
+    getTransactionListForCustomerRequest: {
+      merchantAuthentication: merchantAuthentication(),
+      customerProfileId,
+      sorting: {
+        orderBy: "submitTimeUTC",
+        orderDescending: true,
+      },
+      paging: {
+        limit,
+        offset,
+      },
+    },
+  }, signal);
+  const transactions = asArray(data.transactions).length
+    ? asArray(data.transactions)
+    : asArray(data.getTransactionListForCustomerResponse?.transactions?.transaction);
+  return transactions.map((transaction) => asString(transaction.transId)).filter(Boolean);
+}
+
 export async function fetchTransactionDetails(transactionId: string, signal?: AbortSignal) {
-  const data = await authorizeNetRequest<{ getTransactionDetailsResponse?: { transaction?: unknown } }>({
+  const data = await authorizeNetRequest<{ transaction?: unknown; getTransactionDetailsResponse?: { transaction?: unknown } }>({
     getTransactionDetailsRequest: {
       merchantAuthentication: merchantAuthentication(),
       transId: transactionId,
     },
   }, signal);
-  return asRecord(data.getTransactionDetailsResponse?.transaction);
+  return asRecord(data.transaction || data.getTransactionDetailsResponse?.transaction);
+}
+
+export async function fetchCustomerProfileIds(signal?: AbortSignal) {
+  const data = await authorizeNetRequest<{ ids?: unknown; getCustomerProfileIdsResponse?: { ids?: { numericString?: unknown } } }>({
+    getCustomerProfileIdsRequest: {
+      merchantAuthentication: merchantAuthentication(),
+    },
+  }, signal);
+  const ids = asArray(data.ids).length
+    ? asArray(data.ids)
+    : asArray(data.getCustomerProfileIdsResponse?.ids?.numericString);
+  return ids.map((value) => asString(asRecord(value).numericString || value)).filter(Boolean);
+}
+
+export async function fetchCustomerProfile(customerProfileId: string, signal?: AbortSignal): Promise<AuthorizeNetCustomerProfileSummary> {
+  const data = await authorizeNetRequest<{ profile?: unknown; getCustomerProfileResponse?: { profile?: unknown } }>({
+    getCustomerProfileRequest: {
+      merchantAuthentication: merchantAuthentication(),
+      customerProfileId,
+      unmaskExpirationDate: false,
+      includeIssuerInfo: false,
+    },
+  }, signal);
+  const profile = asRecord(data.profile || data.getCustomerProfileResponse?.profile);
+  const paymentProfilesRoot = asRecord(profile.paymentProfiles);
+  const paymentProfiles = asArray(
+    paymentProfilesRoot.customerPaymentProfileMaskedType || paymentProfilesRoot.paymentProfile || profile.paymentProfiles
+  );
+  const primaryBillTo = asRecord(paymentProfiles[0]?.billTo);
+  const cardLast4s = paymentProfiles.map((paymentProfile) => {
+    const payment = asRecord(paymentProfile.payment);
+    const creditCard = asRecord(payment.creditCard);
+    return last4(asString(creditCard.cardNumber || paymentProfile.accountNumber));
+  }).filter(Boolean);
+  return {
+    customerProfileId: asString(profile.customerProfileId || customerProfileId),
+    merchantCustomerId: asString(profile.merchantCustomerId),
+    email: normalizedEmail(profile.email),
+    firstName: asString(primaryBillTo.firstName),
+    lastName: asString(primaryBillTo.lastName),
+    company: asString(primaryBillTo.company),
+    phone: normalizedPhone(primaryBillTo.phoneNumber || primaryBillTo.phone),
+    cardLast4s: Array.from(new Set(cardLast4s)),
+    customerPaymentProfileIds: paymentProfiles.map((paymentProfile) => asString(paymentProfile.customerPaymentProfileId || paymentProfile.paymentProfileId)).filter(Boolean),
+  };
 }
 
 export function normalizeAuthorizeNetTransaction(transaction: AuthNetObject, importedAt = new Date().toISOString()): Partial<AuthorizeNetTransactionDocument> {
@@ -179,10 +285,22 @@ export function normalizeAuthorizeNetTransaction(transaction: AuthNetObject, imp
 
 export function isSettledSuccessful(status: string) {
   const normalized = status.toLowerCase();
-  return normalized.includes("settled") || normalized.includes("captured");
+  if (isRefundedOrChargeback(status) || isDeclinedOrFailed(status)) return false;
+  if (normalized.includes("pending")) return false;
+  return normalized.includes("settled");
 }
 
 export function isDeclinedOrFailed(status: string) {
   const normalized = status.toLowerCase();
   return normalized.includes("declin") || normalized.includes("fail") || normalized.includes("void") || normalized.includes("error");
+}
+
+export function isPendingSettlement(status: string) {
+  const normalized = status.toLowerCase();
+  return normalized.includes("pending") || normalized.includes("captured");
+}
+
+export function isRefundedOrChargeback(status: string) {
+  const normalized = status.toLowerCase();
+  return normalized.includes("refund") || normalized.includes("chargeback") || normalized.includes("charge back");
 }

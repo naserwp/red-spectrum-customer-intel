@@ -77,6 +77,7 @@ type OrderHistoryItem = {
   billingFirstName?: string;
   billingLastName?: string;
   billingCompany?: string;
+  billingAddress?: { address1?: string; address2?: string; city?: string; state?: string; postcode?: string; country?: string };
   lineItems: OrderLineItem[];
   products?: OrderLineItem[];
   refundsCount: number;
@@ -103,6 +104,7 @@ type SourceCoverage = {
   wooCommerceCustomerOrdersStored?: number;
   wooCommerceOrderRecordsFound?: number;
   authorizeNetTransactionsFound?: number;
+  nmiQuickPayTransactionsFound?: number;
   gatewayOnlyPaymentsAttached?: number;
   reconciledRecords?: number;
   missingUnattachedRecords?: number;
@@ -136,17 +138,54 @@ type GatewayPayment = {
   customerPaymentProfileId?: string;
 };
 
+type UnifiedPaymentLedgerRow = {
+  date: string;
+  source: "woocommerce" | "authorize_net" | "nmi_quick_pay";
+  provider: string;
+  transactionId: string;
+  invoiceNumber: string;
+  productDescription: string;
+  status: string;
+  amount: number;
+  cardLast4: string;
+  matchMethod: string;
+  confidence: string;
+  revenueType: "paid" | "attempted" | "refund" | "pending";
+};
+
+type UnifiedPaymentMetrics = {
+  paidTotal: number;
+  attemptedTotal: number;
+  refundTotal: number;
+  paidCount: number;
+  attemptedCount: number;
+  duplicateSkipped: number;
+  lastActivity: string;
+};
+
 type BusinessProfile = {
   firstName?: string;
   lastName?: string;
   company?: string;
+  dba?: string;
+  email?: string;
   phone?: string;
   address1?: string;
   address2?: string;
+  shippingAddress1?: string;
+  shippingAddress2?: string;
+  shippingCity?: string;
+  shippingState?: string;
+  shippingZip?: string;
+  shippingCountry?: string;
   city?: string;
   state?: string;
   zip?: string;
   country?: string;
+  website?: string;
+  sourcePlatform?: string;
+  customerSince?: string;
+  lastActivity?: string;
   ein?: string;
   potentialCreditLimit?: number;
   creditLimit?: number;
@@ -184,6 +223,7 @@ type CustomerDetail = {
   paidProducts?: string[];
   firstSignupOrderNumber?: string;
   firstSignupDate?: string;
+  firstPaidDate?: string;
   firstSignupAmount?: number;
   firstSignupProduct?: string;
   baseProductsPurchased?: string[];
@@ -197,6 +237,8 @@ type CustomerDetail = {
   productJourney?: ProductJourneyItem[];
   gatewayVerification?: GatewayVerification;
   gatewayPayments?: GatewayPayment[];
+  unifiedPaymentLedger?: UnifiedPaymentLedgerRow[];
+  unifiedPaymentMetrics?: UnifiedPaymentMetrics;
   sourceCoverage?: SourceCoverage;
   businessProfile?: BusinessProfile;
   orderCount: number;
@@ -257,6 +299,18 @@ const productNames = (order?: OrderHistoryItem, fallback: string[] = []) => {
   return names.length ? names.join(", ") : fallback.length ? fallback.join(", ") : "the selected product";
 };
 const paidStatuses = new Set(["completed", "processing", "paid"]);
+const isGatewayPaidStatus = (status?: string) => {
+  const normalized = String(status ?? "").toLowerCase();
+  return normalized.includes("settled") || normalized === "paid";
+};
+const isGatewayDeclinedStatus = (status?: string) => /declin|fail|void|error/i.test(String(status ?? ""));
+const isGatewayRefundStatus = (status?: string) => /refund|chargeback|charge back/i.test(String(status ?? ""));
+const gatewayStatusBadgeClass = (status?: string) => {
+  if (isGatewayPaidStatus(status)) return "border-emerald-500/50 bg-emerald-500/15 text-emerald-200";
+  if (isGatewayDeclinedStatus(status)) return "border-red-500/50 bg-red-500/15 text-red-200";
+  if (isGatewayRefundStatus(status)) return "border-amber-500/50 bg-amber-500/15 text-amber-100";
+  return "border-sky-500/50 bg-sky-500/15 text-sky-200";
+};
 
 function isPaidOrder(order: OrderHistoryItem) {
   return order.isPaid || paidStatuses.has(order.status.toLowerCase());
@@ -499,6 +553,28 @@ export default function CustomerDetailPage() {
     }
   };
 
+  const rebuildCustomerRevenue = async () => {
+    setMessage("Rebuilding customer revenue from gateway transactions...");
+    try {
+      const response = await fetch("/api/admin/rebuild-customer-revenue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ customerId: customer?._id, dryRun: false }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Rebuild failed.");
+      if (data.stats?.length) {
+        const stat = data.stats[0];
+        setMessage(`Revenue rebuilt: Found ${stat.totalGatewayPaymentsFound} gateway transactions. Updated from ${money(stat.beforeRankingTotal)} to ${money(stat.rankingTotal)}.`);
+      } else {
+        setMessage("Rebuild complete - no changes needed.");
+      }
+      await loadCustomer();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Rebuild failed.");
+    }
+  };
+
   const attemptedProductRows = useMemo(() => {
     const rows = new Map<string, { name: string; quantity: number; amount: number; lastAttemptDate: string; status: string; paymentMethod: string }>();
     for (const order of customer?.orders?.filter((item) => item.isAttempted) ?? []) {
@@ -558,7 +634,7 @@ export default function CustomerDetailPage() {
   if (loadError || !customer) return <CustomerErrorState onRetry={loadCustomer} />;
 
   const orders = [...(customer.orders ?? [])].sort((a, b) => new Date(b.dateCreated).getTime() - new Date(a.dateCreated).getTime());
-  const gatewayOnlyOrders = orders.filter((order) => order.source === "authorize_net_only");
+  const gatewayOnlyOrders = orders.filter((order) => order.source === "authorize_net_only" || order.source === "nmi_quick_pay_only");
   const wooCustomerOrdersStored = orders.length - gatewayOnlyOrders.length;
   const attemptedOrders = orders.filter((order) => order.isAttempted);
   const paidOrdersFromTimeline = orders.filter(isPaidOrder);
@@ -581,6 +657,24 @@ export default function CustomerDetailPage() {
   const attemptedProductSummary = classifiedAttemptedProducts.length ? classifiedAttemptedProducts : customer.attemptedProducts ?? [];
   const requiresProductReview = isLead && attemptedBoostProducts.length > 0 && baseProductsPurchased.length === 0;
   const profile = customer.businessProfile ?? {};
+  const latestOrderWithBilling = orders.find((order) => order.billingCompany || order.billingPhone || order.billingAddress?.address1 || order.billingEmail) ?? orders[0];
+  const businessInfo = {
+    businessName: profile.company || latestOrderWithBilling?.billingCompany || customer.name || "-",
+    dba: profile.dba || "-",
+    ein: profile.ein || "-",
+    phone: profile.phone || latestOrderWithBilling?.billingPhone || customer.phone || "-",
+    email: profile.email || customer.email || latestOrderWithBilling?.billingEmail || "-",
+    billingAddress: [profile.address1 || latestOrderWithBilling?.billingAddress?.address1, profile.address2 || latestOrderWithBilling?.billingAddress?.address2].filter(Boolean).join(", ") || "-",
+    shippingAddress: [profile.shippingAddress1, profile.shippingAddress2].filter(Boolean).join(", ") || "-",
+    city: profile.city || latestOrderWithBilling?.billingAddress?.city || "-",
+    state: profile.state || latestOrderWithBilling?.billingAddress?.state || "-",
+    zip: profile.zip || latestOrderWithBilling?.billingAddress?.postcode || "-",
+    country: profile.country || latestOrderWithBilling?.billingAddress?.country || "-",
+    website: profile.website || "-",
+    sourcePlatform: profile.sourcePlatform || profile.source || latestOrderWithBilling?.source || "customer_record",
+    customerSince: profile.customerSince || customer.firstPaidDate || customer.firstSignupDate || customer.firstOrderDate || "",
+    lastActivity: profile.lastActivity || customer.lastPaidDate || customer.lastOrderDate || customer.lastSyncedAt || "",
+  };
   const hasProfileData = Boolean(profile.source || profile.company || profile.ein || profile.creditLimit || profile.potentialCreditLimit || profile.address1);
   const missingUnattachedRecords = Math.max(
     Number(customer.sourceCoverage?.missingUnattachedRecords ?? 0),
@@ -593,9 +687,10 @@ export default function CustomerDetailPage() {
     }
     for (const order of gatewayOnlyOrders) {
       if (!order.transactionId || byTransaction.has(order.transactionId)) continue;
+      const isNmi = order.source === "nmi_quick_pay_only" || order.gatewayVerification?.provider === "nmi";
       byTransaction.set(order.transactionId, {
         date: order.paidDate || order.dateCreated,
-        provider: "authorize_net",
+        provider: isNmi ? "nmi" : "authorize_net",
         transactionId: order.transactionId,
         invoiceNumber: order.orderNumber,
         status: order.gatewayVerification?.transactionStatus || order.status,
@@ -604,7 +699,7 @@ export default function CustomerDetailPage() {
         cardType: order.gatewayVerification?.cardType || "",
         matchedBy: order.gatewayVerification?.matchedBy || order.matchedBy?.join(", ") || "",
         matchConfidence: order.gatewayVerification?.confidence || order.matchConfidence || "",
-        source: "authorize_net_only",
+        source: isNmi ? "nmi_quick_pay_only" : "authorize_net_only",
         customerProfileId: order.gatewayVerification?.customerProfileId || "",
         customerPaymentProfileId: order.gatewayVerification?.paymentProfileId || "",
       });
@@ -612,6 +707,26 @@ export default function CustomerDetailPage() {
     return Array.from(byTransaction.values()).sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
   })();
   const latestGatewayPayment = gatewayHistoryRows[0];
+  const gatewayPaidTotal = gatewayHistoryRows.reduce((sum, payment) => isGatewayPaidStatus(payment.status) ? sum + Number(payment.amount ?? 0) : isGatewayRefundStatus(payment.status) ? sum - Math.abs(Number(payment.amount ?? 0)) : sum, 0);
+  const gatewayDeclinedTotal = gatewayHistoryRows.reduce((sum, payment) => isGatewayDeclinedStatus(payment.status) ? sum + Math.abs(Number(payment.amount ?? 0)) : sum, 0);
+  const gatewayDecisionCount = gatewayHistoryRows.filter((payment) => isGatewayPaidStatus(payment.status) || isGatewayDeclinedStatus(payment.status)).length;
+  const gatewayApprovalRate = gatewayDecisionCount > 0 ? (gatewayHistoryRows.filter((payment) => isGatewayPaidStatus(payment.status)).length / gatewayDecisionCount) * 100 : 0;
+  const unifiedPaymentRows = (customer.unifiedPaymentLedger ?? []).length
+    ? customer.unifiedPaymentLedger ?? []
+    : gatewayHistoryRows.map((payment) => ({
+      date: payment.date,
+      source: payment.provider === "nmi" || payment.provider === "nmi_quick_pay" ? "nmi_quick_pay" as const : "authorize_net" as const,
+      provider: payment.provider,
+      transactionId: payment.transactionId,
+      invoiceNumber: payment.invoiceNumber,
+      productDescription: payment.provider === "nmi" ? "NMI Quick Pay" : "Authorize.net Payment",
+      status: payment.status,
+      amount: payment.amount,
+      cardLast4: payment.cardLast4,
+      matchMethod: payment.matchedBy,
+      confidence: payment.matchConfidence,
+      revenueType: isGatewayPaidStatus(payment.status) ? "paid" as const : isGatewayDeclinedStatus(payment.status) ? "attempted" as const : isGatewayRefundStatus(payment.status) ? "refund" as const : "pending" as const,
+    }));
   const activeSubscriptionRows = subscriptions.filter((sub) => String(sub.status ?? "").toLowerCase() === "active");
   const activeSubscriptionCount = activeSubscriptionRows.length + (customer.isGatewayRecurring ? 1 : 0);
   const wooRecurringRevenue = activeSubscriptionRows.reduce((sum, sub) => sum + Number(sub.monthlyRecurringRevenue ?? sub.amount ?? 0), 0);
@@ -626,6 +741,7 @@ export default function CustomerDetailPage() {
     ["WooCommerce customer orders stored", customer.sourceCoverage?.wooCommerceCustomerOrdersStored ?? wooCustomerOrdersStored],
     ["WooCommerceOrder records found", customer.sourceCoverage?.wooCommerceOrderRecordsFound ?? sourceCompare?.wooCommerceOrderRecordsCount ?? "-"],
     ["Authorize.net transactions found", customer.sourceCoverage?.authorizeNetTransactionsFound ?? gatewayHistoryRows.filter((payment) => payment.provider === "authorize_net").length],
+    ["NMI Quick Pay transactions found", customer.sourceCoverage?.nmiQuickPayTransactionsFound ?? gatewayHistoryRows.filter((payment) => payment.provider === "nmi" || payment.provider === "nmi_quick_pay").length],
     ["Gateway-only payments attached", customer.sourceCoverage?.gatewayOnlyPaymentsAttached ?? gatewayOnlyOrders.length],
     ["Reconciled records", customer.sourceCoverage?.reconciledRecords ?? gatewayHistoryRows.length],
     ["Missing/unattached records", missingUnattachedRecords],
@@ -665,6 +781,7 @@ export default function CustomerDetailPage() {
     actions={<>
       <button onClick={backToCustomerList} className="w-fit rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-semibold text-zinc-100 transition hover:border-red-500/60 hover:bg-zinc-800">Back to Customer List</button>
       <button onClick={downloadPdf} className="w-fit rounded border border-orange-500/50 bg-orange-600/20 px-4 py-2 text-sm font-semibold text-orange-100 transition hover:bg-orange-600/30">Download Customer PDF</button>
+      <button onClick={rebuildCustomerRevenue} className="w-fit rounded bg-blue-700 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-600">Rebuild Revenue</button>
       <button onClick={repairGatewayPayments} className="w-fit rounded bg-red-700 px-4 py-2 text-sm font-semibold text-white transition hover:bg-red-600">Repair Gateway Payments</button>
     </>}
   >
@@ -683,6 +800,7 @@ export default function CustomerDetailPage() {
           ["Average Order Value", money(Number(customer.averageOrderValue ?? 0))],
           ["Risk", customer.riskLevel],
           ["Tier", actualPaid > 0 ? customer.tier : "Lead"],
+          ["Total Credit Limit", money(Number(profile.potentialCreditLimit ?? customer.estimatedCreditLimit ?? 0))],
         ].map(([k, v]) => <div key={String(k)} className="rounded-xl border border-zinc-800 bg-zinc-900 p-4"><p className="text-xs font-semibold uppercase text-zinc-400">{k}</p><p className="mt-2 text-xl font-bold">{String(v)}</p></div>)}
       </section>
 
@@ -690,6 +808,42 @@ export default function CustomerDetailPage() {
         <p className="font-semibold">Timeline not synced yet - run single customer sync</p>
         <p className="mt-1 text-sm text-amber-100/80">This customer has paid value and historical order count, but no saved WooCommerce order timeline on the selected record.</p>
       </div>}
+
+      <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+        <h2 className="text-xl font-semibold text-blue-300">Customer Profile Summary</h2>
+        <div className="mt-3 grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
+          {[
+            ["Customer Name", customer.name],
+            ["Email", customer.email],
+            ["Category", actualPaid >= 2000 ? "VIP Paid" : actualPaid > 0 ? "Paying" : attempted >= 2000 ? "Very Hot Lead" : attempted > 0 ? "Hot Lead" : "Cold Lead"],
+            ["Tier", actualPaid > 0 ? customer.tier : "Lead"],
+            ["Actual Paid", money(actualPaid)],
+            ["Paid Orders", displayedPaidOrderCount],
+            ["Attempted Orders", customer.attemptedOrderCount ?? 0],
+            ["Start Date", displayDate(customer.firstSignupDate || customer.firstOrderDate)],
+            ["Tenure", (() => {
+              const startDate = customer.firstSignupDate || customer.firstOrderDate;
+              const date = startDate ? new Date(startDate) : null;
+              if (!date || Number.isNaN(date.getTime())) return "-";
+              const now = new Date();
+              const months = Math.max(0, (now.getFullYear() - date.getFullYear()) * 12 + now.getMonth() - date.getMonth() + 1);
+              return `${months} mo`;
+            })()],
+            ["Payment Status", displayStatus(customer.paymentStatus)],
+            ["Lead Status", displayStatus(customer.leadStatus)],
+            ["Last Paid", displayDate(customer.lastPaidDate)],
+            ["Last Attempt", displayDate(customer.lastAttemptDate)],
+            ["Risk", customer.riskLevel],
+            ["Score", `${customer.score ?? 0}/${customer.stars ?? 0}`],
+            ["Credit Limit", money(Number(profile.creditLimit ?? customer.actualCreditLimit ?? 0))],
+            ["Total Credit Limit", money(Number(profile.potentialCreditLimit ?? customer.estimatedCreditLimit ?? 0))],
+            ["AI Summary", customer.aiSummary?.substring(0, 100) || "-"],
+          ].map(([label, value]) => <div key={label} className="rounded border border-zinc-700 bg-zinc-950 p-3">
+            <p className="text-xs font-semibold uppercase text-zinc-400">{label}</p>
+            <p className="mt-2 text-sm font-semibold text-zinc-100 line-clamp-2">{String(value)}</p>
+          </div>)}
+        </div>
+      </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
         <h2 className="text-xl font-semibold text-red-300">Subscription Intelligence</h2>
@@ -706,6 +860,32 @@ export default function CustomerDetailPage() {
           ].map(([label, value]) => <div key={label} className="rounded border border-zinc-700 bg-zinc-950 p-3">
             <p className="text-xs font-semibold uppercase text-zinc-400">{label}</p>
             <p className="mt-2 text-sm font-semibold text-zinc-100">{String(value)}</p>
+          </div>)}
+        </div>
+      </section>
+
+      <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+        <h2 className="text-xl font-semibold text-orange-300">Business Information</h2>
+        <div className="mt-3 grid gap-3 md:grid-cols-4">
+          {[
+            ["Business Name", businessInfo.businessName],
+            ["DBA", businessInfo.dba],
+            ["EIN", businessInfo.ein],
+            ["Phone", businessInfo.phone],
+            ["Email", businessInfo.email],
+            ["Billing Address", businessInfo.billingAddress],
+            ["Shipping Address", businessInfo.shippingAddress],
+            ["City", businessInfo.city],
+            ["State", businessInfo.state],
+            ["ZIP", businessInfo.zip],
+            ["Country", businessInfo.country],
+            ["Website", businessInfo.website],
+            ["Source Platform", displayStatus(businessInfo.sourcePlatform)],
+            ["Customer Since", displayDate(businessInfo.customerSince)],
+            ["Last Activity", displayDateTime(businessInfo.lastActivity)],
+          ].map(([label, value]) => <div key={label} className="rounded border border-zinc-700 bg-zinc-950 p-3">
+            <p className="text-xs font-semibold uppercase text-zinc-400">{label}</p>
+            <p className="mt-2 text-sm font-semibold text-zinc-100">{String(value || "-")}</p>
           </div>)}
         </div>
       </section>
@@ -791,7 +971,7 @@ export default function CustomerDetailPage() {
               const type = getOrderType(order);
               return <tr key={order.orderId} className="border-t border-zinc-800">
                 <td className="px-3 py-3">{displayDateTime(order.dateCreated)}</td>
-                <td className="px-3 py-3">{order.orderNumber}{order.source === "authorize_net_only" && <span className="ml-2 rounded border border-emerald-500/50 bg-emerald-500/15 px-2 py-1 text-xs text-emerald-200">Authorize.net Only</span>}</td>
+                <td className="px-3 py-3">{order.orderNumber}{order.source === "authorize_net_only" && <span className="ml-2 rounded border border-emerald-500/50 bg-emerald-500/15 px-2 py-1 text-xs text-emerald-200">Authorize.net Only</span>}{order.source === "nmi_quick_pay_only" && <span className="ml-2 rounded border border-sky-500/50 bg-sky-500/15 px-2 py-1 text-xs text-sky-200">NMI Quick Pay Only</span>}</td>
                 <td className="px-3 py-3">{displayStatus(order.status)}</td>
                 <td className="px-3 py-3">{order.paymentMethodTitle || order.paymentMethod || "-"}</td>
                 <td className="px-3 py-3">{productNames(order)}</td>
@@ -832,6 +1012,40 @@ export default function CustomerDetailPage() {
       </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+        <h2 className="text-xl font-semibold text-red-300">Unified Payment History</h2>
+        <div className="mt-3 grid gap-3 md:grid-cols-4">
+          {[
+            ["Unified Paid", money(Number(customer.unifiedPaymentMetrics?.paidTotal ?? actualPaid))],
+            ["Unified Attempted", money(Number(customer.unifiedPaymentMetrics?.attemptedTotal ?? attempted))],
+            ["Refunds / Chargebacks", money(Number(customer.unifiedPaymentMetrics?.refundTotal ?? 0))],
+            ["Duplicates Skipped", Number(customer.unifiedPaymentMetrics?.duplicateSkipped ?? 0)],
+          ].map(([label, value]) => <div key={label} className="rounded border border-zinc-700 bg-zinc-950 p-3">
+            <p className="text-xs font-semibold uppercase text-zinc-400">{label}</p>
+            <p className="mt-2 text-sm font-semibold text-zinc-100">{value}</p>
+          </div>)}
+        </div>
+        <div className="mt-3 overflow-x-auto rounded border border-zinc-800">
+          <table className="min-w-[1350px] text-sm">
+            <thead className="bg-zinc-950"><tr>{["Date", "Source", "Provider", "Transaction ID", "Invoice / Order #", "Product / Description", "Status", "Amount", "Card Last4", "Match Method", "Confidence"].map((h) => <th key={h} className="px-3 py-2 text-left text-xs uppercase text-zinc-400">{h}</th>)}</tr></thead>
+            <tbody>{unifiedPaymentRows.map((payment, index) => <tr key={`${payment.source}-${payment.transactionId || payment.invoiceNumber}-${index}`} className={`border-t border-zinc-800 ${payment.revenueType === "paid" ? "bg-emerald-500/5" : payment.revenueType === "attempted" ? "bg-orange-500/5" : payment.revenueType === "refund" ? "bg-amber-500/5" : ""}`}>
+              <td className="px-3 py-3">{displayDateTime(payment.date)}</td>
+              <td className="px-3 py-3">{payment.source === "nmi_quick_pay" ? "NMI Quick Pay" : payment.source === "authorize_net" ? "Authorize.net" : "Website / WooCommerce"}</td>
+              <td className="px-3 py-3">{displayStatus(payment.provider)}</td>
+              <td className="px-3 py-3">{payment.transactionId || "-"}</td>
+              <td className="px-3 py-3">{payment.invoiceNumber || "-"}</td>
+              <td className="px-3 py-3">{payment.productDescription || "-"}</td>
+              <td className="px-3 py-3"><span className={`rounded border px-2 py-1 text-xs ${gatewayStatusBadgeClass(payment.status)}`}>{displayStatus(payment.status)}</span></td>
+              <td className="px-3 py-3">{money(payment.amount)}</td>
+              <td className="px-3 py-3">{payment.cardLast4 || "-"}</td>
+              <td className="px-3 py-3">{displayStatus(payment.matchMethod)}</td>
+              <td className="px-3 py-3">{displayStatus(payment.confidence)}</td>
+            </tr>)}</tbody>
+          </table>
+          {unifiedPaymentRows.length === 0 && <p className="p-3 text-zinc-400">No unified payment history has been imported for this customer yet.</p>}
+        </div>
+      </section>
+
+      <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
         <h2 className="text-xl font-semibold text-sky-300">Payment Verification</h2>
         {latestGatewayPayment ? <>
           <div className="mt-3 grid gap-3 md:grid-cols-4">
@@ -852,6 +1066,17 @@ export default function CustomerDetailPage() {
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
         <h2 className="text-xl font-semibold text-emerald-300">Gateway Payment History</h2>
+        <div className="mt-3 grid gap-3 md:grid-cols-4">
+          {[
+            ["Total Gateway Paid", money(gatewayPaidTotal)],
+            ["Total Declined Attempts", money(gatewayDeclinedTotal)],
+            ["Gateway Approval Rate", `${gatewayApprovalRate.toFixed(0)}%`],
+            ["Last Gateway Activity", displayDateTime(latestGatewayPayment?.date)],
+          ].map(([label, value]) => <div key={label} className="rounded border border-zinc-700 bg-zinc-950 p-3">
+            <p className="text-xs font-semibold uppercase text-zinc-400">{label}</p>
+            <p className="mt-2 text-sm font-semibold text-zinc-100">{value}</p>
+          </div>)}
+        </div>
         <div className="mt-3 overflow-x-auto rounded border border-zinc-800">
           <table className="min-w-[1050px] text-sm">
             <thead className="bg-zinc-950"><tr>{["Date", "Provider", "Transaction ID", "Invoice #", "Status", "Amount", "Card Last4", "Card Type", "Match Method", "Confidence", "Source"].map((h) => <th key={h} className="px-3 py-2 text-left text-xs uppercase text-zinc-400">{h}</th>)}</tr></thead>
@@ -860,13 +1085,13 @@ export default function CustomerDetailPage() {
               <td className="px-3 py-3">{displayStatus(payment.provider)}</td>
               <td className="px-3 py-3">{payment.transactionId}</td>
               <td className="px-3 py-3">{payment.invoiceNumber || "-"}</td>
-              <td className="px-3 py-3">{displayStatus(payment.status)}</td>
+              <td className="px-3 py-3"><span className={`rounded border px-2 py-1 text-xs ${gatewayStatusBadgeClass(payment.status)}`}>{displayStatus(payment.status)}</span></td>
               <td className="px-3 py-3">{money(payment.amount)}</td>
               <td className="px-3 py-3">{payment.cardLast4 || "-"}</td>
               <td className="px-3 py-3">{payment.cardType || "-"}</td>
               <td className="px-3 py-3">{displayStatus(payment.matchedBy)}</td>
               <td className="px-3 py-3">{displayStatus(payment.matchConfidence)}</td>
-              <td className="px-3 py-3">{payment.source === "authorize_net_only" ? "Authorize.net only" : displayStatus(payment.source)}</td>
+              <td className="px-3 py-3">{payment.source === "authorize_net_only" ? "Authorize.net only" : payment.source === "nmi_quick_pay_only" ? "NMI Quick Pay only" : displayStatus(payment.source)}</td>
             </tr>)}</tbody>
           </table>
           {gatewayHistoryRows.length === 0 && <p className="p-3 text-zinc-400">No gateway payment history has been reconciled for this customer yet.</p>}

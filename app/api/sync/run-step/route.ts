@@ -9,10 +9,14 @@ import { buildProductJourneySummary } from "@/lib/productClassification";
 import { connectToDatabase } from "@/lib/mongodb";
 import { fetchWooCommerceOrders, fetchWooCommerceSubscriptions, isWooCommerceConfigured, wooCommerceOrderStatuses, wooCommerceSubscriptionStatuses } from "@/lib/woocommerce";
 import { fetchProfileUsersWithFallback, isWooCommerceCustomerFallbackConfigured, isWordPressProfileImportConfigured } from "@/lib/wordpressProfiles";
+import { fetchNmiTransactions, isNmiConfigured, normalizeNmiPaymentEvent } from "@/lib/nmiQuickPay";
+import { reconcileNmiTransaction } from "@/lib/nmiReconciliation";
 import { countBy, normalizeWooOrder, orderHistoryItemFromStoredOrder, unique } from "@/lib/wooOrderImport";
 import { normalizeWooSubscription } from "@/lib/wooSubscriptionImport";
 import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer } from "@/models/Customer";
+import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
+import { PaymentEvent, type PaymentEventDocument } from "@/models/PaymentEvent";
 import { SyncJob } from "@/models/SyncJob";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 import { WooCommerceSubscriptionRecord } from "@/models/WooCommerceSubscription";
@@ -27,14 +31,17 @@ const reconcileLimit = 50;
 const wordpressProfileLimit = 25;
 
 type SyncCursor = {
-  phase?: "orders" | "customers" | "subscriptions" | "wordpress_profiles" | "authorize_net_import" | "authorize_net_reconcile" | "analytics" | "done";
+  phase?: "orders" | "customers" | "subscriptions" | "wordpress_profiles" | "authorize_net_import" | "authorize_net_reconcile" | "nmi_import" | "nmi_reconcile" | "analytics" | "done";
   orderStatusIndex?: number;
   orderPage?: number;
   rebuildOffset?: number;
   subscriptionStatusIndex?: number;
   subscriptionPage?: number;
   authorizeNetOffset?: number;
+  authorizeNetBatchOffset?: number;
   reconcileOffset?: number;
+  nmiOffset?: number;
+  nmiReconcileOffset?: number;
   wordpressProfileOffset?: number;
   analyticsOffset?: number;
   completedSteps?: string[];
@@ -316,13 +323,17 @@ async function importWordPressProfilesStep(cursor: SyncCursor) {
 
 async function importAuthorizeNetStep(cursor: SyncCursor) {
   if (!isAuthorizeNetConfigured()) return { cursor: nextCursor(cursor, { phase: "authorize_net_reconcile", completedSteps: ["authorize_net_import"] }), warning: "Authorize.net is not configured." };
-  const from = "2024-01-01";
+  const from = "2019-01-01";
   const to = dateInput(new Date(), new Date().toISOString().slice(0, 10));
   const ids: string[] = [];
+  const batchOffset = cursor.authorizeNetBatchOffset ?? 0;
+  let batchCount = 0;
   try {
     const batches = await fetchSettledBatchIds(from, to);
-    for (const batch of batches.slice(0, 2)) ids.push(...await fetchTransactionIdsForBatch(batch.batchId));
-    ids.push(...await fetchUnsettledTransactionIds());
+    batchCount = batches.length;
+    const batch = batches[batchOffset];
+    if (batch) ids.push(...await fetchTransactionIdsForBatch(batch.batchId));
+    if (batchOffset === 0) ids.push(...await fetchUnsettledTransactionIds());
   } catch (error) {
     return { cursor: nextCursor(cursor, { phase: "authorize_net_reconcile", completedSteps: ["authorize_net_import"] }), warning: error instanceof Error ? error.message : "Authorize.net import failed." };
   }
@@ -346,11 +357,16 @@ async function importAuthorizeNetStep(cursor: SyncCursor) {
     })), { ordered: false });
     authorizeNetTransactionsImported = write.upsertedCount + write.modifiedCount;
   }
-  const hasMore = offset + selected.length < uniqueIds.length;
+  const hasMoreInBatch = offset + selected.length < uniqueIds.length;
+  const hasMoreBatches = batchOffset + 1 < batchCount;
   return {
-    cursor: hasMore ? nextCursor(cursor, { phase: "authorize_net_import", authorizeNetOffset: offset + selected.length }) : nextCursor(cursor, { phase: "authorize_net_reconcile", reconcileOffset: 0, completedSteps: ["authorize_net_import"] }),
+    cursor: hasMoreInBatch
+      ? nextCursor(cursor, { phase: "authorize_net_import", authorizeNetBatchOffset: batchOffset, authorizeNetOffset: offset + selected.length })
+      : hasMoreBatches
+        ? nextCursor(cursor, { phase: "authorize_net_import", authorizeNetBatchOffset: batchOffset + 1, authorizeNetOffset: 0 })
+        : nextCursor(cursor, { phase: "authorize_net_reconcile", reconcileOffset: 0, completedSteps: ["authorize_net_import"] }),
     authorizeNetTransactionsImported,
-    label: "Importing Authorize.net transactions...",
+    label: `Importing Authorize.net transactions batch ${batchOffset + 1}/${Math.max(batchCount, 1)}...`,
     warning: warnings.join(" "),
   };
 }
@@ -365,9 +381,54 @@ async function reconcileAuthorizeNetStep(cursor: SyncCursor) {
   }
   const hasMore = transactions.length === reconcileLimit;
   return {
-    cursor: hasMore ? nextCursor(cursor, { phase: "authorize_net_reconcile", reconcileOffset: offset + transactions.length }) : nextCursor(cursor, { phase: "analytics", completedSteps: ["authorize_net_reconcile"] }),
+    cursor: hasMore ? nextCursor(cursor, { phase: "authorize_net_reconcile", reconcileOffset: offset + transactions.length }) : nextCursor(cursor, { phase: "nmi_import", nmiOffset: 0, completedSteps: ["authorize_net_reconcile"] }),
     authorizeNetPaymentsReconciled,
     label: `Reconciling Authorize.net payments ${offset}-${offset + transactions.length}...`,
+  };
+}
+
+async function importNmiStep(cursor: SyncCursor) {
+  const offset = cursor.nmiOffset ?? 0;
+  const importedAt = new Date().toISOString();
+  const warnings: string[] = [];
+  const normalized = [];
+  if (isNmiConfigured() && offset === 0) {
+    const result = await fetchNmiTransactions({ from: "2019-01-01", to: new Date().toISOString().slice(0, 10) });
+    if (result.warning) warnings.push(result.warning);
+    normalized.push(...result.transactions);
+  }
+  const webhookEvents = await PaymentEvent.find({ provider: "nmi" }).sort({ receivedAt: -1 }).skip(offset).limit(authNetLimit).lean<PaymentEventDocument[]>();
+  normalized.push(...webhookEvents.map((event) => normalizeNmiPaymentEvent(event, importedAt)));
+  const unique = Array.from(new Map(normalized.filter((transaction) => transaction.transactionId).map((transaction) => [transaction.transactionId, transaction])).values()).slice(0, authNetLimit);
+  let nmiTransactionsImported = 0;
+  if (unique.length) {
+    const write = await NmiQuickPayTransaction.bulkWrite(unique.map((transaction) => ({
+      updateOne: { filter: { transactionId: transaction.transactionId }, update: { $set: transaction }, upsert: true },
+    })), { ordered: false });
+    nmiTransactionsImported = write.upsertedCount + write.modifiedCount;
+  }
+  const hasMore = webhookEvents.length === authNetLimit;
+  return {
+    cursor: hasMore ? nextCursor(cursor, { phase: "nmi_import", nmiOffset: offset + webhookEvents.length }) : nextCursor(cursor, { phase: "nmi_reconcile", nmiReconcileOffset: 0, completedSteps: ["nmi_import"] }),
+    nmiTransactionsImported,
+    label: `Importing NMI Quick Pay transactions ${offset}-${offset + webhookEvents.length}...`,
+    warning: warnings.join(" "),
+  };
+}
+
+async function reconcileNmiStep(cursor: SyncCursor) {
+  const offset = cursor.nmiReconcileOffset ?? 0;
+  const transactions = await NmiQuickPayTransaction.find({}).sort({ submittedAt: -1 }).skip(offset).limit(reconcileLimit).lean<NmiQuickPayTransactionDocument[]>();
+  let nmiPaymentsReconciled = 0;
+  for (const transaction of transactions) {
+    const result = await reconcileNmiTransaction(transaction, false);
+    if (result.matched) nmiPaymentsReconciled += 1;
+  }
+  const hasMore = transactions.length === reconcileLimit;
+  return {
+    cursor: hasMore ? nextCursor(cursor, { phase: "nmi_reconcile", nmiReconcileOffset: offset + transactions.length }) : nextCursor(cursor, { phase: "analytics", completedSteps: ["nmi_reconcile"] }),
+    nmiPaymentsReconciled,
+    label: `Reconciling NMI Quick Pay payments ${offset}-${offset + transactions.length}...`,
   };
 }
 
@@ -396,6 +457,8 @@ export async function POST(request: Request) {
     wordpressProfilesImported?: number;
     authorizeNetTransactionsImported?: number;
     authorizeNetPaymentsReconciled?: number;
+    nmiTransactionsImported?: number;
+    nmiPaymentsReconciled?: number;
     analyticsRecordsUpdated?: number;
   };
 
@@ -405,6 +468,8 @@ export async function POST(request: Request) {
   else if (cursor.phase === "wordpress_profiles") result = await importWordPressProfilesStep(cursor);
   else if (cursor.phase === "authorize_net_import") result = await importAuthorizeNetStep(cursor);
   else if (cursor.phase === "authorize_net_reconcile") result = await reconcileAuthorizeNetStep(cursor);
+  else if (cursor.phase === "nmi_import") result = await importNmiStep(cursor);
+  else if (cursor.phase === "nmi_reconcile") result = await reconcileNmiStep(cursor);
   else if (cursor.phase === "analytics") result = await rebuildAnalyticsStep(cursor);
   else result = { cursor: nextCursor(cursor, { phase: "done" }), label: "Sync complete." };
   if (result.warning) warnings.push(result.warning);
@@ -418,10 +483,10 @@ export async function POST(request: Request) {
     progress: hasMore ? 50 : 100,
     totalPages: 1,
     pagesFetched: 1,
-    recordsProcessed: (result.ordersImported ?? 0) + (result.customersUpdated ?? 0) + (result.subscriptionsImported ?? 0) + (result.wordpressProfilesImported ?? 0) + (result.authorizeNetTransactionsImported ?? 0) + (result.authorizeNetPaymentsReconciled ?? 0) + (result.analyticsRecordsUpdated ?? 0),
+    recordsProcessed: (result.ordersImported ?? 0) + (result.customersUpdated ?? 0) + (result.subscriptionsImported ?? 0) + (result.wordpressProfilesImported ?? 0) + (result.authorizeNetTransactionsImported ?? 0) + (result.authorizeNetPaymentsReconciled ?? 0) + (result.nmiTransactionsImported ?? 0) + (result.nmiPaymentsReconciled ?? 0) + (result.analyticsRecordsUpdated ?? 0),
     errors: [],
     warnings,
-    lastCursor: { page: result.cursor.orderPage ?? result.cursor.rebuildOffset ?? result.cursor.subscriptionPage ?? result.cursor.wordpressProfileOffset ?? result.cursor.authorizeNetOffset ?? result.cursor.reconcileOffset ?? 0, status: result.cursor.phase ?? "" },
+    lastCursor: { page: result.cursor.orderPage ?? result.cursor.rebuildOffset ?? result.cursor.subscriptionPage ?? result.cursor.wordpressProfileOffset ?? result.cursor.authorizeNetOffset ?? result.cursor.reconcileOffset ?? result.cursor.nmiOffset ?? result.cursor.nmiReconcileOffset ?? 0, status: result.cursor.phase ?? "" },
   });
 
   return NextResponse.json({
@@ -437,6 +502,8 @@ export async function POST(request: Request) {
     wordpressProfilesImported: result.wordpressProfilesImported ?? 0,
     authorizeNetTransactionsImported: result.authorizeNetTransactionsImported ?? 0,
     authorizeNetPaymentsReconciled: result.authorizeNetPaymentsReconciled ?? 0,
+    nmiTransactionsImported: result.nmiTransactionsImported ?? 0,
+    nmiPaymentsReconciled: result.nmiPaymentsReconciled ?? 0,
     analyticsRecordsUpdated: result.analyticsRecordsUpdated ?? 0,
     warnings,
   });
