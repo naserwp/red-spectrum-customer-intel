@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 import { calculateCustomerValueMetrics } from "@/lib/customerValue";
 import { connectToDatabase } from "@/lib/mongodb";
 import { buildUnifiedPaymentLedger } from "@/lib/unifiedPaymentLedger";
-import { inspectCreditMeta } from "@/lib/wordpressProfiles";
 import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer } from "@/models/Customer";
 import { findBestCustomerByIdOrEmail } from "@/lib/customerLookup";
@@ -42,15 +41,6 @@ function metaValue(metaRows: Array<{ key?: string; value?: string }> | undefined
   return "";
 }
 
-function metaRowsToRecord(metaRows: Array<{ key?: string; value?: string }> | undefined) {
-  return (Array.isArray(metaRows) ? metaRows : []).reduce<Record<string, unknown>>((acc, row) => {
-    const key = String(row?.key ?? "").trim();
-    if (!key) return acc;
-    acc[key] = String(row?.value ?? "");
-    return acc;
-  }, {});
-}
-
 function pickBusinessValue(
   field: string,
   candidates: Array<{ value: unknown; source: string }>
@@ -61,21 +51,6 @@ function pickBusinessValue(
   });
   return {
     value: match?.value ?? "",
-    source: match?.source ?? "",
-    field,
-  };
-}
-
-function pickBusinessNumber(
-  field: string,
-  candidates: Array<{ value: unknown; source: string }>
-) {
-  const match = candidates.find((candidate) => {
-    const parsed = Number(candidate.value ?? 0);
-    return Number.isFinite(parsed) && parsed > 0;
-  });
-  return {
-    value: Number(match?.value ?? 0),
     source: match?.source ?? "",
     field,
   };
@@ -250,23 +225,9 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     hasText(order.billingCompany) || hasText(order.billingAddress?.address1) || hasText(order.billingAddress?.city) ||
     hasText(metaValue(order.metaData, ["ein", "dba", "doing_business_as", "website", "business_website"]))
   );
-  const wooOrderWithEinData = wooOrderCandidates.find((order) => hasText(inspectCreditMeta(metaRowsToRecord(order.rawSafeMeta)).ein));
-  const storedOrderWithEinData = normalizedOrders.find((order) => hasText(inspectCreditMeta(metaRowsToRecord(order.metaData)).ein));
   const latestAuthorizeNetBusiness = gatewayCandidates.find((transaction) =>
     hasText(transaction.billingCompany) || hasText(transaction.billingPhone) || hasText(transaction.customerEmail)
   );
-  const latestWooOrderWithCreditData = wooOrderCandidates.find((order) => {
-    const detection = inspectCreditMeta(metaRowsToRecord(order.rawSafeMeta));
-    return detection.detectedCreditMetaKeys.length > 0;
-  });
-  const latestStoredOrderWithCreditData = normalizedOrders.find((order) => {
-    const detection = inspectCreditMeta(metaRowsToRecord(order.metaData));
-    return detection.detectedCreditMetaKeys.length > 0;
-  });
-  const latestWooOrderCreditDetection = latestWooOrderWithCreditData ? inspectCreditMeta(metaRowsToRecord(latestWooOrderWithCreditData.rawSafeMeta)) : null;
-  const latestStoredOrderCreditDetection = latestStoredOrderWithCreditData ? inspectCreditMeta(metaRowsToRecord(latestStoredOrderWithCreditData.metaData)) : null;
-  const wooOrderEinDetection = wooOrderWithEinData ? inspectCreditMeta(metaRowsToRecord(wooOrderWithEinData.rawSafeMeta)) : null;
-  const storedOrderEinDetection = storedOrderWithEinData ? inspectCreditMeta(metaRowsToRecord(storedOrderWithEinData.metaData)) : null;
   const businessProfileSources: Record<string, string> = {};
   const resolvedBusinessName = pickBusinessValue("company", [
     { value: customer.businessProfile?.company, source: customer.businessProfile?.source || "customer" },
@@ -282,11 +243,7 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
   ]);
   const resolvedEin = pickBusinessValue("ein", [
     { value: customer.businessProfile?.ein, source: customer.businessProfile?.source || "customer" },
-    { value: wooOrderEinDetection?.ein, source: "woocommerce" },
-    { value: latestWooOrderCreditDetection?.ein, source: "woocommerce" },
     { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["ein"]), source: "woocommerce" },
-    { value: storedOrderEinDetection?.ein, source: "customer" },
-    { value: latestStoredOrderCreditDetection?.ein, source: "customer" },
     { value: metaValue(latestStoredOrderWithBusinessData?.metaData, ["ein"]), source: "customer" },
   ]);
   const resolvedPhone = pickBusinessValue("phone", [
@@ -368,52 +325,24 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     { value: customer.businessProfile?.shippingCountry, source: customer.businessProfile?.source || "customer" },
     { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["shipping_country"]), source: "woocommerce" },
   ]);
-  const resolvedApprovedCredits = pickBusinessNumber("approvedCredits", [
-    { value: customer.businessProfile?.approvedCredits, source: customer.businessProfile?.source || "customer" },
-    { value: customer.businessProfile?.creditLimit, source: customer.businessProfile?.source || "customer" },
-    { value: latestWooOrderCreditDetection?.approvedCredits, source: "woocommerce" },
-    { value: latestStoredOrderCreditDetection?.approvedCredits, source: "customer" },
-  ]);
-  const resolvedAvailableCredit = pickBusinessNumber("availableCredit", [
-    { value: customer.businessProfile?.availableCredit, source: customer.businessProfile?.source || "customer" },
-    { value: latestWooOrderCreditDetection?.availableCredit, source: "woocommerce" },
-    { value: latestStoredOrderCreditDetection?.availableCredit, source: "customer" },
-  ]);
-  const resolvedOutstandingBalance = pickBusinessNumber("outstandingBalance", [
-    { value: customer.businessProfile?.outstandingBalance, source: customer.businessProfile?.source || "customer" },
-    { value: latestWooOrderCreditDetection?.outstandingBalance, source: "woocommerce" },
-    { value: latestStoredOrderCreditDetection?.outstandingBalance, source: "customer" },
-  ]);
   const resolvedCreditStatus = pickBusinessValue("creditStatus", [
     { value: customer.businessProfile?.creditStatus, source: customer.businessProfile?.source || "customer" },
     { value: customer.businessProfile?.net30Status, source: customer.businessProfile?.source || "customer" },
     { value: customer.businessProfile?.accountStatus, source: customer.businessProfile?.source || "customer" },
-    { value: latestWooOrderCreditDetection?.creditStatus, source: "woocommerce" },
-    { value: latestStoredOrderCreditDetection?.creditStatus, source: "customer" },
   ]);
   const resolvedLastBillDate = pickBusinessValue("lastBillDate", [
     { value: customer.businessProfile?.lastBillDate, source: customer.businessProfile?.source || "customer" },
-    { value: latestWooOrderCreditDetection?.lastBillDate, source: "woocommerce" },
-    { value: latestStoredOrderCreditDetection?.lastBillDate, source: "customer" },
   ]);
   const resolvedNextBillingDate = pickBusinessValue("nextBillingDate", [
     { value: customer.businessProfile?.nextBillingDate, source: customer.businessProfile?.source || "customer" },
-    { value: latestWooOrderCreditDetection?.nextBillingDate, source: "woocommerce" },
-    { value: latestStoredOrderCreditDetection?.nextBillingDate, source: "customer" },
   ]);
   const resolvedCreditLimitLastUpdated = pickBusinessValue("creditLimitLastUpdated", [
     { value: customer.businessProfile?.creditLimitLastUpdated, source: customer.businessProfile?.source || "customer" },
-    { value: metaValue(latestWooOrderWithCreditData?.rawSafeMeta, ["last_credit_limit_update"]), source: "woocommerce" },
-    { value: metaValue(latestStoredOrderWithCreditData?.metaData, ["last_credit_limit_update"]), source: "customer" },
   ]);
   for (const resolved of [resolvedBusinessName, resolvedDba, resolvedEin, resolvedPhone, resolvedEmail, resolvedAddress1, resolvedAddress2, resolvedCity, resolvedState, resolvedZip, resolvedCountry, resolvedWebsite, resolvedShippingAddress1, resolvedShippingAddress2, resolvedShippingCity, resolvedShippingState, resolvedShippingZip, resolvedShippingCountry]) {
     if (resolved.source) businessProfileSources[resolved.field] = resolved.source;
   }
-  const creditMetaVerified = Boolean(
-    customer.businessProfile?.creditMetaVerified ||
-    latestWooOrderCreditDetection?.verified ||
-    latestStoredOrderCreditDetection?.verified
-  );
+  const creditMetaVerified = Boolean(customer.creditProfile?.verified && customer.creditProfile?.source === "wc_cs_credits");
   const enrichedBusinessProfile = {
     ...(customer.businessProfile ?? {}),
     company: String(resolvedBusinessName.value || customer.businessProfile?.company || ""),
@@ -434,21 +363,22 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     shippingState: String(resolvedShippingState.value || customer.businessProfile?.shippingState || ""),
     shippingZip: String(resolvedShippingZip.value || customer.businessProfile?.shippingZip || ""),
     shippingCountry: String(resolvedShippingCountry.value || customer.businessProfile?.shippingCountry || ""),
-    approvedCredits: creditMetaVerified ? (resolvedApprovedCredits.value || Number(customer.businessProfile?.approvedCredits ?? 0)) : 0,
-    availableCredit: creditMetaVerified ? (resolvedAvailableCredit.value || Number(customer.businessProfile?.availableCredit ?? 0)) : 0,
-    outstandingBalance: creditMetaVerified ? (resolvedOutstandingBalance.value || Number(customer.businessProfile?.outstandingBalance ?? 0)) : 0,
-    creditStatus: String(resolvedCreditStatus.value || customer.businessProfile?.creditStatus || customer.businessProfile?.net30Status || customer.businessProfile?.accountStatus || ""),
+    approvedCredits: creditMetaVerified ? Number(customer.creditProfile?.approvedCredits ?? customer.businessProfile?.approvedCredits ?? 0) : 0,
+    availableCredit: creditMetaVerified ? Number(customer.creditProfile?.availableCredit ?? customer.businessProfile?.availableCredit ?? 0) : 0,
+    outstandingBalance: creditMetaVerified ? Number(customer.creditProfile?.outstandingBalance ?? customer.businessProfile?.outstandingBalance ?? 0) : 0,
+    creditStatus: String(customer.creditProfile?.creditStatus || resolvedCreditStatus.value || customer.businessProfile?.creditStatus || customer.businessProfile?.net30Status || customer.businessProfile?.accountStatus || ""),
     creditMetaVerified,
-    creditMetaSource: creditMetaVerified ? (resolvedApprovedCredits.source || resolvedAvailableCredit.source || customer.businessProfile?.creditMetaSource || "wordpress_meta") : (customer.businessProfile?.creditMetaSource || "unknown"),
-    creditFallbackReason: creditMetaVerified ? "" : (latestWooOrderCreditDetection?.fallbackReason || latestStoredOrderCreditDetection?.fallbackReason || customer.businessProfile?.creditFallbackReason || "WP credit meta not verified"),
-    creditLimit: creditMetaVerified ? (resolvedApprovedCredits.value || Number(customer.businessProfile?.creditLimit ?? 0)) : 0,
+    creditMetaSource: creditMetaVerified ? "wc_cs_credits" : (customer.businessProfile?.creditMetaSource || "unknown"),
+    creditFallbackReason: creditMetaVerified ? "" : "WP credit meta not verified",
+    creditLimit: creditMetaVerified ? Number(customer.creditProfile?.approvedCredits ?? customer.businessProfile?.creditLimit ?? 0) : 0,
     potentialCreditLimit: creditMetaVerified ? Math.max(
-      resolvedApprovedCredits.value || 0,
+      Number(customer.creditProfile?.approvedCredits ?? 0),
+      Number(customer.creditProfile?.availableCredit ?? 0),
       Number(customer.businessProfile?.potentialCreditLimit ?? 0)
     ) : 0,
     creditLimitLastUpdated: String(resolvedCreditLimitLastUpdated.value || customer.businessProfile?.creditLimitLastUpdated || ""),
-    lastBillDate: String(resolvedLastBillDate.value || customer.businessProfile?.lastBillDate || ""),
-    nextBillingDate: String(resolvedNextBillingDate.value || customer.businessProfile?.nextBillingDate || ""),
+    lastBillDate: String(customer.creditProfile?.lastBillDate || resolvedLastBillDate.value || customer.businessProfile?.lastBillDate || ""),
+    nextBillingDate: String(customer.creditProfile?.nextBillingDate || resolvedNextBillingDate.value || customer.businessProfile?.nextBillingDate || ""),
   };
   const metrics = calculateCustomerValueMetrics({ customer: { ...customer, orders: normalizedOrders, gatewayPayments: mergedGatewayPayments, productJourney: normalizedProductJourney }, authorizeNetTransactions: gatewayCandidates, nmiTransactions: nmiCandidates });
   const unifiedPaymentLedger = buildUnifiedPaymentLedger({ customer: { ...customer, orders: normalizedOrders, gatewayPayments: mergedGatewayPayments }, authorizeNetTransactions: gatewayCandidates, nmiTransactions: nmiCandidates });
@@ -462,9 +392,13 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     wooProfileMatched: wooOrderCandidates.length > 0 || /wordpress|woocommerce/i.test(String(customer.businessProfile?.sourcePlatform || customer.businessProfile?.source || "")),
     wooOrdersUsedForEnrichment: wooOrderCandidates.length,
     businessFieldsSource: businessProfileSources,
-    creditMetaSource: enrichedBusinessProfile.creditMetaSource || customer.sourceCoverage?.creditMetaSource || "",
-    approvedCreditsFound: creditMetaVerified ? Math.max(Number(customer.sourceCoverage?.approvedCreditsFound ?? 0), Number(resolvedApprovedCredits.value ?? 0)) : 0,
-    availableCreditsFound: creditMetaVerified ? Math.max(Number(customer.sourceCoverage?.availableCreditsFound ?? 0), Number(resolvedAvailableCredit.value ?? 0)) : 0,
+    creditMetaSource: creditMetaVerified ? "wc_cs_credits" : (enrichedBusinessProfile.creditMetaSource || customer.sourceCoverage?.creditMetaSource || ""),
+    selectedCreditKey: String(customer.sourceCoverage?.selectedCreditKey ?? ""),
+    selectedAvailableCreditKey: String(customer.sourceCoverage?.selectedAvailableCreditKey ?? ""),
+    selectedOutstandingKey: String(customer.sourceCoverage?.selectedOutstandingKey ?? ""),
+    selectedEinKey: String(customer.sourceCoverage?.selectedEinKey ?? ""),
+    approvedCreditsFound: creditMetaVerified ? Math.max(Number(customer.sourceCoverage?.approvedCreditsFound ?? 0), Number(customer.creditProfile?.approvedCredits ?? 0)) : 0,
+    availableCreditsFound: creditMetaVerified ? Math.max(Number(customer.sourceCoverage?.availableCreditsFound ?? 0), Number(customer.creditProfile?.availableCredit ?? 0)) : 0,
     einSource: resolvedEin.source || customer.sourceCoverage?.einSource || "",
     creditMetaVerified,
     creditFallbackReason: enrichedBusinessProfile.creditFallbackReason || customer.sourceCoverage?.creditFallbackReason || "",
@@ -495,6 +429,7 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
       productJourney: normalizedProductJourney,
       gatewayPayments: mergedGatewayPayments,
       businessProfile: enrichedBusinessProfile,
+      creditProfile: customer.creditProfile,
       paidProducts: livePaidProducts.length ? livePaidProducts : customer.paidProducts ?? [],
       attemptedProducts: liveAttemptedProducts.length ? liveAttemptedProducts : customer.attemptedProducts ?? [],
       ...liveSummary,

@@ -163,12 +163,6 @@ async function buildOrderHistoryItem(order: WooMatchedOrder, verifyGateways: boo
   return item;
 }
 
-function estimateCreditLimit(totalPaid: number, orderCount: number, failedPayments: number, refunds: number, score: number) {
-  const velocityFactor = Math.max(1, Math.min(3, orderCount / 4));
-  const riskPenalty = failedPayments * 180 + refunds * 120 + (100 - score) * 5;
-  return Math.max(300, Math.round(totalPaid * 0.8 * velocityFactor - riskPenalty));
-}
-
 function getTier(paidTotal: number, attemptedTotal: number) {
   if (paidTotal > 0) return paidTotal >= 2500 ? "Platinum" : paidTotal >= 999 ? "Gold" : paidTotal >= 200 ? "Silver" : "Bronze";
   return attemptedTotal > 0 ? "Lead" : "Cold Lead";

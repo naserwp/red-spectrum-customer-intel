@@ -172,6 +172,7 @@ type WordPressMetaDebugEntry = {
   parsedValue?: string;
   parsedNumericValue?: number;
   selectedStatus?: string;
+  rejectionReason?: string;
 };
 
 type WordPressMetaDebugResult = {
@@ -281,6 +282,49 @@ const categoryLabel: Record<string, string> = {
   cold_lead: "Cold Lead",
 };
 
+type HighValueSegment =
+  | "all"
+  | "active_high_value"
+  | "inactive_high_value"
+  | "vip_high_value"
+  | "dormant_high_value"
+  | "funding_ready"
+  | "hot_lead_high_intent"
+  | "gateway_heavy_customer"
+  | "subscription_heavy_customer";
+
+const highValueSegmentLabel: Record<HighValueSegment, string> = {
+  all: "All High Value",
+  active_high_value: "Active High Value",
+  inactive_high_value: "Inactive High Value",
+  vip_high_value: "VIP High Value",
+  dormant_high_value: "Dormant High Value",
+  funding_ready: "Funding Ready",
+  hot_lead_high_intent: "Hot Lead High Intent",
+  gateway_heavy_customer: "Gateway Heavy Customer",
+  subscription_heavy_customer: "Subscription Heavy Customer",
+};
+
+function highValueSegmentForCustomer(c: Customer): HighValueSegment {
+  const paid = paidAmount(c);
+  const attempted = attemptedAmount(c);
+  const latestPaid = c.latestPaidDate || c.lastPaidDate || c.lastOrderDate || "";
+  const latestPaidDate = latestPaid ? new Date(latestPaid) : null;
+  const daysSincePaid = latestPaidDate && !Number.isNaN(latestPaidDate.getTime())
+    ? Math.floor((Date.now() - latestPaidDate.getTime()) / 86400000)
+    : Number.POSITIVE_INFINITY;
+  const hasRecurring = Number(c.activeSubscriptionCount ?? c.activeSubscriptions ?? 0) > 0 || Number(c.estimatedMRR ?? 0) > 0;
+  const hasGatewayRecurring = (c.subscriptionStatus || "").toLowerCase().includes("gateway") || Number(c.gatewayPaidCount ?? 0) > Number(c.paidOrderCount ?? 0);
+  if (paid <= 0 && attempted > 0) return "hot_lead_high_intent";
+  if (hasVerifiedCreditMeta(c) && verifiedCreditLimit(c) > 0 && Number(c.score ?? 0) >= 65) return "funding_ready";
+  if (paid >= 10000) return "vip_high_value";
+  if (hasRecurring && Number(c.estimatedMRR ?? 0) >= 200) return "subscription_heavy_customer";
+  if (hasGatewayRecurring) return "gateway_heavy_customer";
+  if (daysSincePaid > 180) return "dormant_high_value";
+  if (daysSincePaid > 60) return "inactive_high_value";
+  return "active_high_value";
+}
+
 const badgeClass: Record<string, string> = {
   vip_paid: "bg-amber-500/20 text-amber-200 border-amber-500/50",
   paying: "bg-emerald-500/20 text-emerald-200 border-emerald-500/50",
@@ -375,8 +419,8 @@ function WordPressCreditMetaPanel({ result }: { result: WordPressMetaDebugResult
       <p className="mt-2"><span className="font-semibold text-zinc-100">Warnings:</span> {result.warnings?.length ? result.warnings.join(" ") : "-"}</p>
     </div>
     <div className="overflow-x-auto rounded border border-zinc-800">
-      <table className="min-w-[1200px] text-sm">
-        <thead className="bg-zinc-900"><tr>{["Raw Key", "Namespace", "Raw Value", "Parsed Value", "Parsed Numeric", "Selected Status"].map((h) => <th key={h} className="px-3 py-2 text-left text-xs uppercase text-zinc-400">{h}</th>)}</tr></thead>
+      <table className="min-w-[1380px] text-sm">
+        <thead className="bg-zinc-900"><tr>{["Raw Key", "Namespace", "Raw Value", "Parsed Value", "Parsed Numeric", "Accepted / Rejected", "Rejection Reason"].map((h) => <th key={h} className="px-3 py-2 text-left text-xs uppercase text-zinc-400">{h}</th>)}</tr></thead>
         <tbody>
           {combinedEntries.map((entry, index) => <tr key={`${entry.key}-${index}`} className="border-t border-zinc-800">
             <td className="px-3 py-2 font-mono text-xs text-zinc-200">{entry.key}</td>
@@ -385,6 +429,7 @@ function WordPressCreditMetaPanel({ result }: { result: WordPressMetaDebugResult
             <td className="px-3 py-2 max-w-[280px] truncate">{entry.parsedValue || entry.serializedValue || "-"}</td>
             <td className="px-3 py-2">{typeof entry.parsedNumericValue === "number" ? entry.parsedNumericValue : "-"}</td>
             <td className="px-3 py-2">{entry.selectedStatus || "-"}</td>
+            <td className="px-3 py-2 max-w-[320px] truncate">{entry.rejectionReason || "-"}</td>
           </tr>)}
         </tbody>
       </table>
@@ -737,6 +782,7 @@ export default function AdminPage() {
   const [gatewayProvider, setGatewayProvider] = useState<GatewayProvider>("all");
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>("all");
   const [highValuePeriod, setHighValuePeriod] = useState<(typeof highValuePeriods)[number]>("all");
+  const [highValueSegment, setHighValueSegment] = useState<HighValueSegment>("all");
   const [upcomingMeta, setUpcomingMeta] = useState<Record<string, unknown>>({});
   const [riskMeta, setRiskMeta] = useState<Record<string, unknown>>({});
   const [error, setError] = useState("");
@@ -1409,6 +1455,28 @@ export default function AdminPage() {
   const customerStart = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const customerEnd = Math.min(total, page * pageSize);
   const customerMaxPage = Math.max(1, Math.ceil(total / pageSize));
+  const highValueSegmentCounts = useMemo(() => {
+    return customers.reduce<Record<HighValueSegment, number>>((acc, customer) => {
+      const segment = highValueSegmentForCustomer(customer);
+      acc.all += 1;
+      acc[segment] += 1;
+      return acc;
+    }, {
+      all: 0,
+      active_high_value: 0,
+      inactive_high_value: 0,
+      vip_high_value: 0,
+      dormant_high_value: 0,
+      funding_ready: 0,
+      hot_lead_high_intent: 0,
+      gateway_heavy_customer: 0,
+      subscription_heavy_customer: 0,
+    });
+  }, [customers]);
+  const visibleHighValueRows = useMemo(() => {
+    if (highValueSegment === "all") return customers;
+    return customers.filter((customer) => highValueSegmentForCustomer(customer) === highValueSegment);
+  }, [customers, highValueSegment]);
   const hotLeadFailedThisMonth = useMemo(() => {
     const now = new Date();
     return hotLeadRows.filter((row) => {
@@ -1496,7 +1564,28 @@ export default function AdminPage() {
         </section>
       </>}
 
-      {tab === "High Value" && <><div className="flex flex-wrap items-center justify-between gap-3"><Card label="High Value Paid Customers" value={Number(summary.highValueCustomers ?? total)} helper="Unpaid leads excluded" /><select value={highValuePeriod} onChange={(e) => { const next = e.target.value as (typeof highValuePeriods)[number]; setHighValuePeriod(next); loadHighValue(1, pageSize, next); }} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">{highValuePeriods.map((period) => <option key={period} value={period}>{period === "all" ? "All time" : period === "yearly" ? "This year" : "This month"}</option>)}</select></div><ValueIndex rows={customers} rankOffset={(page - 1) * pageSize} /><Pager start={customerStart} end={customerEnd} total={total} page={page} maxPage={customerMaxPage} setPage={(nextPage) => loadHighValue(nextPage, pageSize)} /></>}
+      {tab === "High Value" && <>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <Card label="High Value Paid Customers" value={Number(summary.highValueCustomers ?? total)} helper="True top customers sorted by verified paid revenue" />
+          <div className="flex flex-wrap gap-3">
+            <select value={highValuePeriod} onChange={(e) => { const next = e.target.value as (typeof highValuePeriods)[number]; setHighValuePeriod(next); loadHighValue(1, pageSize, next); }} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">{highValuePeriods.map((period) => <option key={period} value={period}>{period === "all" ? "All time" : period === "yearly" ? "This year" : "This month"}</option>)}</select>
+            <select value={highValueSegment} onChange={(e) => setHighValueSegment(e.target.value as HighValueSegment)} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">
+              {(Object.keys(highValueSegmentLabel) as HighValueSegment[]).map((segment) => <option key={segment} value={segment}>{highValueSegmentLabel[segment]}</option>)}
+            </select>
+          </div>
+        </div>
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          {(["active_high_value", "inactive_high_value", "vip_high_value", "dormant_high_value", "funding_ready", "hot_lead_high_intent", "gateway_heavy_customer", "subscription_heavy_customer"] as HighValueSegment[]).map((segment) => (
+            <button key={segment} onClick={() => setHighValueSegment(segment)} className="text-left">
+              <Card label={highValueSegmentLabel[segment]} value={highValueSegmentCounts[segment]} helper={segment === highValueSegment ? "Current segment" : "Click to filter"} />
+            </button>
+          ))}
+        </section>
+        <ValueIndex rows={visibleHighValueRows} rankOffset={(page - 1) * pageSize} />
+        {highValueSegment === "all"
+          ? <Pager start={customerStart} end={customerEnd} total={total} page={page} maxPage={customerMaxPage} setPage={(nextPage) => loadHighValue(nextPage, pageSize)} />
+          : <p className="text-sm text-zinc-400">Showing {visibleHighValueRows.length} customers from the current ranking page for {highValueSegmentLabel[highValueSegment]}.</p>}
+      </>}
 
       {tab === "Hot Leads" && <>
         <section className="grid gap-3 sm:grid-cols-3"><Card label="Hot Checkout Leads" value={hotLeadRows.length} helper="Unpaid checkout/payment attempts and newer failed attempts after last paid order" /><Card label="Attempted Pipeline" value={money(hotLeadRows.reduce((sum, row) => sum + attemptedAmount(row), 0))} /><Card label="Failed/Pending Attempts This Month" value={hotLeadFailedThisMonth} /></section>

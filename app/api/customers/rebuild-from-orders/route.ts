@@ -4,6 +4,7 @@ import { monthsSince } from "@/lib/customerValue";
 import { customerLedgerRecords, detectAuthorizeNetRecurring } from "@/lib/revenueAnalytics";
 import { buildProductJourneySummary } from "@/lib/productClassification";
 import { countBy, normalizeText, orderHistoryItemFromStoredOrder, unique } from "@/lib/wooOrderImport";
+import { importWordPressCreditBatch } from "@/lib/wordpressCreditSync";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { SyncJob } from "@/models/SyncJob";
@@ -57,12 +58,6 @@ function externalKey(keyType: AggregationKeyType, key: string) {
 
 function fallbackEmail(keyType: AggregationKeyType, key: string) {
   return `no-email-${externalKey(keyType, key).replace(/[^a-z0-9]+/gi, "-").toLowerCase()}@woocommerce.local`.slice(0, 180);
-}
-
-function estimateCreditLimit(totalPaid: number, orderCount: number, failedPayments: number, refunds: number, score: number) {
-  const velocityFactor = Math.max(1, Math.min(3, orderCount / 4));
-  const riskPenalty = failedPayments * 180 + refunds * 120 + (100 - score) * 5;
-  return Math.max(300, Math.round(totalPaid * 0.8 * velocityFactor - riskPenalty));
 }
 
 function getTier(paidTotal: number, attemptedTotal: number) {
@@ -349,6 +344,17 @@ export async function POST(request: Request) {
 
   const nextOffset = offset + customersProcessed;
   const hasMore = nextOffset < groups.length;
+  const remainingRuntimeMs = Math.max(500, deadline - Date.now());
+  let creditProfilesUpdated = 0;
+  if (remainingRuntimeMs > 500) {
+    try {
+      const creditResult = await importWordPressCreditBatch({ limit: Math.min(limit, 25), offset, dryRun, maxRuntimeMs: remainingRuntimeMs });
+      creditProfilesUpdated = dryRun ? 0 : creditResult.updatedProfiles;
+      warnings.push(...creditResult.warnings);
+    } catch (error) {
+      warnings.push(error instanceof Error ? error.message : "WordPress credit sync failed during rebuild batch.");
+    }
+  }
   const finalStatus = warnings.length > 0 || hasMore ? "partial" : "completed";
   await SyncJob.updateOne(
     { _id: job._id },
@@ -384,6 +390,7 @@ export async function POST(request: Request) {
     customersRebuilt: rebuiltCount,
     dryRunCustomersMatched: matchedCount,
     customersSkippedSmallerHistory,
+    creditProfilesUpdated,
     hasMore,
     nextOffset,
     partialSync: finalStatus === "partial",

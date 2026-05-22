@@ -22,6 +22,55 @@ export type WordPressProfileUser = {
   profile: CustomerBusinessProfile;
 };
 
+export type WordPressCreditRecord = {
+  postId: number;
+  title: string;
+  approvedCredits: number;
+  availableCredit: number;
+  outstandingBalance: number;
+  creditStatus: string;
+  lastBillDate: string;
+  nextBillingDate: string;
+  ein: string;
+  linkedUserId: string;
+  linkedCustomerId: string;
+  linkedOrderId: string;
+  linkedSubscriptionId: string;
+  email: string;
+  normalizedEmail: string;
+  phone: string;
+  normalizedPhone: string;
+  company: string;
+  source: "wc_cs_credits";
+  verified: boolean;
+  rawMeta: WpRecord;
+  detectedKeys: {
+    approved: string;
+    available: string;
+    outstanding: string;
+    status: string;
+    lastBill: string;
+    nextBill: string;
+    ein: string;
+    userId: string;
+    customerId: string;
+    orderId: string;
+    subscriptionId: string;
+    email: string;
+    phone: string;
+    company: string;
+  };
+};
+
+export type WordPressCreditRouteProbe = {
+  route: string;
+  status: number;
+  message: string;
+};
+
+export const wordpressCreditHelperEndpointPath =
+  process.env.WP_CREDITS_ENDPOINT_PATH?.trim() || "/wp-json/red-spectrum/v1/wc-cs-credits";
+
 type MetaInspectEntry = {
   key: string;
   normalizedKey: string;
@@ -30,6 +79,12 @@ type MetaInspectEntry = {
   rawValue: string;
   serializedValue: string;
   value: unknown;
+};
+
+type CreditCandidateAssessment = {
+  accepted: boolean;
+  score: number;
+  reason: string;
 };
 
 type CreditMetaDetection = {
@@ -56,6 +111,7 @@ type CreditMetaDetection = {
   fallbackReason: string;
   pluginNamespaceKeys: Record<string, string[]>;
   entries: MetaInspectEntry[];
+  rejectionReasons: Record<string, string>;
 };
 
 function hasMeaningfulText(value: unknown) {
@@ -297,6 +353,54 @@ function scoreMetaEntry(entry: MetaInspectEntry, kind: "approved" | "available" 
   return score;
 }
 
+function weakNumericMeta(entry: MetaInspectEntry) {
+  return /(customer|user|order|invoice|transaction|statement|year|month|day|spent|revenue|paid|attempt|balance_due_count|count|qty|quantity|profile_id|payment_profile|subscription_id|renewal|record|index|offset|page)/i.test(entry.normalizedKey);
+}
+
+function looksLikeDateOrIdentifier(value: unknown) {
+  const text = String(value ?? "").trim();
+  if (!text) return false;
+  if (/^\d{4}[-/]\d{1,2}[-/]\d{1,2}/.test(text)) return true;
+  if (/^\d{6,}$/.test(text)) return true;
+  return false;
+}
+
+function assessCreditCandidate(entry: MetaInspectEntry, kind: "approved" | "available" | "outstanding"): CreditCandidateAssessment {
+  const key = entry.normalizedKey;
+  const rawText = String(entry.rawValue ?? "").trim();
+  const parsed = asNumber(entry.value);
+  const baseScore = scoreMetaEntry(entry, kind);
+  if (!rawText) return { accepted: false, score: 0, reason: "Empty value." };
+  if (parsed <= 0) return { accepted: false, score: baseScore, reason: "Value is not a positive numeric credit amount." };
+  if (looksLikeDateOrIdentifier(entry.value) || looksLikeDateOrIdentifier(rawText)) return { accepted: false, score: baseScore, reason: "Looks like a date or identifier, not a credit amount." };
+  if (weakNumericMeta(entry)) return { accepted: false, score: baseScore, reason: "Key looks like an identifier, order, date, or revenue field." };
+  if (kind === "approved") {
+    if (!/(approved_credits|approved_credit|approved_credit_limit|max_approved_credit|max_approved_limit)/i.test(key)) {
+      return { accepted: false, score: baseScore, reason: "Approved credit key is not explicit enough." };
+    }
+    if (/(available|outstanding|balance)/i.test(key)) {
+      return { accepted: false, score: baseScore, reason: "Approved credit candidate overlaps with available/outstanding semantics." };
+    }
+  }
+  if (kind === "available") {
+    if (!/(available_credit|available_credits|available_credit_limit|availablecredit)/i.test(key)) {
+      return { accepted: false, score: baseScore, reason: "Available credit key is not explicit enough." };
+    }
+  }
+  if (kind === "outstanding") {
+    if (!/(outstanding|balance|debit|due)/i.test(key)) {
+      return { accepted: false, score: baseScore, reason: "Outstanding balance key is not explicit enough." };
+    }
+  }
+  if (parsed <= 10 && !/(approved|available|outstanding|balance|credit_limit)/i.test(key)) {
+    return { accepted: false, score: baseScore, reason: "Tiny numeric value from a weak key is treated as suspicious." };
+  }
+  if (baseScore < 6) {
+    return { accepted: false, score: baseScore, reason: "Key score is too weak for verified credit meta." };
+  }
+  return { accepted: true, score: baseScore, reason: "Accepted as verified credit meta." };
+}
+
 function pickBestMetaEntry(entries: MetaInspectEntry[], kind: "approved" | "available" | "outstanding" | "ein" | "status" | "lastBill" | "nextBill") {
   return [...entries]
     .map((entry) => ({ entry, score: scoreMetaEntry(entry, kind) }))
@@ -306,9 +410,12 @@ function pickBestMetaEntry(entries: MetaInspectEntry[], kind: "approved" | "avai
 
 export function inspectCreditMeta(meta: WpRecord): CreditMetaDetection {
   const entries = flattenMetaEntries(meta);
-  const approvedEntry = pickBestMetaEntry(entries, "approved");
-  const availableEntry = pickBestMetaEntry(entries, "available");
-  const outstandingEntry = pickBestMetaEntry(entries, "outstanding");
+  const approvedCandidates = entries.map((entry) => ({ entry, assessment: assessCreditCandidate(entry, "approved") })).filter((row) => /(approved|credit_limit|max_approved|my_credit_limit)/i.test(row.entry.normalizedKey));
+  const availableCandidates = entries.map((entry) => ({ entry, assessment: assessCreditCandidate(entry, "available") })).filter((row) => /(available)/i.test(row.entry.normalizedKey));
+  const outstandingCandidates = entries.map((entry) => ({ entry, assessment: assessCreditCandidate(entry, "outstanding") })).filter((row) => /(outstanding|balance|debit|due)/i.test(row.entry.normalizedKey));
+  const approvedEntry = [...approvedCandidates].filter((row) => row.assessment.accepted).sort((a, b) => b.assessment.score - a.assessment.score || b.entry.key.length - a.entry.key.length)[0]?.entry;
+  const availableEntry = [...availableCandidates].filter((row) => row.assessment.accepted).sort((a, b) => b.assessment.score - a.assessment.score || b.entry.key.length - a.entry.key.length)[0]?.entry;
+  const outstandingEntry = [...outstandingCandidates].filter((row) => row.assessment.accepted).sort((a, b) => b.assessment.score - a.assessment.score || b.entry.key.length - a.entry.key.length)[0]?.entry;
   const einEntry = pickBestMetaEntry(entries, "ein");
   const statusEntry = pickBestMetaEntry(entries, "status");
   const lastBillEntry = pickBestMetaEntry(entries, "lastBill");
@@ -330,17 +437,25 @@ export function inspectCreditMeta(meta: WpRecord): CreditMetaDetection {
     lastBillEntry?.key,
     nextBillEntry?.key,
   ].filter(Boolean));
+  const rejectionReasons = Object.fromEntries([
+    ...approvedCandidates.filter((row) => !row.assessment.accepted).map((row) => [row.entry.key, row.assessment.reason]),
+    ...availableCandidates.filter((row) => !row.assessment.accepted).map((row) => [row.entry.key, row.assessment.reason]),
+    ...outstandingCandidates.filter((row) => !row.assessment.accepted).map((row) => [row.entry.key, row.assessment.reason]),
+  ]);
   const rejectedCandidateKeys = detectedCreditMetaKeys.filter((key) => !selectedKeys.has(key));
   const approvedCredits = asNumber(approvedEntry?.rawValue);
   const availableCredit = asNumber(availableEntry?.rawValue);
   const outstandingBalance = asNumber(outstandingEntry?.rawValue);
-  const potentialCreditLimit = Math.max(approvedCredits, asNumber(metaValue(meta, ["potential_credit_limit", "max_approved_credit"])));
-  const creditLimit = approvedCredits || asNumber(metaValue(meta, ["credit_limit", "my_credit_limit"]));
-  const verified = approvedCredits > 0 || availableCredit > 0;
+  const potentialCreditLimit = approvedCredits > 0 ? Math.max(approvedCredits, asNumber(metaValue(meta, ["potential_credit_limit", "max_approved_credit"]))) : 0;
+  const creditLimit = approvedCredits > 0 ? approvedCredits : 0;
+  const verified = Boolean(
+    (approvedEntry && approvedCredits > 0) ||
+    (availableEntry && availableCredit > 0)
+  );
   const fallbackReason = verified
     ? ""
     : detectedCreditMetaKeys.length
-      ? "Credit-related meta keys were found, but none exposed a verified approved or available credit value."
+      ? "Credit-related meta keys were found, but none exposed a verified approved or available credit value from a strong plugin/meta key."
       : "No credit-related WordPress or WooCommerce meta keys were exposed for this customer.";
   return {
     detectedCreditMetaKeys,
@@ -372,76 +487,7 @@ export function inspectCreditMeta(meta: WpRecord): CreditMetaDetection {
     fallbackReason,
     pluginNamespaceKeys,
     entries,
-  };
-}
-
-const approvedCreditKeys = [
-  "approved_credits",
-  "approved_credit",
-  "approvedcredits",
-  "approved_credit_limit",
-  "approved_limit",
-  "max_approved_credit",
-  "credit_limit",
-  "my_credit_limit",
-];
-
-const availableCreditKeys = [
-  "available_credits",
-  "available_credit",
-  "availablecredits",
-  "available_credit_limit",
-];
-
-const outstandingCreditKeys = [
-  "total_outstanding",
-  "outstanding_balance",
-  "outstanding",
-  "outstanding_total",
-];
-
-const lastBillDateKeys = [
-  "last_bill_date",
-  "last_billing_date",
-];
-
-const nextBillDateKeys = [
-  "next_bill_date",
-  "next_billing_date",
-];
-
-const creditStatusKeys = [
-  "credit_status",
-  "credits_status",
-  "net30_status",
-  "account_status",
-];
-
-function resolveCreditProfile(meta: WpRecord) {
-  const detected = inspectCreditMeta(meta);
-  const approvedCredits = detected.verified ? (detected.approvedCredits || asNumber(metaValue(meta, approvedCreditKeys))) : 0;
-  const availableCredit = detected.verified ? (detected.availableCredit || asNumber(metaValue(meta, availableCreditKeys))) : 0;
-  const outstandingBalance = detected.verified ? (detected.outstandingBalance || asNumber(metaValue(meta, outstandingCreditKeys))) : 0;
-  const potentialCreditLimit = Math.max(
-    approvedCredits,
-    detected.verified ? detected.potentialCreditLimit : 0,
-    detected.verified ? asNumber(metaValue(meta, ["potential_credit_limit", "max_approved_credit"])) : 0
-  );
-  const creditLimit = approvedCredits || (detected.verified ? detected.creditLimit || asNumber(metaValue(meta, ["credit_limit", "my_credit_limit"])) : 0);
-  return {
-    approvedCredits,
-    availableCredit,
-    outstandingBalance,
-    potentialCreditLimit,
-    creditLimit,
-    creditStatus: detected.creditStatus || metaValue(meta, creditStatusKeys),
-    lastBillDate: detected.lastBillDate || metaValue(meta, lastBillDateKeys),
-    nextBillingDate: detected.nextBillingDate || metaValue(meta, nextBillDateKeys),
-    ein: detected.ein || metaValue(meta, ["ein"]),
-    creditMetaVerified: detected.verified,
-    creditMetaSource: detected.verified ? "wordpress_meta" : "unknown",
-    creditFallbackReason: detected.fallbackReason,
-    detection: detected,
+    rejectionReasons,
   };
 }
 
@@ -462,6 +508,126 @@ function metaDataObject(value: unknown) {
     if (key) result[key] = item.value;
   }
   return result;
+}
+
+function pickMetaByPatterns(meta: WpRecord, patterns: RegExp[]) {
+  const entries = flattenMetaEntries(meta);
+  const match = entries.find((entry) => patterns.some((pattern) => pattern.test(entry.normalizedKey)) && hasMeaningfulText(entry.value));
+  return {
+    key: match?.key ?? "",
+    value: match?.value ?? "",
+  };
+}
+
+function strictCreditValue(meta: WpRecord, patterns: RegExp[]) {
+  const picked = pickMetaByPatterns(meta, patterns);
+  return { key: picked.key, value: asNumber(picked.value) };
+}
+
+function strictCreditText(meta: WpRecord, patterns: RegExp[]) {
+  const picked = pickMetaByPatterns(meta, patterns);
+  return { key: picked.key, value: asString(picked.value) };
+}
+
+function buildCreditCollectionUrl(base: string, route: string, limit: number, offset: number) {
+  const normalizedRoute = route.startsWith("/") ? route : `/${route}`;
+  const url = new URL(`${base}${normalizedRoute}`);
+  url.searchParams.set("context", "edit");
+  url.searchParams.set("per_page", String(limit));
+  url.searchParams.set("offset", String(offset));
+  return url.toString();
+}
+
+function normalizeCreditRecord(post: WpRecord): WordPressCreditRecord {
+  const meta = { ...metaDataObject(post.meta_data), ...asRecord(post.meta), ...asRecord(post.acf) };
+  const approved = strictCreditValue(meta, [/^approved_credits$/i, /^approved_credit_limit$/i, /^max_approved_credit$/i, /^credit_approved$/i]);
+  const available = strictCreditValue(meta, [/^available_credits$/i, /^available_credit_limit$/i, /^credit_available$/i]);
+  const outstanding = strictCreditValue(meta, [/^total_outstanding_amount$/i, /^outstanding_balance$/i, /^total_outstanding$/i, /^balance_due$/i, /^credit_balance$/i, /^debit_balance$/i]);
+  const status = strictCreditText(meta, [/^credit_status$/i, /^credits_status$/i, /^account_status$/i, /^net30_status$/i]);
+  const lastBill = strictCreditText(meta, [/^last_billed_date$/i, /^last_bill_date$/i, /^last_billing_date$/i]);
+  const nextBill = strictCreditText(meta, [/^next_bill_date$/i, /^next_billing_date$/i]);
+  const ein = strictCreditText(meta, [/^billing_ein$/i, /(^|_)ein($|_)/i, /^tax_id$/i, /federal_tax/i]);
+  const linkedUserId = strictCreditText(meta, [/^user_id$/i, /^customer_user$/i, /^wp_user_id$/i, /^linked_user_id$/i]);
+  const linkedCustomerId = strictCreditText(meta, [/^customer_id$/i, /^woocommerce_customer_id$/i, /^linked_customer_id$/i]);
+  const linkedOrderId = strictCreditText(meta, [/^order_id$/i, /^linked_order_id$/i, /^parent_order_id$/i]);
+  const linkedSubscriptionId = strictCreditText(meta, [/^subscription_id$/i, /^linked_subscription_id$/i]);
+  const email = strictCreditText(meta, [/^user_email$/i, /^billing_email$/i, /^customer_email$/i, /(^|_)email$/i]);
+  const phone = strictCreditText(meta, [/^user_phone$/i, /^billing_phone$/i, /^customer_phone$/i, /(^|_)phone$/i]);
+  const company = strictCreditText(meta, [/^user_company$/i, /^billing_company$/i, /^business_name$/i, /(^|_)company$/i, /(^|_)dba$/i]);
+  return {
+    postId: Number(post.id ?? 0),
+    title: asString(asRecord(post.title).rendered || post.title),
+    approvedCredits: approved.value,
+    availableCredit: available.value,
+    outstandingBalance: outstanding.value,
+    creditStatus: status.value,
+    lastBillDate: lastBill.value,
+    nextBillingDate: nextBill.value,
+    ein: ein.value,
+    linkedUserId: linkedUserId.value,
+    linkedCustomerId: linkedCustomerId.value,
+    linkedOrderId: linkedOrderId.value,
+    linkedSubscriptionId: linkedSubscriptionId.value,
+    email: normalizeEmail(email.value),
+    normalizedEmail: normalizeEmail(email.value),
+    phone: phone.value,
+    normalizedPhone: normalizePhone(phone.value),
+    company: company.value,
+    source: "wc_cs_credits",
+    verified: approved.value > 0 || available.value > 0,
+    rawMeta: meta,
+    detectedKeys: {
+      approved: approved.key,
+      available: available.key,
+      outstanding: outstanding.key,
+      status: status.key,
+      lastBill: lastBill.key,
+      nextBill: nextBill.key,
+      ein: ein.key,
+      userId: linkedUserId.key,
+      customerId: linkedCustomerId.key,
+      orderId: linkedOrderId.key,
+      subscriptionId: linkedSubscriptionId.key,
+      email: email.key,
+      phone: phone.key,
+      company: company.key,
+    },
+  };
+}
+
+export async function fetchWordPressCreditRecords({ limit, offset, signal }: { limit: number; offset: number; signal?: AbortSignal }) {
+  if (!isWordPressProfileImportConfigured()) throw new Error("WordPress credit import is not configured.");
+  const safeLimit = Math.min(25, Math.max(1, limit));
+  const base = wpStoreUrl.replace(/\/+$/, "");
+  const route = wordpressCreditHelperEndpointPath;
+  const probes: WordPressCreditRouteProbe[] = [];
+  try {
+    const url = buildCreditCollectionUrl(base, route, safeLimit, offset);
+    const { data, total } = await fetchJsonWithStatus(url, { Authorization: authHeader(), Accept: "application/json" }, signal);
+    const payload = asRecord(data);
+    const records = Array.isArray(data)
+      ? data
+      : Array.isArray(payload.records)
+        ? payload.records
+        : Array.isArray(payload.posts)
+          ? payload.posts
+          : [];
+    const posts = records.map(asRecord);
+    return {
+      posts: posts.map(normalizeCreditRecord),
+      total: Number(payload.total ?? total ?? posts.length ?? 0),
+      selectedRoute: route,
+      routeProbes: probes,
+    };
+  } catch (error) {
+    if (error instanceof ProfileSourceError) {
+      probes.push({ route, status: error.status, message: error.message });
+      if (error.status === 404) {
+        throw new Error(`wc_cs_credits is not exposed through REST. Add WP helper endpoint at ${wordpressCreditHelperEndpointPath}.`);
+      }
+    }
+    throw error;
+  }
 }
 
 function delay(ms: number) {
@@ -531,7 +697,6 @@ export function isWooCommerceCustomerFallbackConfigured() {
 
 export function normalizeWordPressProfileUser(user: WpRecord, importedAt = new Date().toISOString()): WordPressProfileUser {
   const meta = { ...asRecord(user.meta), ...asRecord(user.acf), ...asRecord(user.billing) };
-  const credit = resolveCreditProfile(meta);
   const firstName = metaValue(meta, ["first_name", "billing_first_name"]) || asString(user.first_name);
   const lastName = metaValue(meta, ["last_name", "billing_last_name"]) || asString(user.last_name);
   const email = normalizeEmail(metaValue(meta, ["billing_email"]) || user.email);
@@ -566,19 +731,19 @@ export function normalizeWordPressProfileUser(user: WpRecord, importedAt = new D
       sourcePlatform: "wordpress",
       customerSince: asString(user.registered_date || user.date),
       lastActivity: importedAt,
-      ein: credit.ein || metaValue(meta, ["ein"]),
-      approvedCredits: credit.approvedCredits,
-      availableCredit: credit.availableCredit,
-      outstandingBalance: credit.outstandingBalance,
-      creditStatus: credit.creditStatus,
-      creditMetaVerified: credit.creditMetaVerified,
-      creditMetaSource: credit.creditMetaSource,
-      creditFallbackReason: credit.creditFallbackReason,
-      potentialCreditLimit: credit.potentialCreditLimit,
-      creditLimit: credit.creditLimit,
+      ein: metaValue(meta, ["ein", "billing_ein"]),
+      approvedCredits: 0,
+      availableCredit: 0,
+      outstandingBalance: 0,
+      creditStatus: "",
+      creditMetaVerified: false,
+      creditMetaSource: "",
+      creditFallbackReason: "WP credit meta not verified",
+      potentialCreditLimit: 0,
+      creditLimit: 0,
       creditLimitLastUpdated: metaValue(meta, ["last_credit_limit_update"]),
-      lastBillDate: credit.lastBillDate,
-      nextBillingDate: credit.nextBillingDate,
+      lastBillDate: "",
+      nextBillingDate: "",
       net30Status: metaValue(meta, ["net30_status"]),
       accountStatus: metaValue(meta, ["account_status"]),
       businessType: metaValue(meta, ["business_type"]),
@@ -598,7 +763,6 @@ export function normalizeWooCommerceProfileCustomer(customer: WpRecord, imported
   const billing = asRecord(customer.billing);
   const shipping = asRecord(customer.shipping);
   const meta = { ...metaDataObject(customer.meta_data), ...asRecord(customer.meta), ...asRecord(customer.acf) };
-  const credit = resolveCreditProfile(meta);
   const firstName = asString(customer.first_name || billing.first_name);
   const lastName = asString(customer.last_name || billing.last_name);
   const email = normalizeEmail(customer.email || billing.email || metaValue(meta, ["billing_email"]));
@@ -632,19 +796,19 @@ export function normalizeWooCommerceProfileCustomer(customer: WpRecord, imported
       sourcePlatform: "woocommerce",
       customerSince: asString(customer.date_created),
       lastActivity: asString(customer.date_modified) || importedAt,
-      ein: credit.ein || metaValue(meta, ["ein"]),
-      approvedCredits: credit.approvedCredits,
-      availableCredit: credit.availableCredit,
-      outstandingBalance: credit.outstandingBalance,
-      creditStatus: credit.creditStatus,
-      creditMetaVerified: credit.creditMetaVerified,
-      creditMetaSource: credit.creditMetaSource,
-      creditFallbackReason: credit.creditFallbackReason,
-      potentialCreditLimit: credit.potentialCreditLimit,
-      creditLimit: credit.creditLimit,
+      ein: metaValue(meta, ["ein", "billing_ein"]),
+      approvedCredits: 0,
+      availableCredit: 0,
+      outstandingBalance: 0,
+      creditStatus: "",
+      creditMetaVerified: false,
+      creditMetaSource: "",
+      creditFallbackReason: "WP credit meta not verified",
+      potentialCreditLimit: 0,
+      creditLimit: 0,
       creditLimitLastUpdated: metaValue(meta, ["last_credit_limit_update"]),
-      lastBillDate: credit.lastBillDate,
-      nextBillingDate: credit.nextBillingDate,
+      lastBillDate: "",
+      nextBillingDate: "",
       net30Status: metaValue(meta, ["net30_status"]),
       accountStatus: metaValue(meta, ["account_status"]),
       businessType: metaValue(meta, ["business_type"]),
@@ -717,8 +881,8 @@ export function mergeBusinessProfile(existing: Partial<CustomerBusinessProfile> 
 export function deriveCustomerCreditLimits(profile: Partial<CustomerBusinessProfile>, currentActual?: number | null, currentEstimated?: number) {
   if (profile.creditMetaVerified !== true) {
     return {
-      actualCreditLimit: currentActual ?? null,
-      estimatedCreditLimit: currentEstimated ?? 0,
+      actualCreditLimit: null,
+      estimatedCreditLimit: 0,
     };
   }
   const approved = positiveNumber(profile.approvedCredits);
@@ -812,6 +976,7 @@ function metaEntriesForDebug(meta: WpRecord) {
     parsedValue: typeof entry.value === "string" ? entry.value.slice(0, 500) : safeMetaOutput(entry.key, entry.value),
     parsedNumericValue: asNumber(entry.value),
     selectedStatus: selectedKeyMap.get(entry.key) ?? (rejected.has(entry.key) ? "rejected_candidate" : "ignored"),
+    rejectionReason: inspection.rejectionReasons[entry.key] ?? "",
   }));
 }
 

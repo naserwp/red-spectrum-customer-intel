@@ -9,6 +9,7 @@ import { buildProductJourneySummary } from "@/lib/productClassification";
 import { connectToDatabase } from "@/lib/mongodb";
 import { fetchWooCommerceOrders, fetchWooCommerceSubscriptions, isWooCommerceConfigured, wooCommerceOrderStatuses, wooCommerceSubscriptionStatuses } from "@/lib/woocommerce";
 import { deriveCustomerCreditLimits, fetchProfileUsersWithFallback, isWooCommerceCustomerFallbackConfigured, isWordPressProfileImportConfigured, mergeBusinessProfile } from "@/lib/wordpressProfiles";
+import { importWordPressCreditBatch } from "@/lib/wordpressCreditSync";
 import { fetchNmiTransactions, isNmiConfigured, normalizeNmiPaymentEvent } from "@/lib/nmiQuickPay";
 import { reconcileNmiTransaction } from "@/lib/nmiReconciliation";
 import { countBy, normalizeWooOrder, orderHistoryItemFromStoredOrder, unique } from "@/lib/wooOrderImport";
@@ -29,9 +30,10 @@ const rebuildLimit = 50;
 const authNetLimit = 10;
 const reconcileLimit = 50;
 const wordpressProfileLimit = 25;
+const wordpressCreditLimit = 25;
 
 type SyncCursor = {
-  phase?: "orders" | "customers" | "subscriptions" | "wordpress_profiles" | "authorize_net_import" | "authorize_net_reconcile" | "nmi_import" | "nmi_reconcile" | "analytics" | "done";
+  phase?: "orders" | "customers" | "subscriptions" | "wordpress_profiles" | "wordpress_credit_records" | "authorize_net_import" | "authorize_net_reconcile" | "nmi_import" | "nmi_reconcile" | "analytics" | "done";
   orderStatusIndex?: number;
   orderPage?: number;
   rebuildOffset?: number;
@@ -43,6 +45,7 @@ type SyncCursor = {
   nmiOffset?: number;
   nmiReconcileOffset?: number;
   wordpressProfileOffset?: number;
+  wordpressCreditOffset?: number;
   analyticsOffset?: number;
   completedSteps?: string[];
 };
@@ -272,7 +275,7 @@ async function importSubscriptionStep(cursor: SyncCursor) {
 }
 
 async function importWordPressProfilesStep(cursor: SyncCursor) {
-  if (!isWordPressProfileImportConfigured() && !isWooCommerceCustomerFallbackConfigured()) return { cursor: nextCursor(cursor, { phase: "authorize_net_import", completedSteps: ["wordpress_profiles"] }), warning: "WordPress and WooCommerce customer profile import are not configured." };
+  if (!isWordPressProfileImportConfigured() && !isWooCommerceCustomerFallbackConfigured()) return { cursor: nextCursor(cursor, { phase: "wordpress_credit_records", completedSteps: ["wordpress_profiles"] }), warning: "WordPress and WooCommerce customer profile import are not configured." };
   const offset = cursor.wordpressProfileOffset ?? 0;
   let fetched;
   try {
@@ -282,7 +285,7 @@ async function importWordPressProfilesStep(cursor: SyncCursor) {
       ? "Request timed out during batch fetch"
       : error instanceof Error ? error.message : "WordPress profile import failed.";
     console.log(`[wordpress-profile-import] source=unknown page=${Math.floor(offset / wordpressProfileLimit) + 1} fetched=0 matched=0 updated=0 skipped=0 warning="${warning}"`);
-    return { cursor: nextCursor(cursor, { phase: "authorize_net_import", completedSteps: ["wordpress_profiles"] }), wordpressProfilesImported: 0, label: "WordPress customer profile import skipped.", warning };
+    return { cursor: nextCursor(cursor, { phase: "wordpress_credit_records", completedSteps: ["wordpress_profiles"] }), wordpressProfilesImported: 0, label: "WordPress customer profile import skipped.", warning };
   }
   const { users, total, warnings, sourceUsed } = fetched;
   const importedAt = new Date().toISOString();
@@ -320,10 +323,24 @@ async function importWordPressProfilesStep(cursor: SyncCursor) {
   const hasMore = users.length === wordpressProfileLimit && (total === 0 || nextOffset < total);
   console.log(`[wordpress-profile-import] source=${sourceUsed} page=${Math.floor(offset / wordpressProfileLimit) + 1} fetched=${users.length} matched=${wordpressProfilesImported} updated=${wordpressProfilesImported} skipped=${users.length - wordpressProfilesImported}`);
   return {
-    cursor: hasMore ? nextCursor(cursor, { phase: "wordpress_profiles", wordpressProfileOffset: nextOffset }) : nextCursor(cursor, { phase: "authorize_net_import", completedSteps: ["wordpress_profiles"] }),
+    cursor: hasMore ? nextCursor(cursor, { phase: "wordpress_profiles", wordpressProfileOffset: nextOffset }) : nextCursor(cursor, { phase: "wordpress_credit_records", completedSteps: ["wordpress_profiles"] }),
     wordpressProfilesImported,
     label: `Importing WordPress customer profiles ${offset}-${nextOffset}...`,
     warning: warnings.join(" "),
+  };
+}
+
+async function importWordPressCreditStep(cursor: SyncCursor) {
+  if (!isWordPressProfileImportConfigured()) {
+    return { cursor: nextCursor(cursor, { phase: "authorize_net_import", completedSteps: ["wordpress_credit_records"] }), warning: "WordPress credit import is not configured." };
+  }
+  const offset = cursor.wordpressCreditOffset ?? 0;
+  const result = await importWordPressCreditBatch({ limit: wordpressCreditLimit, offset, dryRun: false, maxRuntimeMs: 8000 });
+  return {
+    cursor: result.hasMore ? nextCursor(cursor, { phase: "wordpress_credit_records", wordpressCreditOffset: result.nextOffset }) : nextCursor(cursor, { phase: "authorize_net_import", completedSteps: ["wordpress_credit_records"] }),
+    wordpressCreditProfilesImported: result.updatedProfiles,
+    label: result.hasMore ? `Importing WordPress credit records ${offset}-${result.nextOffset}...` : `Imported ${result.updatedProfiles} verified WordPress credit records.`,
+    warning: result.warnings.join(" "),
   };
 }
 
@@ -461,6 +478,7 @@ export async function POST(request: Request) {
     customersUpdated?: number;
     subscriptionsImported?: number;
     wordpressProfilesImported?: number;
+    wordpressCreditProfilesImported?: number;
     authorizeNetTransactionsImported?: number;
     authorizeNetPaymentsReconciled?: number;
     nmiTransactionsImported?: number;
@@ -472,6 +490,7 @@ export async function POST(request: Request) {
   else if (cursor.phase === "customers") result = await rebuildCustomerStep(cursor);
   else if (cursor.phase === "subscriptions") result = await importSubscriptionStep(cursor);
   else if (cursor.phase === "wordpress_profiles") result = await importWordPressProfilesStep(cursor);
+  else if (cursor.phase === "wordpress_credit_records") result = await importWordPressCreditStep(cursor);
   else if (cursor.phase === "authorize_net_import") result = await importAuthorizeNetStep(cursor);
   else if (cursor.phase === "authorize_net_reconcile") result = await reconcileAuthorizeNetStep(cursor);
   else if (cursor.phase === "nmi_import") result = await importNmiStep(cursor);
@@ -489,10 +508,10 @@ export async function POST(request: Request) {
     progress: hasMore ? 50 : 100,
     totalPages: 1,
     pagesFetched: 1,
-    recordsProcessed: (result.ordersImported ?? 0) + (result.customersUpdated ?? 0) + (result.subscriptionsImported ?? 0) + (result.wordpressProfilesImported ?? 0) + (result.authorizeNetTransactionsImported ?? 0) + (result.authorizeNetPaymentsReconciled ?? 0) + (result.nmiTransactionsImported ?? 0) + (result.nmiPaymentsReconciled ?? 0) + (result.analyticsRecordsUpdated ?? 0),
+    recordsProcessed: (result.ordersImported ?? 0) + (result.customersUpdated ?? 0) + (result.subscriptionsImported ?? 0) + (result.wordpressProfilesImported ?? 0) + (result.wordpressCreditProfilesImported ?? 0) + (result.authorizeNetTransactionsImported ?? 0) + (result.authorizeNetPaymentsReconciled ?? 0) + (result.nmiTransactionsImported ?? 0) + (result.nmiPaymentsReconciled ?? 0) + (result.analyticsRecordsUpdated ?? 0),
     errors: [],
     warnings,
-    lastCursor: { page: result.cursor.orderPage ?? result.cursor.rebuildOffset ?? result.cursor.subscriptionPage ?? result.cursor.wordpressProfileOffset ?? result.cursor.authorizeNetOffset ?? result.cursor.reconcileOffset ?? result.cursor.nmiOffset ?? result.cursor.nmiReconcileOffset ?? 0, status: result.cursor.phase ?? "" },
+    lastCursor: { page: result.cursor.orderPage ?? result.cursor.rebuildOffset ?? result.cursor.subscriptionPage ?? result.cursor.wordpressProfileOffset ?? result.cursor.wordpressCreditOffset ?? result.cursor.authorizeNetOffset ?? result.cursor.reconcileOffset ?? result.cursor.nmiOffset ?? result.cursor.nmiReconcileOffset ?? 0, status: result.cursor.phase ?? "" },
   });
 
   return NextResponse.json({
@@ -506,6 +525,7 @@ export async function POST(request: Request) {
     customersUpdated: result.customersUpdated ?? 0,
     subscriptionsImported: result.subscriptionsImported ?? 0,
     wordpressProfilesImported: result.wordpressProfilesImported ?? 0,
+    wordpressCreditProfilesImported: result.wordpressCreditProfilesImported ?? 0,
     authorizeNetTransactionsImported: result.authorizeNetTransactionsImported ?? 0,
     authorizeNetPaymentsReconciled: result.authorizeNetPaymentsReconciled ?? 0,
     nmiTransactionsImported: result.nmiTransactionsImported ?? 0,

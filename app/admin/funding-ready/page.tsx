@@ -24,6 +24,7 @@ type FundingRow = {
   activeRecurring: number;
   creditLimit: number;
   potentialCreditLimit: number;
+  creditMetaVerified?: boolean;
   net30Status: string;
   profileCompleteness: number;
   riskLevel: string;
@@ -145,24 +146,18 @@ export default function FundingReadyPage() {
 
     {error && <p className="rounded border border-red-800 bg-red-950/40 p-3 text-red-100">{error}</p>}
     {isLoading ? <AdminLoadingState title="Loading funding readiness..." subtext="Scoring customer value, profile quality, recurring revenue, and risk signals..." /> : <section className="overflow-x-auto rounded-xl border border-zinc-800">
-      <table className="min-w-[1850px] text-sm">
+      <table className="min-w-[1080px] text-sm">
         <thead className="sticky top-0 bg-zinc-950">
-          <tr>{["Customer", "Score", "Funding Tier", "VIP Tier", "Industry", "NAICS/SIC", "Lifetime", "MRR", "Paid Months", "Credit Limit", "Profile", "Risk", "AI Funding Insight", "Action"].map((heading) => <th key={heading} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{heading}</th>)}</tr>
+          <tr>{["Customer", "Funding Tier", "Factiiv Score", "Lifetime Paid", "MRR", "Credit Limit", "Risk", "Action"].map((heading) => <th key={heading} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{heading}</th>)}</tr>
         </thead>
         <tbody>{rows.map((row) => <tr key={row._id} className="border-t border-zinc-800">
           <td className="px-3 py-3"><p className="font-semibold">{row.name}</p><p className="text-xs text-zinc-400">{row.email}</p><p className="text-xs text-zinc-500">{row.company || row.phone || "-"}</p></td>
-          <td className={`px-3 py-3 text-xl font-bold ${scoreClass(row.fundingReadinessScore)}`}>{row.fundingReadinessScore}</td>
           <td className="px-3 py-3">{row.fundingReadinessTier}</td>
-          <td className="px-3 py-3">{row.vipTier}</td>
-          <td className="px-3 py-3"><p>{row.industry}</p><p className="text-xs text-zinc-500">{row.industryClassification}</p></td>
-          <td className="px-3 py-3">NAICS {row.naicsCode || "-"}<br />SIC {row.sicCode || "-"}</td>
+          <td className={`px-3 py-3 text-xl font-bold ${scoreClass(row.fundingReadinessScore)}`}>{row.fundingReadinessScore}</td>
           <td className="px-3 py-3 font-semibold">{money(row.lifetimeSpent)}</td>
           <td className="px-3 py-3">{money(row.estimatedMRR)}</td>
-          <td className="px-3 py-3">{row.paidMonths}</td>
-          <td className="px-3 py-3"><p>{money(row.creditLimit)}</p><p className="text-xs text-zinc-500">Potential {money(row.potentialCreditLimit)}</p></td>
-          <td className="px-3 py-3">{row.profileCompleteness}%</td>
+          <td className="px-3 py-3">{row.creditMetaVerified ? money(row.creditLimit) : "Not verified"}</td>
           <td className="px-3 py-3">{row.riskLevel}</td>
-          <td className="max-w-md px-3 py-3 text-zinc-300"><p>{row.fundingInsight}</p><p className="mt-1 text-xs text-zinc-500">{row.riskInsight}</p></td>
           <td className="px-3 py-3"><div className="flex flex-col gap-2"><span>{row.recommendedAction}</span><Link href={`/admin/customers/${encodeURIComponent(row.email || row._id)}`} className="w-fit rounded bg-zinc-700 px-2 py-1">View</Link></div></td>
         </tr>)}</tbody>
       </table>

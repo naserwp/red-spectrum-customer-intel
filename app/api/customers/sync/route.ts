@@ -260,12 +260,6 @@ const getRiskLevel = (
   score: number
 ): "low" | "medium" | "high" => (c.chargebacks > 0 || c.failedPayments > 2 || score < 45) ? "high" : (c.refunds > 1 || c.failedPayments > 0 || score < 70) ? "medium" : "low";
 
-function estimateCreditLimit(totalPaid: number, orderCount: number, failedPayments: number, refunds: number, score: number) {
-  const velocityFactor = Math.max(1, Math.min(3, orderCount / 4));
-  const riskPenalty = failedPayments * 180 + refunds * 120 + (100 - score) * 5;
-  return Math.max(300, Math.round(totalPaid * 0.8 * velocityFactor - riskPenalty));
-}
-
 function getActualCreditLimitFromMeta(source: WooCommerceOrder | WooCommerceCustomer | undefined): number | null {
   const meta = (source as { meta_data?: Array<{ key?: string; value?: unknown }> })?.meta_data;
   if (!meta) return null;

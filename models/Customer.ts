@@ -167,6 +167,28 @@ export interface CustomerBusinessProfile {
   importedAt: string;
 }
 
+export interface CustomerCreditProfile {
+  approvedCredits: number;
+  availableCredit: number;
+  outstandingBalance: number;
+  creditStatus: string;
+  lastBillDate: string;
+  nextBillingDate: string;
+  sourcePostId: string;
+  sourcePostType: string;
+  sourceOrderId: string;
+  sourceSubscriptionId: string;
+  linkedUserId: string;
+  linkedCustomerId: string;
+  email: string;
+  phone: string;
+  company: string;
+  ein: string;
+  source: "wc_cs_credits" | "";
+  verified: boolean;
+  importedAt: string;
+}
+
 export interface CustomerDocument {
   name: string;
   email: string;
@@ -252,6 +274,7 @@ export interface CustomerDocument {
   gatewayPayments: CustomerGatewayPayment[];
   sourceCoverage: CustomerSourceCoverage;
   businessProfile: CustomerBusinessProfile;
+  creditProfile: CustomerCreditProfile;
   externalCustomerKey: string;
 }
 
@@ -290,6 +313,10 @@ export interface CustomerSourceCoverage {
   einSource?: string;
   creditMetaVerified?: boolean;
   creditFallbackReason?: string;
+  selectedCreditKey?: string;
+  selectedAvailableCreditKey?: string;
+  selectedOutstandingKey?: string;
+  selectedEinKey?: string;
 }
 
 const customerOrderLineItemSchema = new Schema<CustomerOrderLineItem>(
@@ -429,6 +456,10 @@ const customerSourceCoverageSchema = new Schema<CustomerSourceCoverage>(
     einSource: { type: String, default: "" },
     creditMetaVerified: { type: Boolean, default: false },
     creditFallbackReason: { type: String, default: "" },
+    selectedCreditKey: { type: String, default: "" },
+    selectedAvailableCreditKey: { type: String, default: "" },
+    selectedOutstandingKey: { type: String, default: "" },
+    selectedEinKey: { type: String, default: "" },
   },
   { _id: false }
 );
@@ -514,6 +545,31 @@ const customerBusinessProfileSchema = new Schema<CustomerBusinessProfile>(
     fundingReadinessScore: { type: Number, default: 0 },
     fundingReadinessTier: { type: String, default: "" },
     source: { type: String, default: "" },
+    importedAt: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
+const customerCreditProfileSchema = new Schema<CustomerCreditProfile>(
+  {
+    approvedCredits: { type: Number, default: 0 },
+    availableCredit: { type: Number, default: 0 },
+    outstandingBalance: { type: Number, default: 0 },
+    creditStatus: { type: String, default: "" },
+    lastBillDate: { type: String, default: "" },
+    nextBillingDate: { type: String, default: "" },
+    sourcePostId: { type: String, default: "" },
+    sourcePostType: { type: String, default: "" },
+    sourceOrderId: { type: String, default: "" },
+    sourceSubscriptionId: { type: String, default: "" },
+    linkedUserId: { type: String, default: "" },
+    linkedCustomerId: { type: String, default: "" },
+    email: { type: String, default: "" },
+    phone: { type: String, default: "" },
+    company: { type: String, default: "" },
+    ein: { type: String, default: "" },
+    source: { type: String, enum: ["wc_cs_credits", ""], default: "" },
+    verified: { type: Boolean, default: false },
     importedAt: { type: String, default: "" },
   },
   { _id: false }
@@ -605,6 +661,7 @@ const customerSchema = new Schema<CustomerDocument>(
     gatewayPayments: { type: [customerGatewayPaymentSchema], default: [] },
     sourceCoverage: { type: customerSourceCoverageSchema, default: () => ({}) },
     businessProfile: { type: customerBusinessProfileSchema, default: () => ({}) },
+    creditProfile: { type: customerCreditProfileSchema, default: () => ({}) },
     externalCustomerKey: { type: String, default: "", index: true },
   },
   { timestamps: true }
@@ -640,5 +697,10 @@ customerSchema.index({ "orders.gatewayVerification.customerProfileId": 1 });
 customerSchema.index({ "gatewayPayments.transactionId": 1 });
 customerSchema.index({ "gatewayPayments.invoiceNumber": 1 });
 customerSchema.index({ "gatewayPayments.customerProfileId": 1 });
+customerSchema.index({ "creditProfile.sourcePostId": 1 });
+customerSchema.index({ "creditProfile.email": 1 });
+customerSchema.index({ "creditProfile.phone": 1 });
+customerSchema.index({ "creditProfile.linkedUserId": 1 });
+customerSchema.index({ "creditProfile.linkedCustomerId": 1 });
 
 export const Customer = mongoose.models.Customer || mongoose.model<CustomerDocument>("Customer", customerSchema);
