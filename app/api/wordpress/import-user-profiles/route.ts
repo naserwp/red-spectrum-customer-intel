@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { fetchProfileUsersWithFallback, fetchWordPressProfileUsers, isWooCommerceCustomerFallbackConfigured, isWordPressProfileImportConfigured, ProfileTimeoutError } from "@/lib/wordpressProfiles";
+import { deriveCustomerCreditLimits, fetchProfileUsersWithFallback, fetchWordPressProfileUsers, isWooCommerceCustomerFallbackConfigured, isWordPressProfileImportConfigured, mergeBusinessProfile, ProfileTimeoutError } from "@/lib/wordpressProfiles";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 
@@ -76,15 +76,21 @@ export async function POST(request: Request) {
       }
       matchedCustomers += 1;
       if (!dryRun) {
+        const mergedProfile = mergeBusinessProfile(customer.businessProfile, user.profile, importedAt);
+        const creditLimits = deriveCustomerCreditLimits(mergedProfile, customer.actualCreditLimit, customer.estimatedCreditLimit);
         await Customer.updateOne(
           { _id: customer._id },
           {
             $set: {
-              businessProfile: { ...user.profile, importedAt },
-              actualCreditLimit: user.profile.creditLimit || customer.actualCreditLimit || null,
-              estimatedCreditLimit: user.profile.potentialCreditLimit || user.profile.creditLimit || customer.estimatedCreditLimit,
+              businessProfile: mergedProfile,
+              actualCreditLimit: creditLimits.actualCreditLimit,
+              estimatedCreditLimit: creditLimits.estimatedCreditLimit,
               phone: customer.phone || user.profile.phone,
               "sourceCoverage.lastSyncedAt": importedAt,
+              "sourceCoverage.creditMetaSource": mergedProfile.source || user.profile.source || "",
+              "sourceCoverage.approvedCreditsFound": Number(mergedProfile.approvedCredits ?? 0),
+              "sourceCoverage.availableCreditsFound": Number(mergedProfile.availableCredit ?? 0),
+              "sourceCoverage.einSource": mergedProfile.ein ? (mergedProfile.source || user.profile.source || "") : (customer.sourceCoverage?.einSource || ""),
             },
           }
         ).exec();

@@ -328,7 +328,7 @@ async function buildCustomerFromOrders(
     refunds,
     chargebacks: existing?.chargebacks ?? 0,
     actualCreditLimit: existing?.actualCreditLimit ?? null,
-    estimatedCreditLimit: paidTotal > 0 ? estimateCreditLimit(paidTotal, paidOrders.length, failedPayments, refunds, score) : 0,
+    estimatedCreditLimit: 0,
     tier: getTier(paidTotal, attemptedTotal),
     leadStatus: getLeadStatus(paidTotal, attemptedTotal, attemptedOrders.length),
     paymentStatus: getPaymentStatus(paidTotal, attemptedTotal, latestAttempt?.status ?? "", latestAttempt?.paymentMethodTitle || latestAttempt?.paymentMethod || ""),

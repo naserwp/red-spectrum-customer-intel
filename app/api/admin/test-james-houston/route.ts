@@ -4,7 +4,7 @@ import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { isSettledSuccessful } from "@/lib/authorizeNet";
 
-export async function GET(request: Request) {
+export async function GET() {
   try {
     await connectToDatabase();
     

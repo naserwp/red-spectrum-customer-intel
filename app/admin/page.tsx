@@ -13,7 +13,9 @@ type Customer = {
   lifetimeValue?: number; rankingPaidTotal?: number; paidOrderCount?: number; gatewayPaidCount?: number; attemptedOrderCount?: number; paidMonths?: number;
   firstPaidDate?: string; latestPaidDate?: string; subscriptionStartDate?: string; stayWithUsMonths?: number; activeSubscriptionCount?: number; estimatedMRR?: number; category?: string; leadStatus?: string; paymentStatus?: string; lastPaidDate?: string; lastAttemptDate?: string;
   businessName?: string;
-  activeSubscriptions: number; failedPayments: number; chargebacks: number; estimatedCreditLimit: number; tier: string; riskLevel: string;
+  activeSubscriptions: number; failedPayments: number; chargebacks: number; estimatedCreditLimit: number; actualCreditLimit?: number | null; tier: string; riskLevel: string;
+  businessProfile?: { approvedCredits?: number; availableCredit?: number; potentialCreditLimit?: number; creditLimit?: number; creditMetaVerified?: boolean; creditMetaSource?: string; creditFallbackReason?: string };
+  sourceCoverage?: { creditMetaVerified?: boolean; creditMetaSource?: string; creditFallbackReason?: string };
   score: number; stars: number; aiSummaryPreview: string; aiSummary: string; subscriptionStatus: string; orderCount: number; averageOrderValue: number;
   firstOrderDate: string; lastOrderDate: string; refunds: number; riskExplanation: string; recommendedAction: string;
   attemptedProducts?: string[]; lastAttemptedProduct?: string;
@@ -161,6 +163,44 @@ type SyncStatus = {
   counts?: { customers?: number; wooOrders?: number; wooSubscriptions?: number; authorizeNetTransactions?: number; nmiQuickPayTransactions?: number };
 };
 
+type WordPressMetaDebugEntry = {
+  key: string;
+  namespace: string;
+  rawType: string;
+  rawValue: string;
+  serializedValue?: string;
+  parsedValue?: string;
+  parsedNumericValue?: number;
+  selectedStatus?: string;
+};
+
+type WordPressMetaDebugResult = {
+  email?: string;
+  requestedUserId?: string;
+  wordpressUserFound?: boolean;
+  wooCustomerFound?: boolean;
+  wooOrdersFound?: number;
+  wooSubscriptionsFound?: number;
+  detectedCreditMetaKeys?: string[];
+  rejectedCandidateKeys?: string[];
+  selectedApprovedCreditKey?: string;
+  selectedAvailableCreditKey?: string;
+  selectedOutstandingKey?: string;
+  selectedEinKey?: string;
+  selectedCreditStatusKey?: string;
+  selectedLastBillDateKey?: string;
+  selectedNextBillingDateKey?: string;
+  parsedNumericValues?: Record<string, number>;
+  creditMetaVerified?: boolean;
+  fallbackReason?: string;
+  normalizedProfilePreview?: Record<string, unknown>;
+  warnings?: string[];
+  wordpressUser?: { metaEntries?: WordPressMetaDebugEntry[] } | null;
+  wooCustomer?: { metaEntries?: WordPressMetaDebugEntry[] } | null;
+  wooOrders?: Array<{ orderNumber?: string; metaEntries?: WordPressMetaDebugEntry[] }>;
+  wooSubscriptions?: Array<{ subscriptionNumber?: string; metaEntries?: WordPressMetaDebugEntry[] }>;
+};
+
 type DashboardRequestInit = RequestInit & {
   timeoutMs?: number;
 };
@@ -195,6 +235,10 @@ const monthSpan = (start?: string) => {
 const customerStartDate = (c: Customer) => c.firstPaidDate || c.subscriptionStartDate || c.firstOrderDate;
 const customerPaidMonths = (c: Customer) => Number(c.paidMonths ?? c.paidOrderCount ?? 0);
 const customerStayMonths = (c: Customer) => Number(c.stayWithUsMonths ?? monthSpan(customerStartDate(c)));
+const hasVerifiedCreditMeta = (c: Customer) => Boolean(c.businessProfile?.creditMetaVerified || c.sourceCoverage?.creditMetaVerified);
+const verifiedCreditLimit = (c: Customer) => hasVerifiedCreditMeta(c)
+  ? Number(c.businessProfile?.approvedCredits ?? c.businessProfile?.creditLimit ?? c.actualCreditLimit ?? 0)
+  : 0;
 
 const gatewayProviderLabel: Record<string, string> = {
   all: "All",
@@ -300,6 +344,54 @@ function LoadingSkeleton() {
   </div>;
 }
 
+function WordPressCreditMetaPanel({ result }: { result: WordPressMetaDebugResult | null }) {
+  if (!result) return null;
+  const rows = [
+    ["Verified", result.creditMetaVerified ? "true" : "false"],
+    ["Selected approved key", result.selectedApprovedCreditKey || "-"],
+    ["Selected available key", result.selectedAvailableCreditKey || "-"],
+    ["Selected outstanding key", result.selectedOutstandingKey || "-"],
+    ["Selected EIN key", result.selectedEinKey || "-"],
+    ["Fallback reason", result.fallbackReason || "-"],
+  ];
+  const combinedEntries = [
+    ...(result.wordpressUser?.metaEntries ?? []),
+    ...(result.wooCustomer?.metaEntries ?? []),
+    ...((result.wooOrders ?? []).flatMap((row) => row.metaEntries ?? [])),
+    ...((result.wooSubscriptions ?? []).flatMap((row) => row.metaEntries ?? [])),
+  ];
+  return <div className="space-y-3 rounded-xl border border-zinc-800 bg-zinc-950 p-4">
+    <h3 className="text-sm font-semibold uppercase tracking-wide text-red-300">WordPress Credit Meta Debug</h3>
+    <div className="grid gap-2 md:grid-cols-3">
+      {rows.map(([label, value]) => <div key={label} className="rounded border border-zinc-800 bg-zinc-900 p-3 text-sm">
+        <p className="text-xs uppercase text-zinc-500">{label}</p>
+        <p className="mt-1 break-all font-semibold text-zinc-100">{String(value)}</p>
+      </div>)}
+    </div>
+    <div className="rounded border border-zinc-800 bg-zinc-900 p-3 text-sm text-zinc-300">
+      <p><span className="font-semibold text-zinc-100">Detected keys:</span> {(result.detectedCreditMetaKeys ?? []).join(", ") || "-"}</p>
+      <p className="mt-2"><span className="font-semibold text-zinc-100">Rejected candidate keys:</span> {(result.rejectedCandidateKeys ?? []).join(", ") || "-"}</p>
+      <p className="mt-2"><span className="font-semibold text-zinc-100">Parsed numeric values:</span> {result.parsedNumericValues ? JSON.stringify(result.parsedNumericValues) : "-"}</p>
+      <p className="mt-2"><span className="font-semibold text-zinc-100">Warnings:</span> {result.warnings?.length ? result.warnings.join(" ") : "-"}</p>
+    </div>
+    <div className="overflow-x-auto rounded border border-zinc-800">
+      <table className="min-w-[1200px] text-sm">
+        <thead className="bg-zinc-900"><tr>{["Raw Key", "Namespace", "Raw Value", "Parsed Value", "Parsed Numeric", "Selected Status"].map((h) => <th key={h} className="px-3 py-2 text-left text-xs uppercase text-zinc-400">{h}</th>)}</tr></thead>
+        <tbody>
+          {combinedEntries.map((entry, index) => <tr key={`${entry.key}-${index}`} className="border-t border-zinc-800">
+            <td className="px-3 py-2 font-mono text-xs text-zinc-200">{entry.key}</td>
+            <td className="px-3 py-2">{entry.namespace}</td>
+            <td className="px-3 py-2 max-w-[280px] truncate">{entry.rawValue || "-"}</td>
+            <td className="px-3 py-2 max-w-[280px] truncate">{entry.parsedValue || entry.serializedValue || "-"}</td>
+            <td className="px-3 py-2">{typeof entry.parsedNumericValue === "number" ? entry.parsedNumericValue : "-"}</td>
+            <td className="px-3 py-2">{entry.selectedStatus || "-"}</td>
+          </tr>)}
+        </tbody>
+      </table>
+    </div>
+  </div>;
+}
+
 function Pager({ start, end, total, page, maxPage, setPage }: { start: number; end: number; total: number; page: number; maxPage: number; setPage: (p: number) => void }) {
   return <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-zinc-400">
     <p>Showing {start}-{end} of {total}</p>
@@ -314,13 +406,13 @@ function CustomerTable({ rows, exportCustomerPdf }: { rows: Customer[]; exportCu
       <thead className="sticky top-0 bg-zinc-950"><tr>{["Customer", "Category", "Tier", "Actual Paid", "Credit Limit", "Paid Orders", "Attempted Orders", "Start", "Tenure", "Payment Status", "Lead Status", "Last Paid", "Last Attempt", "Risk", "Score", "Preview", "Actions"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
       <tbody>{rows.map((c) => {
         const cat = getCustomerCategory(c);
-        const creditLimit = Number(c.estimatedCreditLimit ?? 0);
+        const creditLimit = verifiedCreditLimit(c);
         return <tr key={c._id} className={`border-t border-zinc-800 ${cat === "vip_paid" ? "bg-amber-500/5" : cat.includes("hot") ? "bg-orange-500/5" : ""}`}>
           <td className="w-56 px-3 py-3"><p className="truncate font-semibold">{c.name}</p><p className="truncate text-xs text-zinc-400">{c.email}</p></td>
           <td className="px-3 py-3"><span className={`inline-flex rounded border px-2 py-1 text-xs ${badgeClass[cat]}`}>{categoryLabel[cat]}</span></td>
           <td className="px-3 py-3">{paidAmount(c) > 0 ? c.tier : "Lead"}</td>
           <td className="px-3 py-3 font-semibold">{money(paidAmount(c))}</td>
-          <td className="px-3 py-3">{creditLimit > 0 ? money(creditLimit) : "-"}</td>
+          <td className="px-3 py-3">{hasVerifiedCreditMeta(c) ? (creditLimit > 0 ? money(creditLimit) : "-") : "WP credit meta not verified"}</td>
           <td className="px-3 py-3">{c.paidOrderCount ?? 0}</td>
           <td className="px-3 py-3">{c.attemptedOrderCount ?? 0}</td>
           <td className="px-3 py-3">{displayDate(customerStartDate(c))}</td>
@@ -406,7 +498,7 @@ function ValueIndex({ rows, rankOffset = 0 }: { rows: Customer[]; rankOffset?: n
       <thead className="sticky top-0 bg-zinc-950"><tr>{["Rank", "Customer", "Business Name", "Lifetime Spent", "Tier", "Payment Status", "Risk", "Score", "Credit Limit", "Paid Months", "Latest Paid", "Stay With Us", "Category", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
       <tbody>{rows.map((c, index) => {
         const cat = getCustomerCategory(c);
-        const creditLimit = Number(c.estimatedCreditLimit ?? 0);
+        const creditLimit = verifiedCreditLimit(c);
         return <tr key={c._id} className="border-t border-zinc-800">
           <td className="px-3 py-3 font-semibold">#{c.rank ?? rankOffset + index + 1}</td>
           <td className="px-3 py-3"><p className="font-semibold">{c.name}</p><p className="text-xs text-zinc-400">{c.email}</p></td>
@@ -416,7 +508,7 @@ function ValueIndex({ rows, rankOffset = 0 }: { rows: Customer[]; rankOffset?: n
           <td className="px-3 py-3">{displayStatus(c.paymentStatus)}</td>
           <td className="px-3 py-3">{c.riskLevel || "-"}</td>
           <td className="px-3 py-3">{c.score ?? 0}</td>
-          <td className="px-3 py-3">{creditLimit > 0 ? money(creditLimit) : "-"}</td>
+          <td className="px-3 py-3">{hasVerifiedCreditMeta(c) ? (creditLimit > 0 ? money(creditLimit) : "-") : "WP credit meta not verified"}</td>
           <td className="px-3 py-3">{customerPaidMonths(c)}</td>
           <td className="px-3 py-3">{displayDate(c.latestPaidDate || c.lastPaidDate || c.lastOrderDate)}</td>
           <td className="px-3 py-3">{customerStayMonths(c)} months</td>
@@ -658,6 +750,9 @@ export default function AdminPage() {
   const [syncLastRun, setSyncLastRun] = useState<SyncLastRun | null>(null);
   const [rebuildBatch, setRebuildBatch] = useState<RebuildBatchState | null>(null);
   const [authNetBatch, setAuthNetBatch] = useState<AuthNetBatchState | null>(null);
+  const [wpDebugEmail, setWpDebugEmail] = useState("elite1transport316@gmail.com");
+  const [wpDebugUserId, setWpDebugUserId] = useState("4902");
+  const [wpMetaDebug, setWpMetaDebug] = useState<WordPressMetaDebugResult | null>(null);
   const [importedOrdersCount, setImportedOrdersCount] = useState(0);
   const [tab, setTab] = useState<(typeof tabs)[number]>("Overview");
   const [page, setPage] = useState(1);
@@ -1149,6 +1244,27 @@ export default function AdminPage() {
     await loadActiveTab(tab, { page: 1, query: appliedSearch });
   };
 
+  const loadWordPressMetaDebug = async () => {
+    setError("");
+    setMessage("");
+    const params = new URLSearchParams();
+    if (wpDebugEmail.trim()) params.set("email", wpDebugEmail.trim());
+    if (wpDebugUserId.trim()) params.set("userId", wpDebugUserId.trim());
+    const response = await fetchJson("wp-meta-debug", `/api/wordpress/debug-user-meta?${params.toString()}`, { timeoutMs: 45000 });
+    if (!response) {
+      setError("WordPress credit meta debug timeout or cancelled.");
+      return;
+    }
+    const data = await response.json();
+    if (!response.ok) {
+      setWpMetaDebug(data);
+      setError(data.error || "WordPress credit meta debug failed.");
+      return;
+    }
+    setWpMetaDebug(data);
+    setMessage(data.creditMetaVerified ? "Verified WP credit meta loaded." : "WP credit meta inspected. Verified values not found in exposed API payloads.");
+  };
+
   const runAuthorizeNetReconcile = async (offset = 0) => {
     setError("");
     setMessage("Reconciling Authorize.net payments...");
@@ -1406,6 +1522,11 @@ export default function AdminPage() {
           <button onClick={() => setAdvancedToolsOpen((open) => !open)} className="font-semibold text-red-300">{advancedToolsOpen ? "Hide" : "Show"} Advanced Tools</button>
           {advancedToolsOpen && <div className="mt-3 space-y-3">
             <p className="text-sm text-zinc-400">Technical one-step tools for debugging. Sync Now is the normal workflow.</p>
+            <div className="grid gap-3 rounded border border-zinc-800 bg-zinc-950 p-4 md:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_auto]">
+              <input value={wpDebugEmail} onChange={(e) => setWpDebugEmail(e.target.value)} className="rounded bg-zinc-900 px-3 py-2 text-sm ring-1 ring-zinc-800" placeholder="Customer email for WP credit meta debug" />
+              <input value={wpDebugUserId} onChange={(e) => setWpDebugUserId(e.target.value)} className="rounded bg-zinc-900 px-3 py-2 text-sm ring-1 ring-zinc-800" placeholder="Woo/WP user id" />
+              <button onClick={loadWordPressMetaDebug} className="rounded bg-zinc-700 px-5 py-2 font-semibold hover:bg-zinc-600">Inspect WP Credit Meta</button>
+            </div>
             <div className="flex flex-wrap gap-3">
               <button onClick={() => runOrderBackfill(true)} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Test WooCommerce Order Import</button>
               <button onClick={() => runOrderBackfill(false)} className="rounded bg-red-600 px-5 py-3 font-semibold hover:bg-red-500">Import WooCommerce Orders</button>
@@ -1423,6 +1544,7 @@ export default function AdminPage() {
               <button onClick={() => runAnalyticsCacheRebuild()} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Rebuild Customer Analytics Cache</button>
               {authNetBatch?.hasMore && <button onClick={() => authNetBatch.action === "import" ? runAuthorizeNetImport(authNetBatch.nextOffset, authNetBatch.nextCursor) : authNetBatch.action === "reconcile" ? runAuthorizeNetReconcile(authNetBatch.nextOffset) : authNetBatch.action === "nmi_import" ? runNmiImport(authNetBatch.nextOffset) : authNetBatch.action === "nmi_reconcile" ? runNmiReconcile(authNetBatch.nextOffset) : runAnalyticsCacheRebuild(authNetBatch.nextOffset)} className="rounded bg-zinc-800 px-5 py-3 font-semibold hover:bg-zinc-700">Continue {authNetBatch.action === "analytics_rebuild" ? "Analytics Cache Rebuild" : authNetBatch.action.includes("nmi") ? "NMI Quick Pay" : "Authorize.net"} {authNetBatch.action === "analytics_rebuild" ? "" : authNetBatch.action.includes("import") ? "Import" : "Reconcile"}</button>}
             </div>
+            <WordPressCreditMetaPanel result={wpMetaDebug} />
           </div>}
         </div>
         {importedOrdersCount === 0 && <p className="text-sm text-zinc-400">Update Customer Profiles is disabled until this page has imported WooCommerce orders. Run Import WooCommerce Orders first.</p>}

@@ -112,6 +112,15 @@ type SourceCoverage = {
   warningSummary?: string;
   lastSyncedAt?: string;
   warnings?: string[];
+  wooProfileMatched?: boolean;
+  wooOrdersUsedForEnrichment?: number;
+  businessFieldsSource?: Record<string, string>;
+  creditMetaSource?: string;
+  approvedCreditsFound?: number;
+  availableCreditsFound?: number;
+  einSource?: string;
+  creditMetaVerified?: boolean;
+  creditFallbackReason?: string;
 };
 
 type SourceCompare = {
@@ -187,9 +196,18 @@ type BusinessProfile = {
   customerSince?: string;
   lastActivity?: string;
   ein?: string;
+  approvedCredits?: number;
+  availableCredit?: number;
+  outstandingBalance?: number;
+  creditStatus?: string;
+  creditMetaVerified?: boolean;
+  creditMetaSource?: string;
+  creditFallbackReason?: string;
   potentialCreditLimit?: number;
   creditLimit?: number;
   creditLimitLastUpdated?: string;
+  lastBillDate?: string;
+  nextBillingDate?: string;
   net30Status?: string;
   accountStatus?: string;
   businessType?: string;
@@ -675,7 +693,24 @@ export default function CustomerDetailPage() {
     customerSince: profile.customerSince || customer.firstPaidDate || customer.firstSignupDate || customer.firstOrderDate || "",
     lastActivity: profile.lastActivity || customer.lastPaidDate || customer.lastOrderDate || customer.lastSyncedAt || "",
   };
-  const hasProfileData = Boolean(profile.source || profile.company || profile.ein || profile.creditLimit || profile.potentialCreditLimit || profile.address1);
+  const creditMetaVerified = Boolean(profile.creditMetaVerified || customer.sourceCoverage?.creditMetaVerified);
+  const approvedCredits = creditMetaVerified ? Number(profile.approvedCredits ?? profile.creditLimit ?? 0) : 0;
+  const totalCreditLimit = creditMetaVerified ? Math.max(
+    approvedCredits,
+    Number(profile.potentialCreditLimit ?? 0)
+  ) : 0;
+  const availableCredit = creditMetaVerified ? Number(profile.availableCredit ?? 0) : 0;
+  const outstandingBalance = creditMetaVerified ? Number(profile.outstandingBalance ?? 0) : 0;
+  const hasProfileData = Boolean(
+    profile.source ||
+    profile.company ||
+    profile.ein ||
+    approvedCredits ||
+    totalCreditLimit ||
+    availableCredit ||
+    outstandingBalance ||
+    profile.address1
+  );
   const missingUnattachedRecords = Math.max(
     Number(customer.sourceCoverage?.missingUnattachedRecords ?? 0),
     sourceCompare ? Math.max(0, sourceCompare.wooCommerceOrderRecordsCount - sourceCompare.customerOrdersCount) : 0
@@ -740,11 +775,20 @@ export default function CustomerDetailPage() {
   const sourceCoverageRows = [
     ["WooCommerce customer orders stored", customer.sourceCoverage?.wooCommerceCustomerOrdersStored ?? wooCustomerOrdersStored],
     ["WooCommerceOrder records found", customer.sourceCoverage?.wooCommerceOrderRecordsFound ?? sourceCompare?.wooCommerceOrderRecordsCount ?? "-"],
+    ["Woo profile matched", customer.sourceCoverage?.wooProfileMatched ? "yes" : "no"],
+    ["Woo orders used for enrichment", customer.sourceCoverage?.wooOrdersUsedForEnrichment ?? 0],
     ["Authorize.net transactions found", customer.sourceCoverage?.authorizeNetTransactionsFound ?? gatewayHistoryRows.filter((payment) => payment.provider === "authorize_net").length],
     ["NMI Quick Pay transactions found", customer.sourceCoverage?.nmiQuickPayTransactionsFound ?? gatewayHistoryRows.filter((payment) => payment.provider === "nmi" || payment.provider === "nmi_quick_pay").length],
     ["Gateway-only payments attached", customer.sourceCoverage?.gatewayOnlyPaymentsAttached ?? gatewayOnlyOrders.length],
     ["Reconciled records", customer.sourceCoverage?.reconciledRecords ?? gatewayHistoryRows.length],
     ["Missing/unattached records", missingUnattachedRecords],
+    ["Business fields source", Object.entries(customer.sourceCoverage?.businessFieldsSource ?? {}).map(([field, source]) => `${field}: ${source}`).join(", ") || "-"],
+    ["Credit meta source", customer.sourceCoverage?.creditMetaSource || "-"],
+    ["Credit meta verified", creditMetaVerified ? "true" : "false"],
+    ["Credit fallback reason", customer.sourceCoverage?.creditFallbackReason || profile.creditFallbackReason || "-"],
+    ["Approved credits found", customer.sourceCoverage?.approvedCreditsFound ? money(Number(customer.sourceCoverage.approvedCreditsFound)) : "-"],
+    ["Available credits found", customer.sourceCoverage?.availableCreditsFound ? money(Number(customer.sourceCoverage.availableCreditsFound)) : "-"],
+    ["EIN source", customer.sourceCoverage?.einSource || "-"],
     ["Revenue coverage", `${Number(customer.sourceCoverage?.revenueCoveragePercent ?? (actualPaid > 0 ? 100 : 0)).toFixed(0)}%`],
   ];
   const plan = isLead
@@ -800,7 +844,9 @@ export default function CustomerDetailPage() {
           ["Average Order Value", money(Number(customer.averageOrderValue ?? 0))],
           ["Risk", customer.riskLevel],
           ["Tier", actualPaid > 0 ? customer.tier : "Lead"],
-          ["Total Credit Limit", money(Number(profile.potentialCreditLimit ?? customer.estimatedCreditLimit ?? 0))],
+          ["Credit Limit", creditMetaVerified ? money(approvedCredits) : "WP credit meta not verified"],
+          ["Available Credit", creditMetaVerified ? money(availableCredit) : "WP credit meta not verified"],
+          ["Total Credit Limit", creditMetaVerified ? money(totalCreditLimit) : "WP credit meta not verified"],
         ].map(([k, v]) => <div key={String(k)} className="rounded-xl border border-zinc-800 bg-zinc-900 p-4"><p className="text-xs font-semibold uppercase text-zinc-400">{k}</p><p className="mt-2 text-xl font-bold">{String(v)}</p></div>)}
       </section>
 
@@ -835,8 +881,9 @@ export default function CustomerDetailPage() {
             ["Last Attempt", displayDate(customer.lastAttemptDate)],
             ["Risk", customer.riskLevel],
             ["Score", `${customer.score ?? 0}/${customer.stars ?? 0}`],
-            ["Credit Limit", money(Number(profile.creditLimit ?? customer.actualCreditLimit ?? 0))],
-            ["Total Credit Limit", money(Number(profile.potentialCreditLimit ?? customer.estimatedCreditLimit ?? 0))],
+            ["Credit Limit", creditMetaVerified ? money(approvedCredits) : "WP credit meta not verified"],
+            ["Available Credit", creditMetaVerified ? money(availableCredit) : "WP credit meta not verified"],
+            ["Total Credit Limit", creditMetaVerified ? money(totalCreditLimit) : "WP credit meta not verified"],
             ["AI Summary", customer.aiSummary?.substring(0, 100) || "-"],
           ].map(([label, value]) => <div key={label} className="rounded border border-zinc-700 bg-zinc-950 p-3">
             <p className="text-xs font-semibold uppercase text-zinc-400">{label}</p>
@@ -902,13 +949,18 @@ export default function CustomerDetailPage() {
             ["Address", [profile.address1, profile.address2].filter(Boolean).join(", ") || "-"],
             ["City/State/ZIP", [profile.city, profile.state, profile.zip].filter(Boolean).join(", ") || "-"],
             ["Country", profile.country || "-"],
-            ["Credit Limit", profile.creditLimit ? money(Number(profile.creditLimit)) : customer.actualCreditLimit ? money(Number(customer.actualCreditLimit)) : "-"],
-            ["Potential Credit Limit", profile.potentialCreditLimit ? money(Number(profile.potentialCreditLimit)) : money(Number(customer.estimatedCreditLimit ?? 0))],
+            ["Credit Limit / Approved Credits", approvedCredits ? money(approvedCredits) : "-"],
+            ["Available Credit", availableCredit ? money(availableCredit) : "-"],
+            ["Outstanding Balance", outstandingBalance ? money(outstandingBalance) : "-"],
+            ["Total Credit Limit", totalCreditLimit ? money(totalCreditLimit) : "-"],
+            ["Credit Status", displayStatus(profile.creditStatus || profile.net30Status || profile.accountStatus)],
             ["Last credit update", displayDate(profile.creditLimitLastUpdated)],
+            ["Last bill date", displayDate(profile.lastBillDate)],
+            ["Next billing date", displayDate(profile.nextBillingDate)],
             ["Net 30 status", displayStatus(profile.net30Status || profile.accountStatus)],
           ].map(([label, value]) => <div key={label} className="rounded border border-zinc-700 bg-zinc-950 p-3">
             <p className="text-xs font-semibold uppercase text-zinc-400">{label}</p>
-            <p className="mt-2 text-sm font-semibold text-zinc-100">{value}</p>
+            <p className="mt-2 text-sm font-semibold text-zinc-100">{String(value)}</p>
           </div>)}
         </div> : <p className="mt-3 rounded border border-zinc-700 bg-zinc-950 p-3 text-zinc-400">No WordPress profile data imported yet.</p>}
       </section>

@@ -8,7 +8,7 @@ import { customerLedgerRecords, detectAuthorizeNetRecurring } from "@/lib/revenu
 import { buildProductJourneySummary } from "@/lib/productClassification";
 import { connectToDatabase } from "@/lib/mongodb";
 import { fetchWooCommerceOrders, fetchWooCommerceSubscriptions, isWooCommerceConfigured, wooCommerceOrderStatuses, wooCommerceSubscriptionStatuses } from "@/lib/woocommerce";
-import { fetchProfileUsersWithFallback, isWooCommerceCustomerFallbackConfigured, isWordPressProfileImportConfigured } from "@/lib/wordpressProfiles";
+import { deriveCustomerCreditLimits, fetchProfileUsersWithFallback, isWooCommerceCustomerFallbackConfigured, isWordPressProfileImportConfigured, mergeBusinessProfile } from "@/lib/wordpressProfiles";
 import { fetchNmiTransactions, isNmiConfigured, normalizeNmiPaymentEvent } from "@/lib/nmiQuickPay";
 import { reconcileNmiTransaction } from "@/lib/nmiReconciliation";
 import { countBy, normalizeWooOrder, orderHistoryItemFromStoredOrder, unique } from "@/lib/wooOrderImport";
@@ -127,7 +127,7 @@ function buildCustomerFromOrders(key: string, orders: WooCommerceOrderDocument[]
     failedPayments,
     refunds,
     chargebacks: 0,
-    estimatedCreditLimit: paidTotal > 0 ? Math.max(300, Math.round(paidTotal * 0.8)) : 0,
+    estimatedCreditLimit: 0,
     actualCreditLimit: null,
     tier: paidTotal >= 2500 ? "Platinum" : paidTotal >= 999 ? "Gold" : paidTotal > 0 ? "Bronze" : "Lead",
     leadStatus: paidTotal > 0 ? "customer" : attemptedTotal > 0 ? "hot_lead" : "cold_lead",
@@ -289,22 +289,28 @@ async function importWordPressProfilesStep(cursor: SyncCursor) {
   let wordpressProfilesImported = 0;
   for (const user of users) {
     const customer = user.normalizedEmail
-      ? await Customer.findOne({ $or: [{ normalizedEmail: user.normalizedEmail }, { email: user.normalizedEmail }] }).lean<{ _id: unknown; phone?: string; estimatedCreditLimit?: number; actualCreditLimit?: number | null } | null>()
+      ? await Customer.findOne({ $or: [{ normalizedEmail: user.normalizedEmail }, { email: user.normalizedEmail }] }).lean<{ _id: unknown; phone?: string; estimatedCreditLimit?: number; actualCreditLimit?: number | null; businessProfile?: Record<string, unknown>; sourceCoverage?: Record<string, unknown> } | null>()
       : null;
     const phoneFallback = !customer && user.profile.phone.length >= 7
-      ? await Customer.findOne({ phone: { $regex: escapeRegex(user.profile.phone.slice(-7)), $options: "i" } }).lean<{ _id: unknown; phone?: string; estimatedCreditLimit?: number; actualCreditLimit?: number | null } | null>()
+      ? await Customer.findOne({ phone: { $regex: escapeRegex(user.profile.phone.slice(-7)), $options: "i" } }).lean<{ _id: unknown; phone?: string; estimatedCreditLimit?: number; actualCreditLimit?: number | null; businessProfile?: Record<string, unknown>; sourceCoverage?: Record<string, unknown> } | null>()
       : null;
     const matched = customer ?? phoneFallback;
     if (!matched) continue;
+    const mergedProfile = mergeBusinessProfile(matched.businessProfile, user.profile, importedAt);
+    const creditLimits = deriveCustomerCreditLimits(mergedProfile, matched.actualCreditLimit, matched.estimatedCreditLimit);
     await Customer.updateOne(
       { _id: matched._id },
       {
         $set: {
-          businessProfile: { ...user.profile, importedAt },
-          actualCreditLimit: user.profile.creditLimit || matched.actualCreditLimit || null,
-          estimatedCreditLimit: user.profile.potentialCreditLimit || user.profile.creditLimit || matched.estimatedCreditLimit,
+          businessProfile: mergedProfile,
+          actualCreditLimit: creditLimits.actualCreditLimit,
+          estimatedCreditLimit: creditLimits.estimatedCreditLimit,
           phone: matched.phone || user.profile.phone,
           "sourceCoverage.lastSyncedAt": importedAt,
+          "sourceCoverage.creditMetaSource": mergedProfile.source || user.profile.source || "",
+          "sourceCoverage.approvedCreditsFound": Number(mergedProfile.approvedCredits ?? 0),
+          "sourceCoverage.availableCreditsFound": Number(mergedProfile.availableCredit ?? 0),
+          "sourceCoverage.einSource": mergedProfile.ein ? (mergedProfile.source || user.profile.source || "") : String(matched.sourceCoverage?.einSource ?? ""),
         },
       }
     ).exec();

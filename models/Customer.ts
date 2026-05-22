@@ -142,9 +142,18 @@ export interface CustomerBusinessProfile {
   customerSince: string;
   lastActivity: string;
   ein: string;
+  approvedCredits: number;
+  availableCredit: number;
+  outstandingBalance: number;
+  creditStatus: string;
+  creditMetaVerified: boolean;
+  creditMetaSource: string;
+  creditFallbackReason: string;
   potentialCreditLimit: number;
   creditLimit: number;
   creditLimitLastUpdated: string;
+  lastBillDate: string;
+  nextBillingDate: string;
   net30Status: string;
   accountStatus: string;
   businessType: string;
@@ -272,6 +281,15 @@ export interface CustomerSourceCoverage {
   reconciledRecords: number;
   missingUnattachedRecords: number;
   revenueCoveragePercent: number;
+  wooProfileMatched?: boolean;
+  wooOrdersUsedForEnrichment?: number;
+  businessFieldsSource?: Record<string, string>;
+  creditMetaSource?: string;
+  approvedCreditsFound?: number;
+  availableCreditsFound?: number;
+  einSource?: string;
+  creditMetaVerified?: boolean;
+  creditFallbackReason?: string;
 }
 
 const customerOrderLineItemSchema = new Schema<CustomerOrderLineItem>(
@@ -402,6 +420,15 @@ const customerSourceCoverageSchema = new Schema<CustomerSourceCoverage>(
     reconciledRecords: { type: Number, default: 0 },
     missingUnattachedRecords: { type: Number, default: 0 },
     revenueCoveragePercent: { type: Number, default: 0 },
+    wooProfileMatched: { type: Boolean, default: false },
+    wooOrdersUsedForEnrichment: { type: Number, default: 0 },
+    businessFieldsSource: { type: Schema.Types.Mixed, default: () => ({}) },
+    creditMetaSource: { type: String, default: "" },
+    approvedCreditsFound: { type: Number, default: 0 },
+    availableCreditsFound: { type: Number, default: 0 },
+    einSource: { type: String, default: "" },
+    creditMetaVerified: { type: Boolean, default: false },
+    creditFallbackReason: { type: String, default: "" },
   },
   { _id: false }
 );
@@ -465,9 +492,18 @@ const customerBusinessProfileSchema = new Schema<CustomerBusinessProfile>(
     customerSince: { type: String, default: "" },
     lastActivity: { type: String, default: "" },
     ein: { type: String, default: "" },
+    approvedCredits: { type: Number, default: 0 },
+    availableCredit: { type: Number, default: 0 },
+    outstandingBalance: { type: Number, default: 0 },
+    creditStatus: { type: String, default: "" },
+    creditMetaVerified: { type: Boolean, default: false },
+    creditMetaSource: { type: String, default: "" },
+    creditFallbackReason: { type: String, default: "" },
     potentialCreditLimit: { type: Number, default: 0 },
     creditLimit: { type: Number, default: 0 },
     creditLimitLastUpdated: { type: String, default: "" },
+    lastBillDate: { type: String, default: "" },
+    nextBillingDate: { type: String, default: "" },
     net30Status: { type: String, default: "" },
     accountStatus: { type: String, default: "" },
     businessType: { type: String, default: "" },

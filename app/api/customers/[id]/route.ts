@@ -2,10 +2,12 @@ import { NextResponse } from "next/server";
 import { calculateCustomerValueMetrics } from "@/lib/customerValue";
 import { connectToDatabase } from "@/lib/mongodb";
 import { buildUnifiedPaymentLedger } from "@/lib/unifiedPaymentLedger";
+import { inspectCreditMeta } from "@/lib/wordpressProfiles";
 import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer } from "@/models/Customer";
 import { findBestCustomerByIdOrEmail } from "@/lib/customerLookup";
 import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
+import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 
 function escapeRegex(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -21,6 +23,62 @@ function isPaidStatus(value: string) {
 
 function uniqueStrings(values: string[]) {
   return Array.from(new Set(values.map((value) => String(value ?? "").trim()).filter(Boolean)));
+}
+
+function hasText(value: unknown) {
+  return String(value ?? "").trim().length > 0;
+}
+
+function normalizeName(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
+}
+
+function metaValue(metaRows: Array<{ key?: string; value?: string }> | undefined, keys: string[]) {
+  const rows = Array.isArray(metaRows) ? metaRows : [];
+  for (const key of keys) {
+    const found = rows.find((row) => String(row?.key ?? "").trim().toLowerCase() === key.toLowerCase());
+    if (hasText(found?.value)) return String(found?.value).trim();
+  }
+  return "";
+}
+
+function metaRowsToRecord(metaRows: Array<{ key?: string; value?: string }> | undefined) {
+  return (Array.isArray(metaRows) ? metaRows : []).reduce<Record<string, unknown>>((acc, row) => {
+    const key = String(row?.key ?? "").trim();
+    if (!key) return acc;
+    acc[key] = String(row?.value ?? "");
+    return acc;
+  }, {});
+}
+
+function pickBusinessValue(
+  field: string,
+  candidates: Array<{ value: unknown; source: string }>
+) {
+  const match = candidates.find((candidate) => {
+    if (typeof candidate.value === "number") return Number.isFinite(candidate.value) && candidate.value > 0;
+    return hasText(candidate.value);
+  });
+  return {
+    value: match?.value ?? "",
+    source: match?.source ?? "",
+    field,
+  };
+}
+
+function pickBusinessNumber(
+  field: string,
+  candidates: Array<{ value: unknown; source: string }>
+) {
+  const match = candidates.find((candidate) => {
+    const parsed = Number(candidate.value ?? 0);
+    return Number.isFinite(parsed) && parsed > 0;
+  });
+  return {
+    value: Number(match?.value ?? 0),
+    source: match?.source ?? "",
+    field,
+  };
 }
 
 function buildLiveAiSummary(name: string, paidTotal: number, paidOrderCount: number, attemptedTotal: number) {
@@ -118,6 +176,37 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     customerName: 1, billingFirstName: 1, billingLastName: 1, billingCompany: 1, billingPhone: 1, normalizedPhone: 1, cardType: 1, cardLast4: 1, customerVaultId: 1,
     customerPaymentProfileId: 1, matchedBy: 1, matchConfidence: 1, wooOrderNumberMatched: 1, wooOrderIdMatched: 1,
   }).sort({ submittedAt: -1 }).limit(100).lean<NmiQuickPayTransactionDocument[]>() : [];
+  const knownInvoiceNumbers = uniqueStrings([
+    ...orderNumbers,
+    ...gatewayCandidates.map((transaction) => transaction.invoiceNumber),
+    ...nmiCandidates.map((transaction) => transaction.invoiceNumber),
+  ]);
+  const normalizedCustomerName = normalizeName(customer.name ?? "");
+  const wooConditions = [
+    ...(email ? [{ normalizedEmail: email }] : []),
+    ...(phone.length >= 7 ? [{ normalizedPhone: phone }, { billingPhone: { $regex: phone.slice(-7), $options: "i" } }] : []),
+    ...(knownInvoiceNumbers.length ? [{ orderNumber: { $in: knownInvoiceNumbers } }] : []),
+    ...(normalizedCustomerName ? [{ billingName: { $regex: `^${nameParts.map(escapeRegex).join("\\s+")}`, $options: "i" } }] : []),
+    ...(customer.businessProfile?.company ? [{ billingCompany: { $regex: escapeRegex(customer.businessProfile.company), $options: "i" } }] : []),
+    ...(gatewayCandidates.map((transaction) => transaction.billingCompany).filter(Boolean).length ? [{
+      billingCompany: { $in: gatewayCandidates.map((transaction) => String(transaction.billingCompany ?? "").trim()).filter(Boolean) },
+    }] : []),
+  ];
+  const wooOrderCandidates = wooConditions.length ? await WooCommerceOrderRecord.find({ $or: wooConditions }, {
+    orderNumber: 1,
+    customerId: 1,
+    billingFirstName: 1,
+    billingLastName: 1,
+    billingName: 1,
+    billingEmail: 1,
+    normalizedEmail: 1,
+    billingPhone: 1,
+    normalizedPhone: 1,
+    billingCompany: 1,
+    billingAddress: 1,
+    rawSafeMeta: 1,
+    dateCreated: 1,
+  }).sort({ dateCreated: -1 }).limit(50).lean<WooCommerceOrderDocument[]>() : [];
   const existingGatewayKeys = new Set((customer.gatewayPayments ?? []).map((payment) => payment.transactionId || `${payment.invoiceNumber}-${payment.amount}-${payment.date}`));
   const mergedGatewayPayments = [
     ...(customer.gatewayPayments ?? []),
@@ -151,6 +240,216 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
   });
   const livePaidProducts = uniqueStrings(normalizedOrders.filter((order) => order.isPaid).flatMap((order) => order.lineItems.map((item) => item.name)));
   const liveAttemptedProducts = uniqueStrings(normalizedOrders.filter((order) => order.isAttempted).flatMap((order) => order.lineItems.map((item) => item.name)));
+  const latestWooOrderWithBusinessData = wooOrderCandidates.find((order) =>
+    hasText(order.billingCompany) ||
+    hasText(order.billingAddress?.address1) ||
+    hasText(order.billingAddress?.city) ||
+    hasText(metaValue(order.rawSafeMeta, ["ein", "dba", "doing_business_as", "website", "business_website", "shipping_address_1", "shipping_city", "shipping_state", "shipping_postcode", "shipping_country"]))
+  );
+  const latestStoredOrderWithBusinessData = normalizedOrders.find((order) =>
+    hasText(order.billingCompany) || hasText(order.billingAddress?.address1) || hasText(order.billingAddress?.city) ||
+    hasText(metaValue(order.metaData, ["ein", "dba", "doing_business_as", "website", "business_website"]))
+  );
+  const wooOrderWithEinData = wooOrderCandidates.find((order) => hasText(inspectCreditMeta(metaRowsToRecord(order.rawSafeMeta)).ein));
+  const storedOrderWithEinData = normalizedOrders.find((order) => hasText(inspectCreditMeta(metaRowsToRecord(order.metaData)).ein));
+  const latestAuthorizeNetBusiness = gatewayCandidates.find((transaction) =>
+    hasText(transaction.billingCompany) || hasText(transaction.billingPhone) || hasText(transaction.customerEmail)
+  );
+  const latestWooOrderWithCreditData = wooOrderCandidates.find((order) => {
+    const detection = inspectCreditMeta(metaRowsToRecord(order.rawSafeMeta));
+    return detection.detectedCreditMetaKeys.length > 0;
+  });
+  const latestStoredOrderWithCreditData = normalizedOrders.find((order) => {
+    const detection = inspectCreditMeta(metaRowsToRecord(order.metaData));
+    return detection.detectedCreditMetaKeys.length > 0;
+  });
+  const latestWooOrderCreditDetection = latestWooOrderWithCreditData ? inspectCreditMeta(metaRowsToRecord(latestWooOrderWithCreditData.rawSafeMeta)) : null;
+  const latestStoredOrderCreditDetection = latestStoredOrderWithCreditData ? inspectCreditMeta(metaRowsToRecord(latestStoredOrderWithCreditData.metaData)) : null;
+  const wooOrderEinDetection = wooOrderWithEinData ? inspectCreditMeta(metaRowsToRecord(wooOrderWithEinData.rawSafeMeta)) : null;
+  const storedOrderEinDetection = storedOrderWithEinData ? inspectCreditMeta(metaRowsToRecord(storedOrderWithEinData.metaData)) : null;
+  const businessProfileSources: Record<string, string> = {};
+  const resolvedBusinessName = pickBusinessValue("company", [
+    { value: customer.businessProfile?.company, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderWithBusinessData?.billingCompany, source: "woocommerce" },
+    { value: latestStoredOrderWithBusinessData?.billingCompany, source: "customer" },
+    { value: latestAuthorizeNetBusiness?.billingCompany, source: "authorize_net" },
+    { value: customer.name, source: "customer" },
+  ]);
+  const resolvedDba = pickBusinessValue("dba", [
+    { value: customer.businessProfile?.dba, source: customer.businessProfile?.source || "customer" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["dba", "doing_business_as"]), source: "woocommerce" },
+    { value: metaValue(latestStoredOrderWithBusinessData?.metaData, ["dba", "doing_business_as"]), source: "customer" },
+  ]);
+  const resolvedEin = pickBusinessValue("ein", [
+    { value: customer.businessProfile?.ein, source: customer.businessProfile?.source || "customer" },
+    { value: wooOrderEinDetection?.ein, source: "woocommerce" },
+    { value: latestWooOrderCreditDetection?.ein, source: "woocommerce" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["ein"]), source: "woocommerce" },
+    { value: storedOrderEinDetection?.ein, source: "customer" },
+    { value: latestStoredOrderCreditDetection?.ein, source: "customer" },
+    { value: metaValue(latestStoredOrderWithBusinessData?.metaData, ["ein"]), source: "customer" },
+  ]);
+  const resolvedPhone = pickBusinessValue("phone", [
+    { value: customer.businessProfile?.phone, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderWithBusinessData?.billingPhone, source: "woocommerce" },
+    { value: latestStoredOrderWithBusinessData?.billingPhone, source: "customer" },
+    { value: latestAuthorizeNetBusiness?.billingPhone, source: "authorize_net" },
+    { value: customer.phone, source: "customer" },
+  ]);
+  const resolvedEmail = pickBusinessValue("email", [
+    { value: customer.businessProfile?.email, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderWithBusinessData?.billingEmail, source: "woocommerce" },
+    { value: latestStoredOrderWithBusinessData?.billingEmail, source: "customer" },
+    { value: latestAuthorizeNetBusiness?.customerEmail, source: "authorize_net" },
+    { value: customer.email, source: "customer" },
+  ]);
+  const resolvedAddress1 = pickBusinessValue("address1", [
+    { value: customer.businessProfile?.address1, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderWithBusinessData?.billingAddress?.address1, source: "woocommerce" },
+    { value: latestStoredOrderWithBusinessData?.billingAddress?.address1, source: "customer" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["billing_address_1", "business_address"]), source: "woocommerce" },
+  ]);
+  const resolvedAddress2 = pickBusinessValue("address2", [
+    { value: customer.businessProfile?.address2, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderWithBusinessData?.billingAddress?.address2, source: "woocommerce" },
+    { value: latestStoredOrderWithBusinessData?.billingAddress?.address2, source: "customer" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["billing_address_2"]), source: "woocommerce" },
+  ]);
+  const resolvedCity = pickBusinessValue("city", [
+    { value: customer.businessProfile?.city, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderWithBusinessData?.billingAddress?.city, source: "woocommerce" },
+    { value: latestStoredOrderWithBusinessData?.billingAddress?.city, source: "customer" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["billing_city"]), source: "woocommerce" },
+  ]);
+  const resolvedState = pickBusinessValue("state", [
+    { value: customer.businessProfile?.state, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderWithBusinessData?.billingAddress?.state, source: "woocommerce" },
+    { value: latestStoredOrderWithBusinessData?.billingAddress?.state, source: "customer" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["billing_state"]), source: "woocommerce" },
+  ]);
+  const resolvedZip = pickBusinessValue("zip", [
+    { value: customer.businessProfile?.zip, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderWithBusinessData?.billingAddress?.postcode, source: "woocommerce" },
+    { value: latestStoredOrderWithBusinessData?.billingAddress?.postcode, source: "customer" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["billing_postcode"]), source: "woocommerce" },
+  ]);
+  const resolvedCountry = pickBusinessValue("country", [
+    { value: customer.businessProfile?.country, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderWithBusinessData?.billingAddress?.country, source: "woocommerce" },
+    { value: latestStoredOrderWithBusinessData?.billingAddress?.country, source: "customer" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["billing_country"]), source: "woocommerce" },
+  ]);
+  const resolvedWebsite = pickBusinessValue("website", [
+    { value: customer.businessProfile?.website, source: customer.businessProfile?.source || "customer" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["website", "business_website"]), source: "woocommerce" },
+    { value: metaValue(latestStoredOrderWithBusinessData?.metaData, ["website", "business_website"]), source: "customer" },
+  ]);
+  const resolvedShippingAddress1 = pickBusinessValue("shippingAddress1", [
+    { value: customer.businessProfile?.shippingAddress1, source: customer.businessProfile?.source || "customer" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["shipping_address_1"]), source: "woocommerce" },
+  ]);
+  const resolvedShippingAddress2 = pickBusinessValue("shippingAddress2", [
+    { value: customer.businessProfile?.shippingAddress2, source: customer.businessProfile?.source || "customer" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["shipping_address_2"]), source: "woocommerce" },
+  ]);
+  const resolvedShippingCity = pickBusinessValue("shippingCity", [
+    { value: customer.businessProfile?.shippingCity, source: customer.businessProfile?.source || "customer" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["shipping_city"]), source: "woocommerce" },
+  ]);
+  const resolvedShippingState = pickBusinessValue("shippingState", [
+    { value: customer.businessProfile?.shippingState, source: customer.businessProfile?.source || "customer" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["shipping_state"]), source: "woocommerce" },
+  ]);
+  const resolvedShippingZip = pickBusinessValue("shippingZip", [
+    { value: customer.businessProfile?.shippingZip, source: customer.businessProfile?.source || "customer" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["shipping_postcode"]), source: "woocommerce" },
+  ]);
+  const resolvedShippingCountry = pickBusinessValue("shippingCountry", [
+    { value: customer.businessProfile?.shippingCountry, source: customer.businessProfile?.source || "customer" },
+    { value: metaValue(latestWooOrderWithBusinessData?.rawSafeMeta, ["shipping_country"]), source: "woocommerce" },
+  ]);
+  const resolvedApprovedCredits = pickBusinessNumber("approvedCredits", [
+    { value: customer.businessProfile?.approvedCredits, source: customer.businessProfile?.source || "customer" },
+    { value: customer.businessProfile?.creditLimit, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderCreditDetection?.approvedCredits, source: "woocommerce" },
+    { value: latestStoredOrderCreditDetection?.approvedCredits, source: "customer" },
+  ]);
+  const resolvedAvailableCredit = pickBusinessNumber("availableCredit", [
+    { value: customer.businessProfile?.availableCredit, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderCreditDetection?.availableCredit, source: "woocommerce" },
+    { value: latestStoredOrderCreditDetection?.availableCredit, source: "customer" },
+  ]);
+  const resolvedOutstandingBalance = pickBusinessNumber("outstandingBalance", [
+    { value: customer.businessProfile?.outstandingBalance, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderCreditDetection?.outstandingBalance, source: "woocommerce" },
+    { value: latestStoredOrderCreditDetection?.outstandingBalance, source: "customer" },
+  ]);
+  const resolvedCreditStatus = pickBusinessValue("creditStatus", [
+    { value: customer.businessProfile?.creditStatus, source: customer.businessProfile?.source || "customer" },
+    { value: customer.businessProfile?.net30Status, source: customer.businessProfile?.source || "customer" },
+    { value: customer.businessProfile?.accountStatus, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderCreditDetection?.creditStatus, source: "woocommerce" },
+    { value: latestStoredOrderCreditDetection?.creditStatus, source: "customer" },
+  ]);
+  const resolvedLastBillDate = pickBusinessValue("lastBillDate", [
+    { value: customer.businessProfile?.lastBillDate, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderCreditDetection?.lastBillDate, source: "woocommerce" },
+    { value: latestStoredOrderCreditDetection?.lastBillDate, source: "customer" },
+  ]);
+  const resolvedNextBillingDate = pickBusinessValue("nextBillingDate", [
+    { value: customer.businessProfile?.nextBillingDate, source: customer.businessProfile?.source || "customer" },
+    { value: latestWooOrderCreditDetection?.nextBillingDate, source: "woocommerce" },
+    { value: latestStoredOrderCreditDetection?.nextBillingDate, source: "customer" },
+  ]);
+  const resolvedCreditLimitLastUpdated = pickBusinessValue("creditLimitLastUpdated", [
+    { value: customer.businessProfile?.creditLimitLastUpdated, source: customer.businessProfile?.source || "customer" },
+    { value: metaValue(latestWooOrderWithCreditData?.rawSafeMeta, ["last_credit_limit_update"]), source: "woocommerce" },
+    { value: metaValue(latestStoredOrderWithCreditData?.metaData, ["last_credit_limit_update"]), source: "customer" },
+  ]);
+  for (const resolved of [resolvedBusinessName, resolvedDba, resolvedEin, resolvedPhone, resolvedEmail, resolvedAddress1, resolvedAddress2, resolvedCity, resolvedState, resolvedZip, resolvedCountry, resolvedWebsite, resolvedShippingAddress1, resolvedShippingAddress2, resolvedShippingCity, resolvedShippingState, resolvedShippingZip, resolvedShippingCountry]) {
+    if (resolved.source) businessProfileSources[resolved.field] = resolved.source;
+  }
+  const creditMetaVerified = Boolean(
+    customer.businessProfile?.creditMetaVerified ||
+    latestWooOrderCreditDetection?.verified ||
+    latestStoredOrderCreditDetection?.verified
+  );
+  const enrichedBusinessProfile = {
+    ...(customer.businessProfile ?? {}),
+    company: String(resolvedBusinessName.value || customer.businessProfile?.company || ""),
+    dba: String(resolvedDba.value || customer.businessProfile?.dba || ""),
+    ein: String(resolvedEin.value || customer.businessProfile?.ein || ""),
+    phone: String(resolvedPhone.value || customer.businessProfile?.phone || ""),
+    email: String(resolvedEmail.value || customer.businessProfile?.email || ""),
+    address1: String(resolvedAddress1.value || customer.businessProfile?.address1 || ""),
+    address2: String(resolvedAddress2.value || customer.businessProfile?.address2 || ""),
+    city: String(resolvedCity.value || customer.businessProfile?.city || ""),
+    state: String(resolvedState.value || customer.businessProfile?.state || ""),
+    zip: String(resolvedZip.value || customer.businessProfile?.zip || ""),
+    country: String(resolvedCountry.value || customer.businessProfile?.country || ""),
+    website: String(resolvedWebsite.value || customer.businessProfile?.website || ""),
+    shippingAddress1: String(resolvedShippingAddress1.value || customer.businessProfile?.shippingAddress1 || ""),
+    shippingAddress2: String(resolvedShippingAddress2.value || customer.businessProfile?.shippingAddress2 || ""),
+    shippingCity: String(resolvedShippingCity.value || customer.businessProfile?.shippingCity || ""),
+    shippingState: String(resolvedShippingState.value || customer.businessProfile?.shippingState || ""),
+    shippingZip: String(resolvedShippingZip.value || customer.businessProfile?.shippingZip || ""),
+    shippingCountry: String(resolvedShippingCountry.value || customer.businessProfile?.shippingCountry || ""),
+    approvedCredits: creditMetaVerified ? (resolvedApprovedCredits.value || Number(customer.businessProfile?.approvedCredits ?? 0)) : 0,
+    availableCredit: creditMetaVerified ? (resolvedAvailableCredit.value || Number(customer.businessProfile?.availableCredit ?? 0)) : 0,
+    outstandingBalance: creditMetaVerified ? (resolvedOutstandingBalance.value || Number(customer.businessProfile?.outstandingBalance ?? 0)) : 0,
+    creditStatus: String(resolvedCreditStatus.value || customer.businessProfile?.creditStatus || customer.businessProfile?.net30Status || customer.businessProfile?.accountStatus || ""),
+    creditMetaVerified,
+    creditMetaSource: creditMetaVerified ? (resolvedApprovedCredits.source || resolvedAvailableCredit.source || customer.businessProfile?.creditMetaSource || "wordpress_meta") : (customer.businessProfile?.creditMetaSource || "unknown"),
+    creditFallbackReason: creditMetaVerified ? "" : (latestWooOrderCreditDetection?.fallbackReason || latestStoredOrderCreditDetection?.fallbackReason || customer.businessProfile?.creditFallbackReason || "WP credit meta not verified"),
+    creditLimit: creditMetaVerified ? (resolvedApprovedCredits.value || Number(customer.businessProfile?.creditLimit ?? 0)) : 0,
+    potentialCreditLimit: creditMetaVerified ? Math.max(
+      resolvedApprovedCredits.value || 0,
+      Number(customer.businessProfile?.potentialCreditLimit ?? 0)
+    ) : 0,
+    creditLimitLastUpdated: String(resolvedCreditLimitLastUpdated.value || customer.businessProfile?.creditLimitLastUpdated || ""),
+    lastBillDate: String(resolvedLastBillDate.value || customer.businessProfile?.lastBillDate || ""),
+    nextBillingDate: String(resolvedNextBillingDate.value || customer.businessProfile?.nextBillingDate || ""),
+  };
   const metrics = calculateCustomerValueMetrics({ customer: { ...customer, orders: normalizedOrders, gatewayPayments: mergedGatewayPayments, productJourney: normalizedProductJourney }, authorizeNetTransactions: gatewayCandidates, nmiTransactions: nmiCandidates });
   const unifiedPaymentLedger = buildUnifiedPaymentLedger({ customer: { ...customer, orders: normalizedOrders, gatewayPayments: mergedGatewayPayments }, authorizeNetTransactions: gatewayCandidates, nmiTransactions: nmiCandidates });
   const liveSummary = buildLiveAiSummary(customer.name, metrics.rankingTotal || Number(customer.paidTotal ?? customer.totalPaid ?? 0), normalizedOrders.filter((order) => order.isPaid).length || Number(customer.paidOrderCount ?? 0), metrics.attemptedTotal);
@@ -160,6 +459,15 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     nmiQuickPayTransactionsFound: Math.max(customer.sourceCoverage?.nmiQuickPayTransactionsFound ?? 0, nmiCandidates.length),
     gatewayOnlyPaymentsAttached: Math.max(customer.sourceCoverage?.gatewayOnlyPaymentsAttached ?? 0, (customer.orders ?? []).filter((order) => order.source === "authorize_net_only" || order.source === "nmi_quick_pay_only").length),
     reconciledRecords: Math.max(customer.sourceCoverage?.reconciledRecords ?? 0, mergedGatewayPayments.length),
+    wooProfileMatched: wooOrderCandidates.length > 0 || /wordpress|woocommerce/i.test(String(customer.businessProfile?.sourcePlatform || customer.businessProfile?.source || "")),
+    wooOrdersUsedForEnrichment: wooOrderCandidates.length,
+    businessFieldsSource: businessProfileSources,
+    creditMetaSource: enrichedBusinessProfile.creditMetaSource || customer.sourceCoverage?.creditMetaSource || "",
+    approvedCreditsFound: creditMetaVerified ? Math.max(Number(customer.sourceCoverage?.approvedCreditsFound ?? 0), Number(resolvedApprovedCredits.value ?? 0)) : 0,
+    availableCreditsFound: creditMetaVerified ? Math.max(Number(customer.sourceCoverage?.availableCreditsFound ?? 0), Number(resolvedAvailableCredit.value ?? 0)) : 0,
+    einSource: resolvedEin.source || customer.sourceCoverage?.einSource || "",
+    creditMetaVerified,
+    creditFallbackReason: enrichedBusinessProfile.creditFallbackReason || customer.sourceCoverage?.creditFallbackReason || "",
   };
   console.log(`[customer-detail] lookup id=${safeId} reason=${result.selectedDocumentReason} documentsWithSameEmail=${result.documentsWithSameEmail}`);
   return NextResponse.json({
@@ -179,11 +487,14 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
       gatewayOnlyPaidTotal: metrics.gatewayOnlyPaidTotal,
       nmiQuickPayPaidTotal: metrics.nmiQuickPayPaidTotal,
       subscriptionPaidTotal: metrics.subscriptionPaidTotal,
+      actualCreditLimit: creditMetaVerified ? Number(enrichedBusinessProfile.creditLimit ?? 0) : null,
+      estimatedCreditLimit: creditMetaVerified ? Number(enrichedBusinessProfile.potentialCreditLimit ?? 0) : 0,
       unifiedPaymentLedger: unifiedPaymentLedger.rows,
       unifiedPaymentMetrics: unifiedPaymentLedger.metrics,
       orders: normalizedOrders,
       productJourney: normalizedProductJourney,
       gatewayPayments: mergedGatewayPayments,
+      businessProfile: enrichedBusinessProfile,
       paidProducts: livePaidProducts.length ? livePaidProducts : customer.paidProducts ?? [],
       attemptedProducts: liveAttemptedProducts.length ? liveAttemptedProducts : customer.attemptedProducts ?? [],
       ...liveSummary,

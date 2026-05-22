@@ -17,6 +17,17 @@ function periodSpent(row: CustomerRankingDocument, period: string) {
   return row.lifetimeSpent;
 }
 
+function verifiedCreditValue(customer?: Partial<CustomerDocument> | null) {
+  if (!customer?.businessProfile?.creditMetaVerified) return 0;
+  return Number(
+    customer.businessProfile?.approvedCredits ||
+    customer.businessProfile?.creditLimit ||
+    customer.actualCreditLimit ||
+    customer.businessProfile?.potentialCreditLimit ||
+    0
+  );
+}
+
 export async function GET(request: Request) {
   const started = Date.now();
   await connectToDatabase();
@@ -64,7 +75,8 @@ export async function GET(request: Request) {
         paymentStatus: customer.paymentStatus,
         riskLevel: customer.riskLevel,
         score: customer.score,
-        estimatedCreditLimit: customer.businessProfile?.creditLimit || customer.actualCreditLimit || customer.businessProfile?.potentialCreditLimit || customer.estimatedCreditLimit || 0,
+        estimatedCreditLimit: verifiedCreditValue(customer),
+        businessProfile: customer.businessProfile,
         paidTotal: lifetimeSpent,
         totalPaid: lifetimeSpent,
         attemptedTotal: Number(customer.attemptedTotal ?? 0),
@@ -115,7 +127,8 @@ export async function GET(request: Request) {
     paymentStatus: detail?.paymentStatus || "",
     riskLevel: detail?.riskLevel || "",
     score: detail?.score ?? 0,
-    estimatedCreditLimit: detail?.businessProfile?.creditLimit || detail?.actualCreditLimit || detail?.businessProfile?.potentialCreditLimit || detail?.estimatedCreditLimit || 0,
+    estimatedCreditLimit: verifiedCreditValue(detail),
+    businessProfile: detail?.businessProfile,
     paidTotal: row.lifetimeSpent,
     totalPaid: row.lifetimeSpent,
     attemptedTotal: row.attemptedPipeline,

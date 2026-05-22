@@ -65,6 +65,16 @@ function profileCompleteness(profile: Partial<CustomerBusinessProfile>) {
   return Math.round((fields.filter(Boolean).length / fields.length) * 100);
 }
 
+function verifiedCreditValue(customer: LeanCustomer) {
+  if (!customer.businessProfile?.creditMetaVerified) return 0;
+  return moneyNumber(customer.businessProfile?.approvedCredits || customer.businessProfile?.creditLimit || customer.actualCreditLimit);
+}
+
+function verifiedTotalCreditValue(customer: LeanCustomer) {
+  if (!customer.businessProfile?.creditMetaVerified) return 0;
+  return moneyNumber(customer.businessProfile?.approvedCredits || customer.businessProfile?.potentialCreditLimit || customer.actualCreditLimit);
+}
+
 function fundingScore(customer: LeanCustomer, ranking?: CustomerRankingDocument) {
   const lifetime = moneyNumber(ranking?.lifetimeSpent ?? customer.lifetimeValue ?? customer.rankingPaidTotal ?? customer.paidTotal ?? customer.totalPaid);
   const paidMonths = moneyNumber(ranking?.paidMonths ?? customer.paidMonths ?? customer.paidOrderCount);
@@ -161,8 +171,9 @@ export async function GET(request: Request) {
       estimatedMRR: moneyNumber(ranking?.estimatedMRR ?? customer.recurringAmount),
       paidMonths: moneyNumber(ranking?.paidMonths ?? customer.paidMonths ?? customer.paidOrderCount),
       activeRecurring: moneyNumber(customer.activeSubscriptions) + (customer.isGatewayRecurring ? 1 : 0),
-      creditLimit: moneyNumber(customer.businessProfile?.creditLimit || customer.actualCreditLimit),
-      potentialCreditLimit: moneyNumber(customer.businessProfile?.potentialCreditLimit || customer.estimatedCreditLimit),
+      creditLimit: verifiedCreditValue(customer),
+      potentialCreditLimit: verifiedTotalCreditValue(customer),
+      creditMetaVerified: Boolean(customer.businessProfile?.creditMetaVerified),
       net30Status: customer.businessProfile?.net30Status || customer.businessProfile?.accountStatus || "",
       profileCompleteness: completeness,
       riskLevel: customer.riskLevel,

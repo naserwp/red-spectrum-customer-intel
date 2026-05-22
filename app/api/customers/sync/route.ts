@@ -375,7 +375,7 @@ async function transformOrdersToCustomers(orders: WooCommerceOrder[]) {
   return Promise.all(Array.from(grouped.values()).map(async (customer) => {
     const score = calculateCustomerScore(customer);
     const averageOrderValue = customer.paidOrderCount > 0 ? customer.paidTotal / customer.paidOrderCount : 0;
-    const estimatedCreditLimit = customer.paidTotal > 0 ? estimateCreditLimit(customer.paidTotal, customer.paidOrderCount, customer.failedPayments, customer.refunds, score) : 0;
+    const estimatedCreditLimit = 0;
     const sortedOrders = [...customer.orders].sort((a, b) => new Date(b.dateCreated).getTime() - new Date(a.dateCreated).getTime());
     const productSummary = buildProductJourneySummary(sortedOrders);
     const leadUrgency = getLeadUrgency(customer.paidTotal, customer.attemptedTotal, customer.attemptedOrderCount, customer.lastAttemptDate);
