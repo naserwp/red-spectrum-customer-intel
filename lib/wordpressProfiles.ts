@@ -4,6 +4,7 @@ import type { CustomerBusinessProfile } from "@/models/Customer";
 const wpStoreUrl = process.env.WP_STORE_URL ?? "";
 const wpUsername = process.env.WP_APPLICATION_USERNAME ?? "";
 const wpPassword = process.env.WP_APPLICATION_PASSWORD ?? "";
+const wordpressCreditApiSecret = process.env.WORDPRESS_CREDIT_API_SECRET ?? "";
 const wcStoreUrl = process.env.WC_STORE_URL ?? wpStoreUrl;
 const wcConsumerKey = process.env.WC_CONSUMER_KEY ?? "";
 const wcConsumerSecret = process.env.WC_CONSUMER_SECRET ?? "";
@@ -495,6 +496,17 @@ function authHeader() {
   return `Basic ${Buffer.from(`${wpUsername}:${wpPassword}`).toString("base64")}`;
 }
 
+function wordpressCreditHeaders() {
+  if (!wordpressCreditApiSecret.trim()) {
+    throw new Error("WORDPRESS_CREDIT_API_SECRET is missing.");
+  }
+  return {
+    Authorization: authHeader(),
+    Accept: "application/json",
+    "X-Red-Spectrum-Secret": wordpressCreditApiSecret.trim(),
+  } satisfies HeadersInit;
+}
+
 function wooAuthHeader() {
   if (wcConsumerKey && wcConsumerSecret) return `Basic ${Buffer.from(`${wcConsumerKey}:${wcConsumerSecret}`).toString("base64")}`;
   return authHeader();
@@ -603,7 +615,7 @@ export async function fetchWordPressCreditRecords({ limit, offset, signal }: { l
   const probes: WordPressCreditRouteProbe[] = [];
   try {
     const url = buildCreditCollectionUrl(base, route, safeLimit, offset);
-    const { data, total } = await fetchJsonWithStatus(url, { Authorization: authHeader(), Accept: "application/json" }, signal);
+    const { data, total } = await fetchJsonWithStatus(url, wordpressCreditHeaders(), signal);
     const payload = asRecord(data);
     const records = Array.isArray(data)
       ? data

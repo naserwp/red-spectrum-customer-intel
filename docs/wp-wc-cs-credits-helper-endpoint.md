@@ -35,3 +35,34 @@ Response shape:
 ```
 
 Use the PHP helper in [docs/wp-wc-cs-credits-helper-endpoint.php](E:\Office\RedSpectrumAdmin\red-spectrum-customer-intel\docs\wp-wc-cs-credits-helper-endpoint.php) inside a WordPress plugin or mu-plugin.
+
+**Authentication**
+
+The app sends this header on every request:
+
+`X-Red-Spectrum-Secret: <WORDPRESS_CREDIT_API_SECRET>`
+
+The WordPress helper should allow access if either:
+
+- the requester is an authenticated admin with `manage_options`
+- or the `X-Red-Spectrum-Secret` header matches the configured secret
+
+Recommended WordPress secret setup:
+
+```php
+define('RED_SPECTRUM_WC_CREDIT_SECRET', 'replace-with-a-long-random-secret');
+```
+
+Place that in `wp-config.php`, then enable the helper snippet/plugin.
+
+App env required:
+
+```env
+WORDPRESS_CREDIT_API_SECRET=replace-with-the-same-long-random-secret
+```
+
+Expected security behavior:
+
+- browser request without login and without `X-Red-Spectrum-Secret` should be blocked
+- admin request in WordPress should work
+- app request with `X-Red-Spectrum-Secret` should work

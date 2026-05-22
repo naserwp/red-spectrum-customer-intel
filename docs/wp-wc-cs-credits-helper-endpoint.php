@@ -10,8 +10,24 @@
 add_action('rest_api_init', function () {
     register_rest_route('red-spectrum/v1', '/wc-cs-credits', [
         'methods'  => WP_REST_Server::READABLE,
-        'permission_callback' => function () {
-            return current_user_can('manage_woocommerce') || current_user_can('edit_posts');
+        'permission_callback' => function (WP_REST_Request $request) {
+            if (current_user_can('manage_options')) {
+                return true;
+            }
+
+            $configured_secret = '';
+
+            if (defined('RED_SPECTRUM_WC_CREDIT_SECRET')) {
+                $configured_secret = (string) RED_SPECTRUM_WC_CREDIT_SECRET;
+            }
+
+            if (!$configured_secret) {
+                $configured_secret = (string) get_option('red_spectrum_wc_credit_secret', '');
+            }
+
+            $request_secret = (string) $request->get_header('X-Red-Spectrum-Secret');
+
+            return $configured_secret !== '' && $request_secret !== '' && hash_equals($configured_secret, $request_secret);
         },
         'callback' => function (WP_REST_Request $request) {
             $per_page = max(1, min(25, (int) $request->get_param('per_page')));
