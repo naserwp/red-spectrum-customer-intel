@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { connectToDatabase } from "@/lib/mongodb";
+import { computeFundingIntelligence } from "@/lib/fundingIntelligence";
 import { Customer, type CustomerBusinessProfile, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking, type CustomerRankingDocument } from "@/models/CustomerRanking";
 
@@ -75,31 +76,6 @@ function verifiedTotalCreditValue(customer: LeanCustomer) {
   return moneyNumber(customer.businessProfile?.approvedCredits || customer.businessProfile?.potentialCreditLimit || customer.actualCreditLimit);
 }
 
-function fundingScore(customer: LeanCustomer, ranking?: CustomerRankingDocument) {
-  const lifetime = moneyNumber(ranking?.lifetimeSpent ?? customer.lifetimeValue ?? customer.rankingPaidTotal ?? customer.paidTotal ?? customer.totalPaid);
-  const paidMonths = moneyNumber(ranking?.paidMonths ?? customer.paidMonths ?? customer.paidOrderCount);
-  const mrr = moneyNumber(ranking?.estimatedMRR ?? customer.recurringAmount);
-  const profileScore = profileCompleteness(customer.businessProfile ?? {});
-  let score = 0;
-  score += Math.min(30, lifetime / 250);
-  score += Math.min(18, paidMonths * 2);
-  score += customer.activeSubscriptions > 0 || customer.isGatewayRecurring ? 12 : 0;
-  score += Math.min(12, mrr / 100);
-  score += Math.min(18, profileScore * 0.18);
-  score += customer.riskLevel === "low" ? 10 : customer.riskLevel === "medium" ? 5 : 0;
-  score -= moneyNumber(customer.failedPayments) > 2 ? 8 : 0;
-  score -= moneyNumber(customer.chargebacks) > 0 ? 15 : 0;
-  return Math.max(0, Math.min(100, Math.round(score)));
-}
-
-function fundingTier(score: number, lifetime: number) {
-  if (score >= 85 && lifetime >= 10000) return "Funding VIP Elite";
-  if (score >= 75 && lifetime >= 5000) return "Funding VIP";
-  if (score >= 65) return "Funding Ready";
-  if (score >= 50) return "Needs Enrichment";
-  return "Not Ready";
-}
-
 function insights(customer: LeanCustomer, score: number, lifetime: number, profileScore: number, industry: IndustryMatch) {
   const strengths = [
     lifetime >= 5000 ? "Strong verified customer spend" : "",
@@ -141,7 +117,7 @@ export async function GET(request: Request) {
       name: 1, email: 1, normalizedEmail: 1, phone: 1, businessProfile: 1, estimatedCreditLimit: 1, actualCreditLimit: 1,
       lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, attemptedTotal: 1, paidMonths: 1, paidOrderCount: 1,
       activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, recurringNextEstimatedPayment: 1, riskLevel: 1, failedPayments: 1,
-      chargebacks: 1, tier: 1, score: 1, lastPaidDate: 1, firstPaidDate: 1, paidProducts: 1, baseProductsPurchased: 1,
+      chargebacks: 1, tier: 1, score: 1, lastPaidDate: 1, firstPaidDate: 1, paidProducts: 1, baseProductsPurchased: 1, creditProfile: 1, factiivProfile: 1, publicEnrichment: 1,
     }).sort({ lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1 }).limit(1000).lean<LeanCustomer[]>(),
     CustomerRanking.find({}).sort({ lifetimeSpent: -1 }).limit(1000).lean<CustomerRankingDocument[]>(),
   ]);
@@ -151,8 +127,9 @@ export async function GET(request: Request) {
     const lifetime = moneyNumber(ranking?.lifetimeSpent ?? customer.lifetimeValue ?? customer.rankingPaidTotal ?? customer.paidTotal ?? customer.totalPaid);
     const industry = classifyIndustry(customer);
     const completeness = profileCompleteness(customer.businessProfile ?? {});
-    const score = fundingScore(customer, ranking);
-    const readinessTier = fundingTier(score, lifetime);
+    const funding = computeFundingIntelligence(customer, ranking);
+    const score = Math.max(funding.estimatedFundingReadiness, funding.factiivScore);
+    const readinessTier = funding.fundingTier;
     const insight = insights(customer, score, lifetime, completeness, industry);
     return {
       _id: String(customer._id),
@@ -166,7 +143,7 @@ export async function GET(request: Request) {
       sicCode: industry.sicCode,
       fundingReadinessScore: score,
       fundingReadinessTier: readinessTier,
-      vipTier: lifetime >= 10000 ? "VIP Elite" : lifetime >= 5000 ? "VIP" : lifetime >= 2000 ? "High Value" : "Standard",
+      vipTier: funding.vipTier,
       lifetimeSpent: lifetime,
       estimatedMRR: moneyNumber(ranking?.estimatedMRR ?? customer.recurringAmount),
       paidMonths: moneyNumber(ranking?.paidMonths ?? customer.paidMonths ?? customer.paidOrderCount),
@@ -177,6 +154,14 @@ export async function GET(request: Request) {
       net30Status: customer.businessProfile?.net30Status || customer.businessProfile?.accountStatus || "",
       profileCompleteness: completeness,
       riskLevel: customer.riskLevel,
+      factiivMatched: Boolean(customer.factiivProfile?.factiivMatched),
+      factiivMatchConfidence: customer.factiivProfile?.factiivMatchConfidence || "",
+      tradeLines: funding.tradeLines,
+      tradeAmountTotal: funding.totalTradeAmount,
+      outstandingBalance: funding.outstandingBalance,
+      paymentStabilityScore: funding.paymentStabilityScore,
+      monthlyPaymentConsistency: funding.monthlyPaymentConsistency,
+      segments: funding.segments,
       lastPaidDate: ranking?.latestPaidDate || customer.lastPaidDate,
       firstPaidDate: ranking?.firstPaidDate || customer.firstPaidDate,
       ...insight,

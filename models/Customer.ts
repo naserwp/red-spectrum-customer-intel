@@ -189,6 +189,51 @@ export interface CustomerCreditProfile {
   importedAt: string;
 }
 
+export interface CustomerFactiivProfile {
+  factiivProfileId: string;
+  factiivScore: number;
+  reputationScore: number;
+  historyScore: number;
+  utilizationScore: number;
+  tradeQuantity: number;
+  tradeAmountTotal: number;
+  tradeBalanceTotal: number;
+  activityQuantity: number;
+  activityPaymentAmountTotal: number;
+  activityLastKnownBalanceTotal: number;
+  matchedBusinessName: string;
+  matchedEmail: string;
+  matchedUsername: string;
+  factiivMatched: boolean;
+  factiivMatchConfidence: string;
+  factiivSearchQuery: string;
+  factiivMatchReason: string;
+  lastFactiivSync: string;
+  source: string;
+  rawSummary: string;
+}
+
+export interface CustomerPublicEnrichment {
+  websiteDomain: string;
+  linkedInCompanyUrl: string;
+  facebookPageUrl: string;
+  instagramUrl: string;
+  twitterUrl: string;
+  publicBusinessWebsite: string;
+  googleBusinessProfileUrl: string;
+  secretaryOfStateUrl: string;
+  inferredIndustry: string;
+  naicsCode: string;
+  sicCode: string;
+  enrichmentSources: string[];
+  socialProfilesFound: number;
+  publicBusinessDataFound: boolean;
+  confidence: string;
+  enrichmentStatus: string;
+  lastChecked: string;
+  lastEnrichmentRun: string;
+}
+
 export interface CustomerDocument {
   name: string;
   email: string;
@@ -275,6 +320,8 @@ export interface CustomerDocument {
   sourceCoverage: CustomerSourceCoverage;
   businessProfile: CustomerBusinessProfile;
   creditProfile: CustomerCreditProfile;
+  factiivProfile: CustomerFactiivProfile;
+  publicEnrichment: CustomerPublicEnrichment;
   externalCustomerKey: string;
 }
 
@@ -317,6 +364,12 @@ export interface CustomerSourceCoverage {
   selectedAvailableCreditKey?: string;
   selectedOutstandingKey?: string;
   selectedEinKey?: string;
+  factiivSearchQuery?: string;
+  factiivMatchReason?: string;
+  enrichmentSources?: string[];
+  socialProfilesFound?: number;
+  publicBusinessDataFound?: boolean;
+  lastEnrichmentRun?: string;
 }
 
 const customerOrderLineItemSchema = new Schema<CustomerOrderLineItem>(
@@ -460,6 +513,12 @@ const customerSourceCoverageSchema = new Schema<CustomerSourceCoverage>(
     selectedAvailableCreditKey: { type: String, default: "" },
     selectedOutstandingKey: { type: String, default: "" },
     selectedEinKey: { type: String, default: "" },
+    factiivSearchQuery: { type: String, default: "" },
+    factiivMatchReason: { type: String, default: "" },
+    enrichmentSources: { type: [String], default: [] },
+    socialProfilesFound: { type: Number, default: 0 },
+    publicBusinessDataFound: { type: Boolean, default: false },
+    lastEnrichmentRun: { type: String, default: "" },
   },
   { _id: false }
 );
@@ -575,6 +634,57 @@ const customerCreditProfileSchema = new Schema<CustomerCreditProfile>(
   { _id: false }
 );
 
+const customerFactiivProfileSchema = new Schema<CustomerFactiivProfile>(
+  {
+    factiivProfileId: { type: String, default: "" },
+    factiivScore: { type: Number, default: 0 },
+    reputationScore: { type: Number, default: 0 },
+    historyScore: { type: Number, default: 0 },
+    utilizationScore: { type: Number, default: 0 },
+    tradeQuantity: { type: Number, default: 0 },
+    tradeAmountTotal: { type: Number, default: 0 },
+    tradeBalanceTotal: { type: Number, default: 0 },
+    activityQuantity: { type: Number, default: 0 },
+    activityPaymentAmountTotal: { type: Number, default: 0 },
+    activityLastKnownBalanceTotal: { type: Number, default: 0 },
+    matchedBusinessName: { type: String, default: "" },
+    matchedEmail: { type: String, default: "" },
+    matchedUsername: { type: String, default: "" },
+    factiivMatched: { type: Boolean, default: false },
+    factiivMatchConfidence: { type: String, default: "" },
+    factiivSearchQuery: { type: String, default: "" },
+    factiivMatchReason: { type: String, default: "" },
+    lastFactiivSync: { type: String, default: "" },
+    source: { type: String, default: "" },
+    rawSummary: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
+const customerPublicEnrichmentSchema = new Schema<CustomerPublicEnrichment>(
+  {
+    websiteDomain: { type: String, default: "" },
+    linkedInCompanyUrl: { type: String, default: "" },
+    facebookPageUrl: { type: String, default: "" },
+    instagramUrl: { type: String, default: "" },
+    twitterUrl: { type: String, default: "" },
+    publicBusinessWebsite: { type: String, default: "" },
+    googleBusinessProfileUrl: { type: String, default: "" },
+    secretaryOfStateUrl: { type: String, default: "" },
+    inferredIndustry: { type: String, default: "" },
+    naicsCode: { type: String, default: "" },
+    sicCode: { type: String, default: "" },
+    enrichmentSources: { type: [String], default: [] },
+    socialProfilesFound: { type: Number, default: 0 },
+    publicBusinessDataFound: { type: Boolean, default: false },
+    confidence: { type: String, default: "" },
+    enrichmentStatus: { type: String, default: "" },
+    lastChecked: { type: String, default: "" },
+    lastEnrichmentRun: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
 const customerSchema = new Schema<CustomerDocument>(
   {
     name: { type: String, required: true },
@@ -662,6 +772,8 @@ const customerSchema = new Schema<CustomerDocument>(
     sourceCoverage: { type: customerSourceCoverageSchema, default: () => ({}) },
     businessProfile: { type: customerBusinessProfileSchema, default: () => ({}) },
     creditProfile: { type: customerCreditProfileSchema, default: () => ({}) },
+    factiivProfile: { type: customerFactiivProfileSchema, default: () => ({}) },
+    publicEnrichment: { type: customerPublicEnrichmentSchema, default: () => ({}) },
     externalCustomerKey: { type: String, default: "", index: true },
   },
   { timestamps: true }
@@ -702,5 +814,8 @@ customerSchema.index({ "creditProfile.email": 1 });
 customerSchema.index({ "creditProfile.phone": 1 });
 customerSchema.index({ "creditProfile.linkedUserId": 1 });
 customerSchema.index({ "creditProfile.linkedCustomerId": 1 });
+customerSchema.index({ "factiivProfile.factiivMatched": 1, "factiivProfile.factiivScore": -1 });
+customerSchema.index({ "factiivProfile.lastFactiivSync": -1 });
+customerSchema.index({ "publicEnrichment.lastEnrichmentRun": -1 });
 
 export const Customer = mongoose.models.Customer || mongoose.model<CustomerDocument>("Customer", customerSchema);

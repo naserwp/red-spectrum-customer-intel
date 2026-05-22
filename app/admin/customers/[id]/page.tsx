@@ -125,6 +125,12 @@ type SourceCoverage = {
   selectedAvailableCreditKey?: string;
   selectedOutstandingKey?: string;
   selectedEinKey?: string;
+  factiivSearchQuery?: string;
+  factiivMatchReason?: string;
+  enrichmentSources?: string[];
+  socialProfilesFound?: number;
+  publicBusinessDataFound?: boolean;
+  lastEnrichmentRun?: string;
 };
 
 type SourceCompare = {
@@ -151,10 +157,23 @@ type GatewayPayment = {
   customerPaymentProfileId?: string;
 };
 
+type UnifiedPaymentOrigin =
+  | "woocommerce_checkout"
+  | "woocommerce_subscription_renewal"
+  | "authorize_net_manual"
+  | "authorize_net_cim_profile"
+  | "authorize_net_recurring"
+  | "ghl_payment_link"
+  | "nmi"
+  | "stripe"
+  | "unknown_gateway";
+
 type UnifiedPaymentLedgerRow = {
   date: string;
   source: "woocommerce" | "authorize_net" | "nmi_quick_pay";
   provider: string;
+  origin: UnifiedPaymentOrigin;
+  originClassificationReason: string;
   transactionId: string;
   invoiceNumber: string;
   productDescription: string;
@@ -164,6 +183,13 @@ type UnifiedPaymentLedgerRow = {
   matchMethod: string;
   confidence: string;
   revenueType: "paid" | "attempted" | "refund" | "pending";
+  matchedWooOrderId: string;
+  matchedSubscriptionId: string;
+  gatewayProfileId: string;
+  paymentProfileId: string;
+  recurringPatternDetected: boolean;
+  retryDetected: boolean;
+  staleNextPaymentPrevented: boolean;
 };
 
 type UnifiedPaymentMetrics = {
@@ -174,6 +200,24 @@ type UnifiedPaymentMetrics = {
   attemptedCount: number;
   duplicateSkipped: number;
   lastActivity: string;
+  paidByWooCommerce: number;
+  paidBySubscriptionRenewal: number;
+  paidByAuthorizeNetManual: number;
+  paidByCimRecurring: number;
+  failedAttemptsBySource: Partial<Record<UnifiedPaymentOrigin, number>>;
+  lastFailedAttempt: string;
+  nextRetryAttempt: string;
+  lastSuccessfulPayment: string;
+  activePaymentProfileCount: number;
+};
+
+type SubscriptionIntelligence = {
+  activeSubscriptionCount: number;
+  paymentFrequency: string;
+  nextPayment: string;
+  lastPayment: string;
+  nextRetryAttempt: string;
+  staleNextPaymentPrevented: boolean;
 };
 
 type BusinessProfile = {
@@ -219,6 +263,8 @@ type BusinessProfile = {
   industryClassification?: string;
   naicsCode?: string;
   sicCode?: string;
+  fundingReadinessScore?: number;
+  fundingReadinessTier?: string;
   source?: string;
   importedAt?: string;
 };
@@ -234,6 +280,49 @@ type CreditProfile = {
   source?: string;
   verified?: boolean;
   ein?: string;
+};
+
+type FactiivProfile = {
+  factiivProfileId?: string;
+  factiivScore?: number;
+  reputationScore?: number;
+  historyScore?: number;
+  utilizationScore?: number;
+  tradeQuantity?: number;
+  tradeAmountTotal?: number;
+  tradeBalanceTotal?: number;
+  activityQuantity?: number;
+  activityPaymentAmountTotal?: number;
+  activityLastKnownBalanceTotal?: number;
+  matchedBusinessName?: string;
+  matchedEmail?: string;
+  matchedUsername?: string;
+  factiivMatched?: boolean;
+  factiivMatchConfidence?: string;
+  factiivSearchQuery?: string;
+  factiivMatchReason?: string;
+  lastFactiivSync?: string;
+};
+
+type PublicEnrichment = {
+  websiteDomain?: string;
+  linkedInCompanyUrl?: string;
+  facebookPageUrl?: string;
+  instagramUrl?: string;
+  twitterUrl?: string;
+  publicBusinessWebsite?: string;
+  googleBusinessProfileUrl?: string;
+  secretaryOfStateUrl?: string;
+  inferredIndustry?: string;
+  naicsCode?: string;
+  sicCode?: string;
+  enrichmentSources?: string[];
+  socialProfilesFound?: number;
+  publicBusinessDataFound?: boolean;
+  confidence?: string;
+  enrichmentStatus?: string;
+  lastChecked?: string;
+  lastEnrichmentRun?: string;
 };
 
 type CustomerDetail = {
@@ -282,6 +371,9 @@ type CustomerDetail = {
   sourceCoverage?: SourceCoverage;
   businessProfile?: BusinessProfile;
   creditProfile?: CreditProfile;
+  factiivProfile?: FactiivProfile;
+  publicEnrichment?: PublicEnrichment;
+  subscriptionIntelligence?: SubscriptionIntelligence;
   orderCount: number;
   averageOrderValue: number;
   firstOrderDate: string;
@@ -329,6 +421,28 @@ const paymentSourceLabel = (value?: string) => {
   if (value === "authorize_net") return "Authorize.net";
   if (value === "woocommerce") return "Website / WooCommerce";
   return displayStatus(value);
+};
+const paymentOriginLabel = (value?: UnifiedPaymentOrigin) => {
+  switch (value) {
+    case "woocommerce_checkout":
+      return "WooCommerce Checkout";
+    case "woocommerce_subscription_renewal":
+      return "Subscription Renewal";
+    case "authorize_net_manual":
+      return "Authorize.net Manual";
+    case "authorize_net_cim_profile":
+      return "Authorize.net CIM";
+    case "authorize_net_recurring":
+      return "Authorize.net Recurring";
+    case "ghl_payment_link":
+      return "GHL Payment Link";
+    case "nmi":
+      return "NMI";
+    case "stripe":
+      return "Stripe";
+    default:
+      return "Unknown Gateway";
+  }
 };
 const monthSpan = (start?: string, end = new Date()) => {
   const date = start ? new Date(start) : null;
@@ -607,6 +721,8 @@ export default function CustomerDetailPage() {
   const classifiedAttemptedProducts = [...attemptedBaseProducts, ...attemptedBoostProducts, ...attemptedAddOnProducts];
   const attemptedProductSummary = classifiedAttemptedProducts.length ? classifiedAttemptedProducts : customer.attemptedProducts ?? [];
   const profile = customer.businessProfile ?? {};
+  const factiiv = customer.factiivProfile ?? {};
+  const enrichment = customer.publicEnrichment ?? {};
   const latestOrderWithBilling = orders.find((order) => order.billingCompany || order.billingPhone || order.billingAddress?.address1 || order.billingEmail) ?? orders[0];
   const businessInfo = {
     businessName: profile.company || latestOrderWithBilling?.billingCompany || customer.name || "-",
@@ -620,7 +736,7 @@ export default function CustomerDetailPage() {
     state: profile.state || latestOrderWithBilling?.billingAddress?.state || "-",
     zip: profile.zip || latestOrderWithBilling?.billingAddress?.postcode || "-",
     country: profile.country || latestOrderWithBilling?.billingAddress?.country || "-",
-    website: profile.website || "-",
+    website: profile.website || enrichment.publicBusinessWebsite || enrichment.websiteDomain || "-",
     sourcePlatform: profile.sourcePlatform || profile.source || latestOrderWithBilling?.source || "customer_record",
     customerSince: profile.customerSince || customer.firstPaidDate || customer.firstSignupDate || customer.firstOrderDate || "",
     lastActivity: profile.lastActivity || customer.lastPaidDate || customer.lastOrderDate || customer.lastSyncedAt || "",
@@ -683,6 +799,8 @@ export default function CustomerDetailPage() {
       date: payment.date,
       source: payment.provider === "nmi" || payment.provider === "nmi_quick_pay" ? "nmi_quick_pay" as const : "authorize_net" as const,
       provider: payment.provider,
+      origin: payment.provider === "nmi" || payment.provider === "nmi_quick_pay" ? "nmi" as const : "unknown_gateway" as const,
+      originClassificationReason: "fallback_gateway_history",
       transactionId: payment.transactionId,
       invoiceNumber: payment.invoiceNumber,
       productDescription: payment.provider === "nmi" ? "NMI Quick Pay" : "Authorize.net Payment",
@@ -692,37 +810,48 @@ export default function CustomerDetailPage() {
       matchMethod: payment.matchedBy,
       confidence: payment.matchConfidence,
       revenueType: isGatewayPaidStatus(payment.status) ? "paid" as const : isGatewayDeclinedStatus(payment.status) ? "attempted" as const : isGatewayRefundStatus(payment.status) ? "refund" as const : "pending" as const,
+      matchedWooOrderId: "",
+      matchedSubscriptionId: "",
+      gatewayProfileId: payment.customerProfileId || "",
+      paymentProfileId: payment.customerPaymentProfileId || "",
+      recurringPatternDetected: false,
+      retryDetected: false,
+      staleNextPaymentPrevented: false,
     }));
   const activeSubscriptionRows = subscriptions.filter((sub) => String(sub.status ?? "").toLowerCase() === "active");
-  const activeSubscriptionCount = activeSubscriptionRows.length + (customer.isGatewayRecurring ? 1 : 0);
+  const activeSubscriptionCount = Number(customer.subscriptionIntelligence?.activeSubscriptionCount ?? (activeSubscriptionRows.length + (customer.isGatewayRecurring ? 1 : 0)));
   const wooRecurringRevenue = activeSubscriptionRows.reduce((sum, sub) => sum + Number(sub.monthlyRecurringRevenue ?? sub.amount ?? 0), 0);
   const recurringRevenue = wooRecurringRevenue + (customer.isGatewayRecurring ? Number(customer.recurringAmount ?? 0) : 0);
-  const nextRenewal = activeSubscriptionRows.map((sub) => String(sub.nextBillingDate ?? "")).filter(Boolean).sort()[0] || customer.recurringNextEstimatedPayment || "";
-  const lastRenewal = activeSubscriptionRows.map((sub) => String(sub.lastBillingDate ?? "")).filter(Boolean).sort().reverse()[0] || customer.recurringLastPayment || customer.lastPaidDate || "";
+  const nextRenewal = customer.subscriptionIntelligence?.nextPayment || "";
+  const lastRenewal = customer.subscriptionIntelligence?.lastPayment || activeSubscriptionRows.map((sub) => String(sub.lastBillingDate ?? "")).filter(Boolean).sort().reverse()[0] || customer.recurringLastPayment || customer.lastPaidDate || "";
   const subscriptionStart = activeSubscriptionRows.map((sub) => String(sub.startDate ?? "")).filter(Boolean).sort()[0] || customer.firstSignupDate || customer.firstOrderDate || "";
   const subscriptionAgeMonths = monthSpan(subscriptionStart);
   const estimatedYearlyValue = recurringRevenue * 12;
   const renewalRisk = customer.riskLevel === "high" || customer.failedPayments > 1 ? "high" : customer.riskLevel === "medium" || customer.failedPayments > 0 ? "medium" : "low";
   const fundingTier = fundingTierLabel(Number(customer.score ?? 0), actualPaid);
   const vipTier = vipTierLabel(actualPaid);
+  const fundingTierDisplay = profile.fundingReadinessTier || fundingTier;
   const paymentActivity = actualPaid > 0
     ? `${displayedPaidOrderCount} paid records, ${customer.attemptedOrderCount ?? 0} attempted`
     : `${customer.attemptedOrderCount ?? 0} attempted records`;
-  const tradelineStatus = creditMetaVerified
-    ? displayStatus(profile.creditStatus || profile.net30Status || profile.accountStatus || "verified")
-    : "Not verified";
   const fundingInsight = (() => {
     if (Number(customer.score ?? 0) >= 75 && actualPaid >= 5000) return "Strong payment history with funding-ready revenue signals.";
     if (Number(customer.score ?? 0) >= 65) return "Usable revenue profile. Verify remaining credit and business metadata before underwriting.";
     if (!creditMetaVerified) return "WP credit meta is not verified. Complete credit verification before using this profile for funding decisions.";
     return "Profile needs more paid history or recurring activity before funding outreach.";
   })();
-  const gatewayProfileIds = Array.from(new Set(gatewayHistoryRows.flatMap((payment) => [payment.customerProfileId, payment.customerPaymentProfileId]).filter(Boolean)));
+  const gatewayProfileIds = Array.from(new Set(unifiedPaymentRows.flatMap((payment) => [payment.gatewayProfileId, payment.paymentProfileId]).filter(Boolean)));
   const paymentVerificationMessage = latestGatewayPayment
     ? (verification?.matched
         ? "Gateway verification is attached to this customer."
-        : "Gateway transactions exist for this customer, but some records remain unverified against a WooCommerce order.")
+        : unifiedPaymentRows.some((payment) => payment.transactionId)
+          ? "Gateway rows imported but not fully verified against WooCommerce orders."
+          : "Gateway transactions exist for this customer, but some records remain unverified against a WooCommerce order.")
     : "No gateway rows are attached yet. Run reconciliation to import and match gateway records.";
+  const failedAttemptsBySourceText = Object.entries(customer.unifiedPaymentMetrics?.failedAttemptsBySource ?? {})
+    .sort((a, b) => b[1] - a[1])
+    .map(([origin, count]) => `${paymentOriginLabel(origin as UnifiedPaymentOrigin)}: ${count}`)
+    .join(", ") || "-";
   const paymentDetailByKey = new Map(gatewayHistoryRows.map((payment) => [payment.transactionId || `${payment.provider}-${payment.invoiceNumber}-${payment.amount}-${payment.date}`, payment]));
   const sourceCoverageRows = [
     ["WooCommerce customer orders stored", customer.sourceCoverage?.wooCommerceCustomerOrdersStored ?? wooCustomerOrdersStored],
@@ -745,6 +874,12 @@ export default function CustomerDetailPage() {
     ["Approved credits found", customer.sourceCoverage?.approvedCreditsFound ? money(Number(customer.sourceCoverage.approvedCreditsFound)) : "-"],
     ["Available credits found", customer.sourceCoverage?.availableCreditsFound ? money(Number(customer.sourceCoverage.availableCreditsFound)) : "-"],
     ["EIN source", customer.sourceCoverage?.einSource || "-"],
+    ["Factiiv search query", customer.sourceCoverage?.factiivSearchQuery || factiiv.factiivSearchQuery || "-"],
+    ["Factiiv match reason", customer.sourceCoverage?.factiivMatchReason || factiiv.factiivMatchReason || "-"],
+    ["Enrichment sources", (customer.sourceCoverage?.enrichmentSources ?? enrichment.enrichmentSources ?? []).join(", ") || "-"],
+    ["Social profiles found", customer.sourceCoverage?.socialProfilesFound ?? enrichment.socialProfilesFound ?? 0],
+    ["Public business data found", (customer.sourceCoverage?.publicBusinessDataFound ?? enrichment.publicBusinessDataFound) ? "yes" : "no"],
+    ["Last enrichment run", displayDateTime(customer.sourceCoverage?.lastEnrichmentRun || enrichment.lastEnrichmentRun)],
     ["Revenue coverage", `${Number(customer.sourceCoverage?.revenueCoveragePercent ?? (actualPaid > 0 ? 100 : 0)).toFixed(0)}%`],
   ];
   return <DetailShell
@@ -799,16 +934,15 @@ export default function CustomerDetailPage() {
         <h2 className="text-xl font-semibold text-sky-200">Factiiv Funding Intelligence</h2>
         <div className="mt-3 grid gap-3 md:grid-cols-4">
           {[
-            ["Factiiv Score", String(customer.score ?? 0)],
-            ["Funding Tier", fundingTier],
-            ["VIP Tier", vipTier],
-            ["Industry", profile.industry || profile.businessType || "Not verified"],
-            ["NAICS / SIC", [profile.naicsCode, profile.sicCode].filter(Boolean).join(" / ") || "Not verified"],
-            ["Paid Months", String(customer.paidMonths ?? displayedPaidOrderCount)],
-            ["Verified Credit Limit", creditMetaVerified ? money(approvedCredits) : "Not verified"],
-            ["Tradeline Status", tradelineStatus],
-            ["Payment Activity", paymentActivity],
+            ["Factiiv Score", factiiv.factiivMatched ? String(Number(factiiv.factiivScore ?? profile.fundingReadinessScore ?? 0)) : "Not verified"],
+            ["Funding Tier", fundingTierDisplay],
+            ["Trade Lines", factiiv.factiivMatched ? String(factiiv.tradeQuantity ?? 0) : "Not verified"],
+            ["Total Trade Amount", factiiv.factiivMatched ? money(Number(factiiv.tradeAmountTotal ?? 0)) : "Not verified"],
+            ["Outstanding Balance", factiiv.factiivMatched ? money(Number(factiiv.tradeBalanceTotal ?? factiiv.activityLastKnownBalanceTotal ?? 0)) : "Not verified"],
+            ["Payment Activity", factiiv.factiivMatched ? `${Number(factiiv.activityQuantity ?? 0)} activities / ${money(Number(factiiv.activityPaymentAmountTotal ?? 0))}` : paymentActivity],
             ["Risk", customer.riskLevel],
+            ["Verified Credit Limit", creditMetaVerified ? money(approvedCredits) : "Not verified"],
+            ["VIP Tier", vipTier],
             ["MRR", recurringRevenue > 0 ? money(recurringRevenue) : "Not verified"],
           ].map(([label, value]) => <div key={label} className="rounded border border-sky-900/60 bg-zinc-950/80 p-3">
             <p className="text-xs font-semibold uppercase text-sky-200/80">{label}</p>
@@ -827,7 +961,7 @@ export default function CustomerDetailPage() {
           {[
             ["Active subscriptions", activeSubscriptionCount],
             ["Recurring revenue", money(recurringRevenue)],
-            ["Payment frequency", customer.recurringFrequencyEstimate || activeSubscriptionRows[0]?.billingInterval || "-"],
+            ["Payment frequency", customer.subscriptionIntelligence?.paymentFrequency || customer.recurringFrequencyEstimate || activeSubscriptionRows[0]?.billingInterval || "-"],
             ["Renewal risk", renewalRisk],
             ["Subscription age", `${subscriptionAgeMonths} months`],
             ["Next payment", displayDate(nextRenewal)],
@@ -838,6 +972,7 @@ export default function CustomerDetailPage() {
             <p className="mt-2 text-sm font-semibold text-zinc-100">{String(value)}</p>
           </div>)}
         </div>
+        {customer.subscriptionIntelligence?.staleNextPaymentPrevented ? <p className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100">A stale next payment date was suppressed because no active renewal schedule or valid retry window is currently attached.</p> : null}
       </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
@@ -972,12 +1107,16 @@ export default function CustomerDetailPage() {
         <h2 className="text-xl font-semibold text-red-300">Payment Intelligence</h2>
         <div className="mt-3 grid gap-3 md:grid-cols-4">
           {[
-            ["Unified Paid", money(Number(customer.unifiedPaymentMetrics?.paidTotal ?? actualPaid))],
-            ["Unified Attempted", money(Number(customer.unifiedPaymentMetrics?.attemptedTotal ?? attempted))],
-            ["Refunds / Chargebacks", money(Number(customer.unifiedPaymentMetrics?.refundTotal ?? 0))],
+            ["Paid by WooCommerce", money(Number(customer.unifiedPaymentMetrics?.paidByWooCommerce ?? 0))],
+            ["Paid by Subscription Renewal", money(Number(customer.unifiedPaymentMetrics?.paidBySubscriptionRenewal ?? 0))],
+            ["Paid by Authorize.net Manual", money(Number(customer.unifiedPaymentMetrics?.paidByAuthorizeNetManual ?? 0))],
+            ["Paid by CIM Recurring", money(Number(customer.unifiedPaymentMetrics?.paidByCimRecurring ?? 0))],
+            ["Failed Attempts by source", failedAttemptsBySourceText],
+            ["Last Failed Attempt", displayDateTime(customer.unifiedPaymentMetrics?.lastFailedAttempt)],
+            ["Next Retry Attempt", displayDateTime(customer.subscriptionIntelligence?.nextRetryAttempt || customer.unifiedPaymentMetrics?.nextRetryAttempt)],
+            ["Last Successful Payment", displayDateTime(customer.unifiedPaymentMetrics?.lastSuccessfulPayment || latestGatewayPayment?.date)],
+            ["Active Payment Profile Count", String(customer.unifiedPaymentMetrics?.activePaymentProfileCount ?? gatewayProfileIds.length)],
             ["Gateway Approval Rate", `${gatewayApprovalRate.toFixed(0)}%`],
-            ["Last Gateway Activity", displayDateTime(latestGatewayPayment?.date)],
-            ["Verified payment profiles", gatewayProfileIds.length ? gatewayProfileIds.join(", ") : "Not verified"],
             ["Unmatched gateway records", missingUnattachedRecords],
             ["Gateway verification", paymentVerificationMessage],
           ].map(([label, value]) => <div key={label} className="rounded border border-zinc-700 bg-zinc-950 p-3">
@@ -991,15 +1130,15 @@ export default function CustomerDetailPage() {
         <h2 className="text-xl font-semibold text-red-300">Unified Payment History</h2>
         <div className="mt-3 overflow-x-auto rounded border border-zinc-800">
           <table className="min-w-[980px] text-sm">
-            <thead className="bg-zinc-950"><tr>{["Date", "Source", "Status", "Amount", "Invoice / Order #", "Product", "Card Last4", "Match", ""].map((h) => <th key={h} className="px-3 py-2 text-left text-xs uppercase text-zinc-400">{h}</th>)}</tr></thead>
+            <thead className="bg-zinc-950"><tr>{["Date", "Origin", "Status", "Amount", "Invoice / Order #", "Product", "Card Last4", "Match", ""].map((h) => <th key={h} className="px-3 py-2 text-left text-xs uppercase text-zinc-400">{h}</th>)}</tr></thead>
             <tbody>{unifiedPaymentRows.map((payment, index) => {
-              const rowKey = `${payment.source}-${payment.transactionId || payment.invoiceNumber}-${index}`;
+              const rowKey = `${payment.origin}-${payment.transactionId || payment.invoiceNumber}-${index}`;
               const details = paymentDetailByKey.get(payment.transactionId || `${payment.provider}-${payment.invoiceNumber}-${payment.amount}-${payment.date}`);
               const isExpanded = expandedPaymentRow === rowKey;
               return <Fragment key={rowKey}>
                 <tr key={rowKey} className={`border-t border-zinc-800 ${payment.revenueType === "paid" ? "bg-emerald-500/5" : payment.revenueType === "attempted" ? "bg-orange-500/5" : payment.revenueType === "refund" ? "bg-amber-500/5" : ""}`}>
                   <td className="px-3 py-3">{displayDateTime(payment.date)}</td>
-                  <td className="px-3 py-3">{paymentSourceLabel(payment.source)}</td>
+                  <td className="px-3 py-3">{paymentOriginLabel(payment.origin)}</td>
                   <td className="px-3 py-3"><span className={`rounded border px-2 py-1 text-xs ${gatewayStatusBadgeClass(payment.status)}`}>{displayStatus(payment.status)}</span></td>
                   <td className="px-3 py-3">{money(payment.amount)}</td>
                   <td className="px-3 py-3">{payment.invoiceNumber || "-"}</td>
@@ -1012,10 +1151,16 @@ export default function CustomerDetailPage() {
                   <td colSpan={9} className="px-3 py-3">
                     <div className="grid gap-3 md:grid-cols-3">
                       <div><p className="text-xs uppercase text-zinc-500">Transaction ID</p><p className="mt-1 break-all text-sm text-zinc-100">{payment.transactionId || "-"}</p></div>
-                      <div><p className="text-xs uppercase text-zinc-500">Customer Profile ID</p><p className="mt-1 break-all text-sm text-zinc-100">{details?.customerProfileId || "-"}</p></div>
-                      <div><p className="text-xs uppercase text-zinc-500">Payment Profile ID</p><p className="mt-1 break-all text-sm text-zinc-100">{details?.customerPaymentProfileId || "-"}</p></div>
+                      <div><p className="text-xs uppercase text-zinc-500">Customer Profile ID</p><p className="mt-1 break-all text-sm text-zinc-100">{payment.gatewayProfileId || details?.customerProfileId || "-"}</p></div>
+                      <div><p className="text-xs uppercase text-zinc-500">Payment Profile ID</p><p className="mt-1 break-all text-sm text-zinc-100">{payment.paymentProfileId || details?.customerPaymentProfileId || "-"}</p></div>
                       <div><p className="text-xs uppercase text-zinc-500">Raw Gateway Status</p><p className="mt-1 text-sm text-zinc-100">{displayStatus(payment.status)}</p></div>
                       <div><p className="text-xs uppercase text-zinc-500">Confidence</p><p className="mt-1 text-sm text-zinc-100">{displayStatus(payment.confidence) || "-"}</p></div>
+                      <div><p className="text-xs uppercase text-zinc-500">Origin Reason</p><p className="mt-1 text-sm text-zinc-100">{displayStatus(payment.originClassificationReason) || "-"}</p></div>
+                      <div><p className="text-xs uppercase text-zinc-500">Matched Woo Order ID</p><p className="mt-1 break-all text-sm text-zinc-100">{payment.matchedWooOrderId || "-"}</p></div>
+                      <div><p className="text-xs uppercase text-zinc-500">Matched Subscription ID</p><p className="mt-1 break-all text-sm text-zinc-100">{payment.matchedSubscriptionId || "-"}</p></div>
+                      <div><p className="text-xs uppercase text-zinc-500">Recurring Pattern</p><p className="mt-1 text-sm text-zinc-100">{payment.recurringPatternDetected ? "yes" : "no"}</p></div>
+                      <div><p className="text-xs uppercase text-zinc-500">Retry Detected</p><p className="mt-1 text-sm text-zinc-100">{payment.retryDetected ? "yes" : "no"}</p></div>
+                      <div><p className="text-xs uppercase text-zinc-500">Stale Next Payment Prevented</p><p className="mt-1 text-sm text-zinc-100">{payment.staleNextPaymentPrevented ? "yes" : "no"}</p></div>
                       <div><p className="text-xs uppercase text-zinc-500">Source Debug</p><p className="mt-1 text-sm text-zinc-100">{details?.source ? displayStatus(details.source) : paymentSourceLabel(payment.source)}</p></div>
                     </div>
                   </td>

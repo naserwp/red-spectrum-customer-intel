@@ -9,6 +9,9 @@ const protectedApiPaths = [
   "/api/nmi/backfill-transactions",
   "/api/nmi/reconcile-customers",
   "/api/nmi/repair-customer",
+  "/api/factiv/sync",
+  "/api/enrichment/rebuild",
+  "/api/enrichment/public-profiles",
   "/api/wordpress/debug-user-meta",
   "/api/wordpress/import-credit-records",
   "/api/wordpress/debug-credit-records",
@@ -40,5 +43,5 @@ export async function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/admin/:path*", "/api/woocommerce/backfill-orders", "/api/woocommerce/backfill-subscriptions", "/api/authorize-net/backfill-transactions", "/api/authorize-net/reconcile-customers", "/api/nmi/backfill-transactions", "/api/nmi/reconcile-customers", "/api/nmi/repair-customer", "/api/wordpress/debug-user-meta", "/api/wordpress/import-credit-records", "/api/wordpress/debug-credit-records", "/api/sync/run-step", "/api/customers/rebuild-from-orders", "/api/customers/sync-one", "/api/customers/compare-source"],
+  matcher: ["/admin/:path*", "/api/woocommerce/backfill-orders", "/api/woocommerce/backfill-subscriptions", "/api/authorize-net/backfill-transactions", "/api/authorize-net/reconcile-customers", "/api/nmi/backfill-transactions", "/api/nmi/reconcile-customers", "/api/nmi/repair-customer", "/api/factiv/sync", "/api/enrichment/rebuild", "/api/enrichment/public-profiles", "/api/wordpress/debug-user-meta", "/api/wordpress/import-credit-records", "/api/wordpress/debug-credit-records", "/api/sync/run-step", "/api/customers/rebuild-from-orders", "/api/customers/sync-one", "/api/customers/compare-source"],
 };

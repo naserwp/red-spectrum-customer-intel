@@ -7,6 +7,7 @@ import { Customer } from "@/models/Customer";
 import { findBestCustomerByIdOrEmail } from "@/lib/customerLookup";
 import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
+import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
 
 function escapeRegex(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -30,6 +31,36 @@ function hasText(value: unknown) {
 
 function normalizeName(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
+}
+
+function dateValue(value?: string) {
+  if (!value) return 0;
+  const parsed = new Date(value).getTime();
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function addDays(value: string, days: number) {
+  const parsed = dateValue(value);
+  if (!parsed) return "";
+  const date = new Date(parsed);
+  date.setDate(date.getDate() + days);
+  return date.toISOString();
+}
+
+function futureDate(value?: string) {
+  const parsed = dateValue(value);
+  if (!parsed) return "";
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return parsed >= today.getTime() ? new Date(parsed).toISOString() : "";
+}
+
+function formatBillingFrequency(subscription?: Partial<WooCommerceSubscriptionDocument>) {
+  const interval = String(subscription?.billingInterval ?? "").trim();
+  const period = String(subscription?.billingPeriod ?? "").trim();
+  if (!interval && !period) return "";
+  if (!interval || interval === "1") return period || "";
+  return `${interval} ${period}`.trim();
 }
 
 function metaValue(metaRows: Array<{ key?: string; value?: string }> | undefined, keys: string[]) {
@@ -182,6 +213,37 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     rawSafeMeta: 1,
     dateCreated: 1,
   }).sort({ dateCreated: -1 }).limit(50).lean<WooCommerceOrderDocument[]>() : [];
+  const wooCustomerIds = uniqueStrings([
+    ...(customer.orders ?? []).map((order) => String(order.customerId ?? "")),
+    ...wooOrderCandidates.map((order) => String(order.customerId ?? "")),
+  ]).map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0);
+  const relatedOrderIds = uniqueStrings([
+    ...(customer.orders ?? []).map((order) => String(order.orderId ?? "")),
+    ...wooOrderCandidates.map((order) => String(order.orderNumber ?? "")),
+    ...knownInvoiceNumbers,
+  ]).map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0);
+  const subscriptionConditions = [
+    ...(email ? [{ normalizedEmail: email }] : []),
+    ...(wooCustomerIds.length ? [{ customerId: { $in: wooCustomerIds } }] : []),
+    ...(relatedOrderIds.length ? [{ relatedOrderIds: { $in: relatedOrderIds } }] : []),
+  ];
+  const subscriptionCandidates = subscriptionConditions.length ? await WooCommerceSubscriptionRecord.find({ $or: subscriptionConditions }, {
+    subscriptionId: 1,
+    subscriptionNumber: 1,
+    status: 1,
+    customerId: 1,
+    customerEmail: 1,
+    normalizedEmail: 1,
+    productNames: 1,
+    amount: 1,
+    recurringTotal: 1,
+    billingInterval: 1,
+    billingPeriod: 1,
+    startDate: 1,
+    nextPaymentDate: 1,
+    lastPaymentDate: 1,
+    relatedOrderIds: 1,
+  }).sort({ updatedAt: -1 }).limit(50).lean<WooCommerceSubscriptionDocument[]>() : [];
   const existingGatewayKeys = new Set((customer.gatewayPayments ?? []).map((payment) => payment.transactionId || `${payment.invoiceNumber}-${payment.amount}-${payment.date}`));
   const mergedGatewayPayments = [
     ...(customer.gatewayPayments ?? []),
@@ -381,7 +443,42 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     nextBillingDate: String(customer.creditProfile?.nextBillingDate || resolvedNextBillingDate.value || customer.businessProfile?.nextBillingDate || ""),
   };
   const metrics = calculateCustomerValueMetrics({ customer: { ...customer, orders: normalizedOrders, gatewayPayments: mergedGatewayPayments, productJourney: normalizedProductJourney }, authorizeNetTransactions: gatewayCandidates, nmiTransactions: nmiCandidates });
-  const unifiedPaymentLedger = buildUnifiedPaymentLedger({ customer: { ...customer, orders: normalizedOrders, gatewayPayments: mergedGatewayPayments }, authorizeNetTransactions: gatewayCandidates, nmiTransactions: nmiCandidates });
+  const unifiedPaymentLedger = buildUnifiedPaymentLedger({
+    customer: { ...customer, orders: normalizedOrders, gatewayPayments: mergedGatewayPayments },
+    authorizeNetTransactions: gatewayCandidates,
+    nmiTransactions: nmiCandidates,
+    subscriptions: subscriptionCandidates,
+  });
+  const activeSubscriptionCandidates = subscriptionCandidates.filter((subscription) => String(subscription.status ?? "").toLowerCase() === "active");
+  const activeSubscriptionNextDates = activeSubscriptionCandidates.map((subscription) => futureDate(subscription.nextPaymentDate)).filter(Boolean).sort((a, b) => dateValue(a) - dateValue(b));
+  const recurringRows = unifiedPaymentLedger.rows.filter((row) => row.recurringPatternDetected && row.revenueType === "paid").sort((a, b) => dateValue(b.date) - dateValue(a.date));
+  const lastRecurringPayment = recurringRows[0]?.date || "";
+  const recurringNextCandidate = futureDate(customer.recurringNextEstimatedPayment)
+    || (lastRecurringPayment ? futureDate(addDays(lastRecurringPayment, 30)) : "");
+  const retryDates = unifiedPaymentLedger.rows
+    .filter((row) => row.retryDetected && row.revenueType === "attempted")
+    .map((row) => futureDate(addDays(row.date, row.origin === "woocommerce_subscription_renewal" || row.recurringPatternDetected ? 3 : 7)))
+    .filter(Boolean)
+    .sort((a, b) => dateValue(a) - dateValue(b));
+  const staleNextPaymentPrevented = Boolean(
+    [customer.recurringNextEstimatedPayment, customer.businessProfile?.nextBillingDate]
+      .filter(Boolean)
+      .some((value) => !futureDate(value))
+      && !activeSubscriptionNextDates.length
+      && !recurringNextCandidate
+      && !retryDates.length
+  );
+  const subscriptionIntelligence = {
+    activeSubscriptionCount: activeSubscriptionCandidates.length + (customer.isGatewayRecurring ? 1 : 0),
+    paymentFrequency: formatBillingFrequency(activeSubscriptionCandidates[0]) || customer.recurringFrequencyEstimate || "",
+    nextPayment: activeSubscriptionNextDates[0] || retryDates[0] || recurringNextCandidate || "",
+    lastPayment: activeSubscriptionCandidates.map((subscription) => subscription.lastPaymentDate).filter(Boolean).sort((a, b) => dateValue(b) - dateValue(a))[0]
+      || lastRecurringPayment
+      || metrics.lastPaidDate
+      || "",
+    nextRetryAttempt: retryDates[0] || "",
+    staleNextPaymentPrevented,
+  };
   const liveSummary = buildLiveAiSummary(customer.name, metrics.rankingTotal || Number(customer.paidTotal ?? customer.totalPaid ?? 0), normalizedOrders.filter((order) => order.isPaid).length || Number(customer.paidOrderCount ?? 0), metrics.attemptedTotal);
   const sourceCoverage = {
     ...(customer.sourceCoverage ?? {}),
@@ -425,6 +522,7 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
       estimatedCreditLimit: creditMetaVerified ? Number(enrichedBusinessProfile.potentialCreditLimit ?? 0) : 0,
       unifiedPaymentLedger: unifiedPaymentLedger.rows,
       unifiedPaymentMetrics: unifiedPaymentLedger.metrics,
+      subscriptionIntelligence,
       orders: normalizedOrders,
       productJourney: normalizedProductJourney,
       gatewayPayments: mergedGatewayPayments,

@@ -16,6 +16,8 @@ type Customer = {
   activeSubscriptions: number; failedPayments: number; chargebacks: number; estimatedCreditLimit: number; actualCreditLimit?: number | null; tier: string; riskLevel: string;
   businessProfile?: { approvedCredits?: number; availableCredit?: number; potentialCreditLimit?: number; creditLimit?: number; creditMetaVerified?: boolean; creditMetaSource?: string; creditFallbackReason?: string };
   sourceCoverage?: { creditMetaVerified?: boolean; creditMetaSource?: string; creditFallbackReason?: string };
+  factiivProfile?: { factiivMatched?: boolean; factiivScore?: number; factiivMatchConfidence?: string };
+  publicEnrichment?: { publicBusinessDataFound?: boolean; socialProfilesFound?: number };
   score: number; stars: number; aiSummaryPreview: string; aiSummary: string; subscriptionStatus: string; orderCount: number; averageOrderValue: number;
   firstOrderDate: string; lastOrderDate: string; refunds: number; riskExplanation: string; recommendedAction: string;
   attemptedProducts?: string[]; lastAttemptedProduct?: string;
@@ -140,7 +142,7 @@ type AuthNetBatchState = {
   hasMore: boolean;
   nextOffset: number;
   nextCursor?: { windowStart?: string; transactionOffset?: number };
-  action: "import" | "reconcile" | "nmi_import" | "nmi_reconcile" | "analytics_rebuild";
+  action: "import" | "reconcile" | "nmi_import" | "nmi_reconcile" | "analytics_rebuild" | "factiv_sync" | "enrichment_rebuild" | "public_profiles_refresh";
 };
 
 type SyncStepResult = {
@@ -291,7 +293,11 @@ type HighValueSegment =
   | "funding_ready"
   | "hot_lead_high_intent"
   | "gateway_heavy_customer"
-  | "subscription_heavy_customer";
+  | "subscription_heavy_customer"
+  | "high_retry_risk"
+  | "tradeline_verified"
+  | "factiv_matched"
+  | "high_payment_consistency";
 
 const highValueSegmentLabel: Record<HighValueSegment, string> = {
   all: "All High Value",
@@ -303,6 +309,10 @@ const highValueSegmentLabel: Record<HighValueSegment, string> = {
   hot_lead_high_intent: "Hot Lead High Intent",
   gateway_heavy_customer: "Gateway Heavy Customer",
   subscription_heavy_customer: "Subscription Heavy Customer",
+  high_retry_risk: "High Retry Risk",
+  tradeline_verified: "Tradeline Verified",
+  factiv_matched: "Factiiv Matched",
+  high_payment_consistency: "High Payment Consistency",
 };
 
 function highValueSegmentForCustomer(c: Customer): HighValueSegment {
@@ -315,8 +325,13 @@ function highValueSegmentForCustomer(c: Customer): HighValueSegment {
     : Number.POSITIVE_INFINITY;
   const hasRecurring = Number(c.activeSubscriptionCount ?? c.activeSubscriptions ?? 0) > 0 || Number(c.estimatedMRR ?? 0) > 0;
   const hasGatewayRecurring = (c.subscriptionStatus || "").toLowerCase().includes("gateway") || Number(c.gatewayPaidCount ?? 0) > Number(c.paidOrderCount ?? 0);
+  const paymentConsistency = Number(c.paidMonths ?? c.paidOrderCount ?? 0) >= 6 && Number(c.failedPayments ?? 0) === 0 && Number(c.chargebacks ?? 0) === 0;
   if (paid <= 0 && attempted > 0) return "hot_lead_high_intent";
+  if (Number(c.failedPayments ?? 0) >= 3 || attempted >= 500) return "high_retry_risk";
   if (hasVerifiedCreditMeta(c) && verifiedCreditLimit(c) > 0 && Number(c.score ?? 0) >= 65) return "funding_ready";
+  if (Boolean(c.factiivProfile?.factiivMatched)) return "factiv_matched";
+  if (hasVerifiedCreditMeta(c)) return "tradeline_verified";
+  if (paymentConsistency) return "high_payment_consistency";
   if (paid >= 10000) return "vip_high_value";
   if (hasRecurring && Number(c.estimatedMRR ?? 0) >= 200) return "subscription_heavy_customer";
   if (hasGatewayRecurring) return "gateway_heavy_customer";
@@ -1290,6 +1305,84 @@ export default function AdminPage() {
     await loadActiveTab(tab, { page: 1, query: appliedSearch });
   };
 
+  const runFactiivSync = async (offset = 0) => {
+    setError("");
+    setMessage("Running Factiiv sync...");
+    const res = await fetch("/api/factiv/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: 25, offset, dryRun: false }),
+    });
+    const data = await res.json();
+    setSyncResult(data);
+    if (!res.ok) return setError(data.error || "Factiiv sync failed");
+    const processed = Number(data.processed ?? 0);
+    const updated = Number(data.updated ?? 0);
+    setMessage(data.hasMore ? `Factiiv sync updated ${updated} customers. Continue to process the next batch.` : `Factiiv sync updated ${updated} customers.`);
+    setAuthNetBatch(data.hasMore ? { hasMore: true, nextOffset: Number(data.nextOffset ?? offset + processed), action: "factiv_sync" } : null);
+    setSyncLastRun({
+      action: "Run Factiiv Sync",
+      status: data.warnings?.length ? "Completed with warnings" : "Completed",
+      ordersImported: 0,
+      customersUpdated: updated,
+      warnings: data.warnings ?? [],
+      lastRunTime: new Date().toLocaleString(),
+    });
+    await loadActiveTab(tab, { page: 1, query: appliedSearch });
+  };
+
+  const runFundingIntelligenceRebuild = async (offset = 0) => {
+    setError("");
+    setMessage("Rebuilding funding intelligence...");
+    const res = await fetch("/api/enrichment/rebuild", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: 50, offset, dryRun: false }),
+    });
+    const data = await res.json();
+    setSyncResult(data);
+    if (!res.ok) return setError(data.error || "Funding intelligence rebuild failed");
+    const processed = Number(data.processed ?? 0);
+    const updated = Number(data.updated ?? 0);
+    setMessage(data.hasMore ? `Rebuilt funding intelligence for ${updated} customers. Continue for the next batch.` : `Rebuilt funding intelligence for ${updated} customers.`);
+    setAuthNetBatch(data.hasMore ? { hasMore: true, nextOffset: Number(data.nextOffset ?? offset + processed), action: "enrichment_rebuild" } : null);
+    setSyncLastRun({
+      action: "Rebuild Funding Intelligence",
+      status: data.warnings?.length ? "Completed with warnings" : "Completed",
+      ordersImported: 0,
+      customersUpdated: updated,
+      warnings: data.warnings ?? [],
+      lastRunTime: new Date().toLocaleString(),
+    });
+    await loadActiveTab(tab, { page: 1, query: appliedSearch });
+  };
+
+  const runPublicProfilesRefresh = async (offset = 0) => {
+    setError("");
+    setMessage("Refreshing public business profiles...");
+    const res = await fetch("/api/enrichment/public-profiles", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: 25, offset, dryRun: false }),
+    });
+    const data = await res.json();
+    setSyncResult(data);
+    if (!res.ok) return setError(data.error || "Public enrichment refresh failed");
+    const processed = Number(data.processed ?? 0);
+    const updated = Number(data.updated ?? 0);
+    setMessage(data.hasMore ? `Updated ${updated} public enrichment profiles. Continue for the next batch.` : `Updated ${updated} public enrichment profiles.`);
+    setAuthNetBatch(data.hasMore ? { hasMore: true, nextOffset: Number(data.nextOffset ?? offset + processed), action: "public_profiles_refresh" } : null);
+    setSyncLastRun({
+      action: "Refresh Public Profiles",
+      status: data.warnings?.length ? "Completed with warnings" : "Completed",
+      ordersImported: 0,
+      customersUpdated: updated,
+      warnings: data.warnings ?? [],
+      lastRunTime: new Date().toLocaleString(),
+    });
+    await loadActiveTab(tab, { page: 1, query: appliedSearch });
+  };
+
   const loadWordPressMetaDebug = async () => {
     setError("");
     setMessage("");
@@ -1471,6 +1564,10 @@ export default function AdminPage() {
       hot_lead_high_intent: 0,
       gateway_heavy_customer: 0,
       subscription_heavy_customer: 0,
+      high_retry_risk: 0,
+      tradeline_verified: 0,
+      factiv_matched: 0,
+      high_payment_consistency: 0,
     });
   }, [customers]);
   const visibleHighValueRows = useMemo(() => {
@@ -1575,7 +1672,7 @@ export default function AdminPage() {
           </div>
         </div>
         <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          {(["active_high_value", "inactive_high_value", "vip_high_value", "dormant_high_value", "funding_ready", "hot_lead_high_intent", "gateway_heavy_customer", "subscription_heavy_customer"] as HighValueSegment[]).map((segment) => (
+          {(["active_high_value", "inactive_high_value", "vip_high_value", "dormant_high_value", "funding_ready", "hot_lead_high_intent", "gateway_heavy_customer", "subscription_heavy_customer", "high_retry_risk", "tradeline_verified", "factiv_matched", "high_payment_consistency"] as HighValueSegment[]).map((segment) => (
             <button key={segment} onClick={() => setHighValueSegment(segment)} className="text-left">
               <Card label={highValueSegmentLabel[segment]} value={highValueSegmentCounts[segment]} helper={segment === highValueSegment ? "Current segment" : "Click to filter"} />
             </button>
@@ -1601,7 +1698,7 @@ export default function AdminPage() {
       {tab === "Sync Center" && <section className="space-y-4 rounded-xl border border-zinc-800 bg-zinc-900/70 p-5">
         <div>
           <h2 className="mb-2 text-xl font-semibold text-red-300">Sync Center</h2>
-          <p className="text-sm text-zinc-400">Imports new WooCommerce orders, updates customers, imports subscriptions, and reconciles Authorize.net payments in safe batches.</p>
+          <p className="text-sm text-zinc-400">Imports new WooCommerce orders, updates customers, imports subscriptions, reconciles gateway payments, syncs Factiiv, and refreshes funding enrichment in safe batches.</p>
         </div>
         <div className="flex flex-wrap gap-3">
           <button disabled={syncRunning} onClick={runSyncNow} className="rounded bg-red-600 px-6 py-3 font-semibold text-white hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-60">Sync Now</button>
@@ -1630,8 +1727,12 @@ export default function AdminPage() {
               <button onClick={() => runNmiImport()} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Import NMI Quick Pay Transactions</button>
               <button onClick={() => runNmiReconcile()} className="rounded bg-red-800 px-5 py-3 font-semibold hover:bg-red-700">Reconcile NMI Quick Pay Payments</button>
               <button onClick={runReconcileAllGatewayPayments} className="rounded bg-red-800 px-5 py-3 font-semibold hover:bg-red-700">Reconcile All Gateway Payments</button>
+              <button onClick={() => runFactiivSync()} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Run Factiiv Sync</button>
+              <button onClick={() => runFundingIntelligenceRebuild()} className="rounded bg-blue-800 px-5 py-3 font-semibold hover:bg-blue-700">Rebuild Funding Intelligence</button>
+              <button onClick={() => runFundingIntelligenceRebuild()} className="rounded bg-blue-700 px-5 py-3 font-semibold hover:bg-blue-600">Re-run Enrichment</button>
+              <button onClick={() => runPublicProfilesRefresh()} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Refresh Public Profiles</button>
               <button onClick={() => runAnalyticsCacheRebuild()} className="rounded bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600">Rebuild Customer Analytics Cache</button>
-              {authNetBatch?.hasMore && <button onClick={() => authNetBatch.action === "import" ? runAuthorizeNetImport(authNetBatch.nextOffset, authNetBatch.nextCursor) : authNetBatch.action === "reconcile" ? runAuthorizeNetReconcile(authNetBatch.nextOffset) : authNetBatch.action === "nmi_import" ? runNmiImport(authNetBatch.nextOffset) : authNetBatch.action === "nmi_reconcile" ? runNmiReconcile(authNetBatch.nextOffset) : runAnalyticsCacheRebuild(authNetBatch.nextOffset)} className="rounded bg-zinc-800 px-5 py-3 font-semibold hover:bg-zinc-700">Continue {authNetBatch.action === "analytics_rebuild" ? "Analytics Cache Rebuild" : authNetBatch.action.includes("nmi") ? "NMI Quick Pay" : "Authorize.net"} {authNetBatch.action === "analytics_rebuild" ? "" : authNetBatch.action.includes("import") ? "Import" : "Reconcile"}</button>}
+              {authNetBatch?.hasMore && <button onClick={() => authNetBatch.action === "import" ? runAuthorizeNetImport(authNetBatch.nextOffset, authNetBatch.nextCursor) : authNetBatch.action === "reconcile" ? runAuthorizeNetReconcile(authNetBatch.nextOffset) : authNetBatch.action === "nmi_import" ? runNmiImport(authNetBatch.nextOffset) : authNetBatch.action === "nmi_reconcile" ? runNmiReconcile(authNetBatch.nextOffset) : authNetBatch.action === "factiv_sync" ? runFactiivSync(authNetBatch.nextOffset) : authNetBatch.action === "enrichment_rebuild" ? runFundingIntelligenceRebuild(authNetBatch.nextOffset) : authNetBatch.action === "public_profiles_refresh" ? runPublicProfilesRefresh(authNetBatch.nextOffset) : runAnalyticsCacheRebuild(authNetBatch.nextOffset)} className="rounded bg-zinc-800 px-5 py-3 font-semibold hover:bg-zinc-700">Continue {authNetBatch.action === "analytics_rebuild" ? "Analytics Cache Rebuild" : authNetBatch.action === "factiv_sync" ? "Factiiv Sync" : authNetBatch.action === "enrichment_rebuild" ? "Funding Intelligence" : authNetBatch.action === "public_profiles_refresh" ? "Public Profiles" : authNetBatch.action.includes("nmi") ? "NMI Quick Pay" : "Authorize.net"} {authNetBatch.action === "analytics_rebuild" || authNetBatch.action === "factiv_sync" || authNetBatch.action === "enrichment_rebuild" || authNetBatch.action === "public_profiles_refresh" ? "" : authNetBatch.action.includes("import") ? "Import" : "Reconcile"}</button>}
             </div>
             <WordPressCreditMetaPanel result={wpMetaDebug} />
           </div>}
