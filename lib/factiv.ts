@@ -19,6 +19,21 @@ export type FactiivSyncResult = {
   warnings: string[];
 };
 
+export type FactiivSearchResult = {
+  profileId: string;
+  businessName: string;
+  email: string;
+  username: string;
+  factiivScore: number;
+  tradeQuantity: number;
+  tradeAmountTotal: number;
+  tradeBalanceTotal: number;
+  rawSummary: string;
+  matchConfidence: string;
+  matchReason: string;
+  selectedProfileData: CustomerFactiivProfile;
+};
+
 function asNumber(value: unknown) {
   const parsed = Number(value ?? 0);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -65,6 +80,50 @@ function summarizeRecord(record: FactiivApiRecord) {
     .slice(0, 12)
     .map(([key, value]) => `${key}:${typeof value === "object" ? JSON.stringify(value) : String(value)}`);
   return pairs.join(" | ");
+}
+
+function asArray(value: unknown) {
+  return Array.isArray(value) ? value : [];
+}
+
+function mapFactiivTrades(record: FactiivApiRecord) {
+  return asArray((record as { trades?: unknown[] }).trades).map((trade) => {
+    const row = trade as FactiivApiRecord;
+    const amount = asNumber(getNestedRecordValue(row, ["amount", "highcreditlimit", "high_credit_limit"]));
+    const balance = asNumber(getNestedRecordValue(row, ["balance", "currentbalance", "current_balance"]));
+    return {
+      tradeId: asText(getNestedRecordValue(row, ["id", "tradeid"])),
+      tradeName: asText(getNestedRecordValue(row, ["name", "trade_name", "typedesc", "relationdescription"])) || "Trade",
+      tradeType: asText(getNestedRecordValue(row, ["typedesc", "type", "trade_type"])),
+      relation: asText(getNestedRecordValue(row, ["relationdescription", "relation"])),
+      amount,
+      balance,
+      tradeStatus: asText(getNestedRecordValue(row, ["tradestatus", "status"])),
+      adminStatus: asText(getNestedRecordValue(row, ["adminstatus", "admin_status"])),
+      fromCompanyName: asText(getNestedRecordValue(row, ["fromcompanyname", "from_company_name"])),
+      toCompanyName: asText(getNestedRecordValue(row, ["tocompanyname", "to_company_name"])),
+      lastActivity: asText(getNestedRecordValue(row, ["lastactivity", "updatedat", "createdat"])),
+      utilizationPercent: amount > 0 ? Math.round((balance / amount) * 10000) / 100 : 0,
+    };
+  });
+}
+
+function mapFactiivActivities(record: FactiivApiRecord) {
+  const rows = asArray((record as { activities?: unknown[]; activityHistory?: unknown[] }).activities)
+    .concat(asArray((record as { activityHistory?: unknown[] }).activityHistory));
+  return rows.map((activity) => {
+    const row = activity as FactiivApiRecord;
+    const daysLate = asNumber(getNestedRecordValue(row, ["dayslate", "days_late"]));
+    return {
+      activityDate: asText(getNestedRecordValue(row, ["activitydate", "date", "createdat", "paymentdate"])),
+      activityType: asText(getNestedRecordValue(row, ["activitytype", "type"])),
+      paymentAmount: asNumber(getNestedRecordValue(row, ["paymentamount", "payment_amount"])),
+      chargeAmount: asNumber(getNestedRecordValue(row, ["chargeamount", "charge_amount"])),
+      interest: asNumber(getNestedRecordValue(row, ["interest", "interestamount", "interest_amount"])),
+      daysLate,
+      paymentStatus: daysLate > 0 ? "late" : "on_time",
+    };
+  });
 }
 
 function buildSearchQueries(customer: Partial<CustomerDocument>) {
@@ -137,8 +196,9 @@ function scoreMatch(customer: Partial<CustomerDocument>, record: FactiivApiRecor
 
 function mapFactiivRecord(record: FactiivApiRecord, query: string, matchReason: string, confidence: string): CustomerFactiivProfile {
   return {
+    profileId: asText(getNestedRecordValue(record, ["profileid", "id", "accountid", "publicaccountid"])),
     factiivProfileId: asText(getNestedRecordValue(record, ["id", "profileid", "accountid", "publicaccountid"])),
-    factiivScore: asNumber(getNestedRecordValue(record, ["factivscore"])),
+    factiivScore: asNumber(getNestedRecordValue(record, ["factiivscore", "factivscore"])),
     reputationScore: asNumber(getNestedRecordValue(record, ["reputationscore"])),
     historyScore: asNumber(getNestedRecordValue(record, ["historyscore"])),
     utilizationScore: asNumber(getNestedRecordValue(record, ["utilizationscore"])),
@@ -153,12 +213,52 @@ function mapFactiivRecord(record: FactiivApiRecord, query: string, matchReason: 
     matchedUsername: asText(getNestedRecordValue(record, ["matchedusername", "username", "user_name", "ownername"])),
     factiivMatched: true,
     factiivMatchConfidence: confidence,
+    matchedBy: "auto",
+    autoPersisted: false,
+    autoPersistReason: "",
     factiivSearchQuery: query,
     factiivMatchReason: matchReason,
     lastFactiivSync: new Date().toISOString(),
+    manualAttachedBy: "",
+    manualAttachedAt: "",
+    trades: mapFactiivTrades(record),
+    activities: mapFactiivActivities(record),
     source: "factiv_public_accounts",
     rawSummary: summarizeRecord(record),
   };
+}
+
+export function shouldAutoPersistFactiiv(profile: CustomerFactiivProfile) {
+  return profile.factiivMatchConfidence === "high" || profile.factiivMatchReason.split(",").includes("email_exact");
+}
+
+export async function searchFactiivProfiles(query: string, customer?: Partial<CustomerDocument>): Promise<FactiivSearchResult[]> {
+  const trimmedQuery = query.trim();
+  if (!trimmedQuery) return [];
+  const records = extractRecords(await fetchFactiivAccounts(trimmedQuery, 20));
+  return records.map((record) => {
+    const match = customer ? scoreMatch(customer, record, trimmedQuery) : { score: 0, reasons: [] as string[] };
+    const confidence = match.score >= 90 ? "high" : match.score >= 55 ? "medium" : match.score > 0 ? "low" : "";
+    const selectedProfileData = mapFactiivRecord(record, trimmedQuery, match.reasons.join(",") || "manual_search_result", confidence || "manual");
+    return {
+      profileId: selectedProfileData.factiivProfileId,
+      businessName: selectedProfileData.matchedBusinessName,
+      email: selectedProfileData.matchedEmail,
+      username: selectedProfileData.matchedUsername,
+      factiivScore: selectedProfileData.factiivScore,
+      tradeQuantity: selectedProfileData.tradeQuantity,
+      tradeAmountTotal: selectedProfileData.tradeAmountTotal,
+      tradeBalanceTotal: selectedProfileData.tradeBalanceTotal,
+      rawSummary: selectedProfileData.rawSummary,
+      matchConfidence: confidence || "none",
+      matchReason: selectedProfileData.factiivMatchReason || "manual_search_result",
+      selectedProfileData,
+    };
+  }).sort((a, b) =>
+    (b.matchConfidence === "high" ? 3 : b.matchConfidence === "medium" ? 2 : b.matchConfidence === "low" ? 1 : 0)
+    - (a.matchConfidence === "high" ? 3 : a.matchConfidence === "medium" ? 2 : a.matchConfidence === "low" ? 1 : 0)
+    || b.factiivScore - a.factiivScore
+  );
 }
 
 export async function syncFactiivProfile(customer: Partial<CustomerDocument>): Promise<FactiivSyncResult> {
@@ -167,6 +267,7 @@ export async function syncFactiivProfile(customer: Partial<CustomerDocument>): P
   if (!queries.length) {
     return {
       profile: {
+        profileId: "",
         factiivProfileId: "",
         factiivScore: 0,
         reputationScore: 0,
@@ -183,9 +284,16 @@ export async function syncFactiivProfile(customer: Partial<CustomerDocument>): P
         matchedUsername: "",
         factiivMatched: false,
         factiivMatchConfidence: "",
+        matchedBy: "",
+        autoPersisted: false,
+        autoPersistReason: "",
         factiivSearchQuery: "",
         factiivMatchReason: "no_search_query",
         lastFactiivSync: new Date().toISOString(),
+        manualAttachedBy: "",
+        manualAttachedAt: "",
+        trades: [],
+        activities: [],
         source: "factiv_public_accounts",
         rawSummary: "",
       },
@@ -213,6 +321,7 @@ export async function syncFactiivProfile(customer: Partial<CustomerDocument>): P
 
   return {
     profile: bestProfile ?? {
+      profileId: "",
       factiivProfileId: "",
       factiivScore: 0,
       reputationScore: 0,
@@ -229,9 +338,16 @@ export async function syncFactiivProfile(customer: Partial<CustomerDocument>): P
       matchedUsername: "",
       factiivMatched: false,
       factiivMatchConfidence: "",
+      matchedBy: "",
+      autoPersisted: false,
+      autoPersistReason: "",
       factiivSearchQuery: queries[0] || "",
       factiivMatchReason: bestScore < 20 ? "no_confident_match" : "no_match",
       lastFactiivSync: new Date().toISOString(),
+      manualAttachedBy: "",
+      manualAttachedAt: "",
+      trades: [],
+      activities: [],
       source: "factiv_public_accounts",
       rawSummary: "",
     },
