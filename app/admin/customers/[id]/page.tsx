@@ -6,6 +6,7 @@ import { Fragment, type ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AdminHeader } from "@/app/admin/_components/AdminHeader";
 import { AdminLayout, AdminLoadingState } from "@/app/admin/_components/AdminLayout";
+import { resolveCustomerStateCode } from "@/lib/customerState";
 
 type OrderLineItem = {
   productId: number;
@@ -127,6 +128,11 @@ type SourceCoverage = {
   selectedEinKey?: string;
   factiivSearchQuery?: string;
   factiivMatchReason?: string;
+  lastFactiivSearchQueries?: string[];
+  lastFactiivSearchResultsCount?: number;
+  lastFactiivMatchReason?: string;
+  manualAttachedBy?: string;
+  manualAttachedAt?: string;
   enrichmentSources?: string[];
   socialProfilesFound?: number;
   publicBusinessDataFound?: boolean;
@@ -283,6 +289,7 @@ type CreditProfile = {
 };
 
 type FactiivProfile = {
+  profileId?: string;
   factiivProfileId?: string;
   factiivScore?: number;
   reputationScore?: number;
@@ -299,9 +306,52 @@ type FactiivProfile = {
   matchedUsername?: string;
   factiivMatched?: boolean;
   factiivMatchConfidence?: string;
+  matchedBy?: string;
+  autoPersisted?: boolean;
+  autoPersistReason?: string;
   factiivSearchQuery?: string;
   factiivMatchReason?: string;
   lastFactiivSync?: string;
+  manualAttachedBy?: string;
+  manualAttachedAt?: string;
+  trades?: Array<{
+    tradeId?: string;
+    tradeName?: string;
+    tradeType?: string;
+    relation?: string;
+    amount?: number;
+    balance?: number;
+    tradeStatus?: string;
+    adminStatus?: string;
+    fromCompanyName?: string;
+    toCompanyName?: string;
+    lastActivity?: string;
+    utilizationPercent?: number;
+  }>;
+  activities?: Array<{
+    activityDate?: string;
+    activityType?: string;
+    paymentAmount?: number;
+    chargeAmount?: number;
+    interest?: number;
+    daysLate?: number;
+    paymentStatus?: string;
+  }>;
+};
+
+type FactiivSearchRow = {
+  profileId: string;
+  businessName: string;
+  email: string;
+  username: string;
+  factiivScore: number;
+  tradeQuantity: number;
+  tradeAmountTotal: number;
+  tradeBalanceTotal: number;
+  rawSummary: string;
+  matchConfidence: string;
+  matchReason: string;
+  selectedProfileData: FactiivProfile;
 };
 
 type PublicEnrichment = {
@@ -584,8 +634,65 @@ export default function CustomerDetailPage() {
   const [subscriptions, setSubscriptions] = useState<Array<Record<string, string | number>>>([]);
   const [sourceCompare, setSourceCompare] = useState<SourceCompare | null>(null);
   const [expandedPaymentRow, setExpandedPaymentRow] = useState<string | null>(null);
+  const [factiivSearchMode, setFactiivSearchMode] = useState<"email" | "business" | "name" | "ein" | "custom">("email");
+  const [factiivCustomQuery, setFactiivCustomQuery] = useState("");
+  const [factiivResults, setFactiivResults] = useState<FactiivSearchRow[]>([]);
+  const [isFactiivSearching, setIsFactiivSearching] = useState(false);
+  const [attachingProfileId, setAttachingProfileId] = useState("");
   const activeController = useRef<AbortController | null>(null);
   const requestSequence = useRef(0);
+  const factiivAutoSearchKey = useRef("");
+
+  const mergeCustomerWithAttachedFactiiv = useCallback((
+    current: CustomerDetail | null,
+    attachedProfile?: FactiivProfile | null,
+    fundingIntelligence?: { fundingReadinessScore?: number; fundingReadinessTier?: string } | null
+  ) => {
+    if (!current) return current;
+    if (!attachedProfile?.factiivMatched) return current;
+    return {
+      ...current,
+      factiivProfile: attachedProfile,
+      businessProfile: {
+        ...(current.businessProfile ?? {}),
+        fundingReadinessScore: Number(
+          fundingIntelligence?.fundingReadinessScore
+          ?? current.businessProfile?.fundingReadinessScore
+          ?? 0
+        ),
+        fundingReadinessTier: String(
+          fundingIntelligence?.fundingReadinessTier
+          ?? current.businessProfile?.fundingReadinessTier
+          ?? ""
+        ),
+      },
+    };
+  }, []);
+
+  const refreshCustomerSnapshot = useCallback(async (
+    attachedProfile?: FactiivProfile | null,
+    fundingIntelligence?: { fundingReadinessScore?: number; fundingReadinessTier?: string } | null
+  ) => {
+    const safeId = encodeURIComponent(decodeURIComponent(params.id));
+    const response = await fetch(`/api/customers/${safeId}`, { cache: "no-store" });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Customer not found.");
+    const freshCustomer = data.customer as CustomerDetail;
+    const refetchProfileMatched = Boolean(freshCustomer?.factiivProfile?.factiivMatched);
+    const attachedProfileReceived = Boolean(attachedProfile?.factiivMatched);
+    const usingLocalAttachedProfileFallback = !refetchProfileMatched && attachedProfileReceived;
+    if (typeof window !== "undefined") {
+      console.debug("[factiv-ui]", {
+        attachedProfileReceived,
+        refetchProfileMatched,
+        usingLocalAttachedProfileFallback,
+      });
+    }
+    const nextCustomer = usingLocalAttachedProfileFallback
+      ? mergeCustomerWithAttachedFactiiv(freshCustomer, attachedProfile, fundingIntelligence)
+      : freshCustomer;
+    setCustomer(nextCustomer);
+  }, [mergeCustomerWithAttachedFactiiv, params.id]);
 
   const loadCustomer = useCallback(async () => {
     activeController.current?.abort();
@@ -698,6 +805,78 @@ export default function CustomerDetailPage() {
     }
   };
 
+  const runFactiivSearch = useCallback(async () => {
+    if (!customer) return;
+    setIsFactiivSearching(true);
+    try {
+      const response = await fetch("/api/factiv/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          customerId: customer._id,
+          mode: factiivSearchMode,
+          email: customer.email,
+          businessName: customer.businessProfile?.company || customer.name || "",
+          customerName: customer.name,
+          ein: customer.businessProfile?.ein || "",
+          customQuery: factiivCustomQuery,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Factiiv search failed.");
+      setFactiivResults(data.results ?? []);
+      if (data.autoPersisted) {
+        const attachedProfile = (data.attachedProfile ?? null) as FactiivProfile | null;
+        const fundingIntelligence = data.fundingIntelligence ?? null;
+        setCustomer((current) => mergeCustomerWithAttachedFactiiv(current, attachedProfile, fundingIntelligence));
+        setMessage("Factiiv profile attached.");
+        await refreshCustomerSnapshot(attachedProfile, fundingIntelligence);
+        return;
+      }
+      setMessage(`Factiiv search returned ${Number(data.resultsCount ?? 0)} results.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Factiiv search failed.");
+      setFactiivResults([]);
+    } finally {
+      setIsFactiivSearching(false);
+    }
+  }, [customer, factiivCustomQuery, factiivSearchMode, mergeCustomerWithAttachedFactiiv, refreshCustomerSnapshot]);
+
+  useEffect(() => {
+    if (!customer?._id || !customer.email || customer.factiivProfile?.factiivMatched || isFactiivSearching) return;
+    const key = `${customer._id}:${customer.email}`;
+    if (factiivAutoSearchKey.current === key) return;
+    factiivAutoSearchKey.current = key;
+    void runFactiivSearch();
+  }, [customer?._id, customer?.email, customer?.factiivProfile?.factiivMatched, isFactiivSearching, runFactiivSearch]);
+
+  const attachFactiivProfile = useCallback(async (result: FactiivSearchRow) => {
+    if (!customer) return;
+    setAttachingProfileId(result.profileId);
+    try {
+      const response = await fetch("/api/factiv/attach-profile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          customerId: customer._id,
+          profileId: result.profileId,
+          selectedProfileData: result.selectedProfileData,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Factiiv attach failed.");
+      const attachedProfile = (data.factiivProfile ?? result.selectedProfileData) as FactiivProfile;
+      const fundingIntelligence = data.fundingIntelligence ?? null;
+      setCustomer((current) => mergeCustomerWithAttachedFactiiv(current, attachedProfile, fundingIntelligence));
+      setMessage("Factiiv profile attached.");
+      await refreshCustomerSnapshot(attachedProfile, fundingIntelligence);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Factiiv attach failed.");
+    } finally {
+      setAttachingProfileId("");
+    }
+  }, [customer, mergeCustomerWithAttachedFactiiv, refreshCustomerSnapshot]);
+
   if (isLoading) return <CustomerLoadingState />;
   if (loadError || !customer) return <CustomerErrorState onRetry={loadCustomer} />;
 
@@ -724,6 +903,7 @@ export default function CustomerDetailPage() {
   const factiiv = customer.factiivProfile ?? {};
   const enrichment = customer.publicEnrichment ?? {};
   const latestOrderWithBilling = orders.find((order) => order.billingCompany || order.billingPhone || order.billingAddress?.address1 || order.billingEmail) ?? orders[0];
+  const businessStateCode = resolveCustomerStateCode(customer);
   const businessInfo = {
     businessName: profile.company || latestOrderWithBilling?.billingCompany || customer.name || "-",
     dba: profile.dba || "-",
@@ -733,7 +913,7 @@ export default function CustomerDetailPage() {
     billingAddress: [profile.address1 || latestOrderWithBilling?.billingAddress?.address1, profile.address2 || latestOrderWithBilling?.billingAddress?.address2].filter(Boolean).join(", ") || "-",
     shippingAddress: [profile.shippingAddress1, profile.shippingAddress2].filter(Boolean).join(", ") || "-",
     city: profile.city || latestOrderWithBilling?.billingAddress?.city || "-",
-    state: profile.state || latestOrderWithBilling?.billingAddress?.state || "-",
+    state: businessStateCode || profile.state || latestOrderWithBilling?.billingAddress?.state || "-",
     zip: profile.zip || latestOrderWithBilling?.billingAddress?.postcode || "-",
     country: profile.country || latestOrderWithBilling?.billingAddress?.country || "-",
     website: profile.website || enrichment.publicBusinessWebsite || enrichment.websiteDomain || "-",
@@ -834,6 +1014,10 @@ export default function CustomerDetailPage() {
   const paymentActivity = actualPaid > 0
     ? `${displayedPaidOrderCount} paid records, ${customer.attemptedOrderCount ?? 0} attempted`
     : `${customer.attemptedOrderCount ?? 0} attempted records`;
+  const factiivTrades = factiiv.trades ?? [];
+  const factiivActivities = factiiv.activities ?? [];
+  const factiivScoreDisplay = factiiv.factiivMatched ? Number(factiiv.factiivScore ?? 0) : null;
+  const factiivUtilizationDisplay = factiiv.factiivMatched ? `${(Number(factiiv.utilizationScore ?? 0) * 100).toFixed(1)}%` : "—";
   const fundingInsight = (() => {
     if (Number(customer.score ?? 0) >= 75 && actualPaid >= 5000) return "Strong payment history with funding-ready revenue signals.";
     if (Number(customer.score ?? 0) >= 65) return "Usable revenue profile. Verify remaining credit and business metadata before underwriting.";
@@ -876,6 +1060,11 @@ export default function CustomerDetailPage() {
     ["EIN source", customer.sourceCoverage?.einSource || "-"],
     ["Factiiv search query", customer.sourceCoverage?.factiivSearchQuery || factiiv.factiivSearchQuery || "-"],
     ["Factiiv match reason", customer.sourceCoverage?.factiivMatchReason || factiiv.factiivMatchReason || "-"],
+    ["Last Factiiv search queries", (customer.sourceCoverage?.lastFactiivSearchQueries ?? []).join(", ") || "-"],
+    ["Last Factiiv results count", customer.sourceCoverage?.lastFactiivSearchResultsCount ?? "-"],
+    ["Last Factiiv match reason", customer.sourceCoverage?.lastFactiivMatchReason || "-"],
+    ["Manual attached by", customer.sourceCoverage?.manualAttachedBy || factiiv.manualAttachedBy || "-"],
+    ["Manual attached at", displayDateTime(customer.sourceCoverage?.manualAttachedAt || factiiv.manualAttachedAt)],
     ["Enrichment sources", (customer.sourceCoverage?.enrichmentSources ?? enrichment.enrichmentSources ?? []).join(", ") || "-"],
     ["Social profiles found", customer.sourceCoverage?.socialProfilesFound ?? enrichment.socialProfilesFound ?? 0],
     ["Public business data found", (customer.sourceCoverage?.publicBusinessDataFound ?? enrichment.publicBusinessDataFound) ? "yes" : "no"],
@@ -932,13 +1121,47 @@ export default function CustomerDetailPage() {
 
       <section className="rounded-xl border border-sky-900/70 bg-sky-950/25 p-4">
         <h2 className="text-xl font-semibold text-sky-200">Factiiv Funding Intelligence</h2>
+        {!factiiv.factiivMatched ? <p className="mt-3 rounded border border-sky-900/60 bg-zinc-950/70 p-3 text-sm text-zinc-300">No Factiiv profile auto-matched. Use manual search below.</p> : null}
+        {factiiv.factiivMatched ? <div className="mt-3 grid gap-3 lg:grid-cols-[220px_1fr]">
+          <div className="rounded border border-sky-900/60 bg-zinc-950/80 p-4">
+            <p className="text-xs font-semibold uppercase text-sky-200/80">Factiiv Score</p>
+            <div className="mt-3 flex items-end gap-2">
+              <span className="text-4xl font-bold text-zinc-100">{factiivScoreDisplay ?? "—"}</span>
+              <span className={`rounded border px-2 py-1 text-xs font-semibold ${factiiv.factiivMatchConfidence === "high" ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-200" : factiiv.factiivMatchConfidence === "medium" ? "border-amber-500/50 bg-amber-500/15 text-amber-100" : "border-red-500/50 bg-red-500/15 text-red-200"}`}>{displayStatus(factiiv.factiivMatchConfidence) || "-"}</span>
+            </div>
+            <div className="mt-4 h-2 overflow-hidden rounded bg-zinc-800">
+              <div className="h-full rounded bg-sky-500" style={{ width: `${Math.max(0, Math.min(100, Number(factiiv.factiivScore ?? 0) / 10))}%` }} />
+            </div>
+            <div className="mt-4 space-y-2 text-sm text-zinc-300">
+              <p><span className="text-zinc-500">Matched Business:</span> {factiiv.matchedBusinessName || "—"}</p>
+              <p><span className="text-zinc-500">Matched Email:</span> {factiiv.matchedEmail || "—"}</p>
+              <p><span className="text-zinc-500">Matched Username / Owner:</span> {factiiv.matchedUsername || "—"}</p>
+              <p><span className="text-zinc-500">Last Factiiv Sync:</span> {displayDateTime(factiiv.lastFactiivSync)}</p>
+            </div>
+          </div>
+          <div className="grid gap-3 md:grid-cols-3">
+            {[
+              ["Reputation Score", String(Number(factiiv.reputationScore ?? 0))],
+              ["History Score", String(Number(factiiv.historyScore ?? 0))],
+              ["Utilization Score", factiivUtilizationDisplay],
+              ["Activity Quantity", String(Number(factiiv.activityQuantity ?? 0))],
+              ["Payment Activity Total", money(Number(factiiv.activityPaymentAmountTotal ?? 0))],
+              ["Last Known Balance", money(Number(factiiv.activityLastKnownBalanceTotal ?? 0))],
+              ["Matched By", displayStatus(factiiv.matchedBy) || "-"],
+              ["Auto Persist", factiiv.autoPersisted ? `yes (${factiiv.autoPersistReason || "high confidence"})` : "no"],
+            ].map(([label, value]) => <div key={label} className="rounded border border-sky-900/60 bg-zinc-950/80 p-3">
+              <p className="text-xs font-semibold uppercase text-sky-200/80">{label}</p>
+              <p className="mt-2 text-sm font-semibold text-zinc-100">{String(value)}</p>
+            </div>)}
+          </div>
+        </div> : null}
         <div className="mt-3 grid gap-3 md:grid-cols-4">
           {[
-            ["Factiiv Score", factiiv.factiivMatched ? String(Number(factiiv.factiivScore ?? profile.fundingReadinessScore ?? 0)) : "Not verified"],
+            ["Factiiv Score", factiiv.factiivMatched ? String(Number(factiiv.factiivScore ?? profile.fundingReadinessScore ?? 0)) : "Not matched"],
             ["Funding Tier", fundingTierDisplay],
-            ["Trade Lines", factiiv.factiivMatched ? String(factiiv.tradeQuantity ?? 0) : "Not verified"],
-            ["Total Trade Amount", factiiv.factiivMatched ? money(Number(factiiv.tradeAmountTotal ?? 0)) : "Not verified"],
-            ["Outstanding Balance", factiiv.factiivMatched ? money(Number(factiiv.tradeBalanceTotal ?? factiiv.activityLastKnownBalanceTotal ?? 0)) : "Not verified"],
+            ["Trade Lines", factiiv.factiivMatched ? String(factiiv.tradeQuantity ?? 0) : "Not matched"],
+            ["Total Trade Amount", factiiv.factiivMatched ? money(Number(factiiv.tradeAmountTotal ?? 0)) : "Not matched"],
+            ["Outstanding Balance", factiiv.factiivMatched ? money(Number(factiiv.tradeBalanceTotal ?? factiiv.activityLastKnownBalanceTotal ?? 0)) : "Not matched"],
             ["Payment Activity", factiiv.factiivMatched ? `${Number(factiiv.activityQuantity ?? 0)} activities / ${money(Number(factiiv.activityPaymentAmountTotal ?? 0))}` : paymentActivity],
             ["Risk", customer.riskLevel],
             ["Verified Credit Limit", creditMetaVerified ? money(approvedCredits) : "Not verified"],
@@ -949,9 +1172,128 @@ export default function CustomerDetailPage() {
             <p className="mt-2 text-sm font-semibold text-zinc-100">{String(value)}</p>
           </div>)}
         </div>
+        {factiivTrades.length > 0 ? <div className="mt-4 rounded border border-sky-900/60 bg-zinc-950/70 p-4">
+          <p className="text-xs font-semibold uppercase text-sky-200/80">Factiiv Trades</p>
+          <div className="mt-3 grid gap-3 lg:grid-cols-2">
+            {factiivTrades.map((trade, index) => <div key={`${trade.tradeId || trade.tradeName || "trade"}-${index}`} className="rounded border border-zinc-800 bg-zinc-950/80 p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="font-semibold text-zinc-100">{trade.tradeName || trade.tradeType || "Trade"}</p>
+                  <p className="mt-1 text-xs text-zinc-400">{trade.relation || trade.tradeType || "-"}</p>
+                </div>
+                <span className={`rounded border px-2 py-1 text-xs font-semibold ${/verify|active|open|on[_ -]?time/i.test(String(trade.tradeStatus || trade.adminStatus)) ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-200" : /late|risk|hold|review/i.test(String(trade.tradeStatus || trade.adminStatus)) ? "border-amber-500/50 bg-amber-500/15 text-amber-100" : "border-red-500/50 bg-red-500/15 text-red-200"}`}>{displayStatus(trade.tradeStatus || trade.adminStatus) || "-"}</span>
+              </div>
+              <div className="mt-3 grid gap-2 sm:grid-cols-2 text-sm text-zinc-300">
+                <p><span className="text-zinc-500">Amount:</span> {money(Number(trade.amount ?? 0))}</p>
+                <p><span className="text-zinc-500">Balance:</span> {money(Number(trade.balance ?? 0))}</p>
+                <p><span className="text-zinc-500">From:</span> {trade.fromCompanyName || "-"}</p>
+                <p><span className="text-zinc-500">To:</span> {trade.toCompanyName || "-"}</p>
+                <p><span className="text-zinc-500">Last Activity:</span> {displayDateTime(trade.lastActivity)}</p>
+                <p><span className="text-zinc-500">Utilization:</span> {Number(trade.utilizationPercent ?? 0).toFixed(1)}%</p>
+              </div>
+            </div>)}
+          </div>
+        </div> : null}
+        {factiivActivities.length > 0 ? <div className="mt-4 rounded border border-sky-900/60 bg-zinc-950/70 p-4">
+          <p className="text-xs font-semibold uppercase text-sky-200/80">Factiiv Activity / Payment History</p>
+          <div className="mt-3 overflow-x-auto rounded border border-zinc-800">
+            <table className="min-w-[900px] text-sm">
+              <thead className="bg-zinc-950">
+                <tr>{["Date", "Type", "Payment Amount", "Charge Amount", "Interest", "Days Late", "Status"].map((header) => <th key={header} className="px-3 py-2 text-left text-xs uppercase text-zinc-400">{header}</th>)}</tr>
+              </thead>
+              <tbody>
+                {factiivActivities.map((activity, index) => <tr key={`${activity.activityDate || "activity"}-${index}`} className="border-t border-zinc-800">
+                  <td className="px-3 py-3">{displayDateTime(activity.activityDate)}</td>
+                  <td className="px-3 py-3">{displayStatus(activity.activityType) || "-"}</td>
+                  <td className="px-3 py-3">{money(Number(activity.paymentAmount ?? 0))}</td>
+                  <td className="px-3 py-3">{money(Number(activity.chargeAmount ?? 0))}</td>
+                  <td className="px-3 py-3">{money(Number(activity.interest ?? 0))}</td>
+                  <td className="px-3 py-3">{Number(activity.daysLate ?? 0)}</td>
+                  <td className="px-3 py-3"><span className={`rounded border px-2 py-1 text-xs font-semibold ${String(activity.paymentStatus ?? "") === "on_time" ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-200" : String(activity.paymentStatus ?? "") === "late" ? "border-red-500/50 bg-red-500/15 text-red-200" : "border-zinc-600 bg-zinc-800 text-zinc-200"}`}>{displayStatus(activity.paymentStatus) || "-"}</span></td>
+                </tr>)}
+              </tbody>
+            </table>
+          </div>
+        </div> : null}
         <div className="mt-4 rounded border border-sky-900/60 bg-zinc-950/70 p-4">
           <p className="text-xs font-semibold uppercase text-sky-200/80">AI Funding Insight</p>
           <p className="mt-2 text-sm text-zinc-100">{fundingInsight}</p>
+        </div>
+        <div className="mt-4 rounded border border-sky-900/60 bg-zinc-950/70 p-4">
+          <div className="flex flex-wrap items-center gap-3">
+            {([
+              ["email", "Search by Email"],
+              ["business", "Search by Business Name"],
+              ["name", "Search by Customer Name"],
+              ["ein", "Search by EIN"],
+              ["custom", "Custom search input"],
+            ] as const).map(([value, label]) => (
+              <button
+                key={value}
+                onClick={() => setFactiivSearchMode(value)}
+                className={`rounded border px-3 py-2 text-sm font-semibold ${factiivSearchMode === value ? "border-sky-400 bg-sky-500/20 text-sky-100" : "border-zinc-700 bg-zinc-900 text-zinc-200 hover:bg-zinc-800"}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="mt-4 flex flex-col gap-3 md:flex-row">
+            <input
+              value={
+                factiivSearchMode === "custom" ? factiivCustomQuery
+                  : factiivSearchMode === "email" ? customer.email
+                    : factiivSearchMode === "business" ? (profile.company || businessInfo.businessName)
+                      : factiivSearchMode === "name" ? customer.name
+                        : (profile.ein || "")
+              }
+              onChange={(event) => {
+                if (factiivSearchMode === "custom") setFactiivCustomQuery(event.target.value);
+              }}
+              readOnly={factiivSearchMode !== "custom"}
+              placeholder="Enter custom Factiiv search"
+              className="flex-1 rounded border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-sky-500"
+            />
+            <button
+              onClick={runFactiivSearch}
+              disabled={isFactiivSearching}
+              className="rounded bg-sky-700 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-600 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isFactiivSearching ? "Searching..." : "Search Factiiv"}
+            </button>
+          </div>
+          <div className="mt-4 overflow-x-auto rounded border border-zinc-800">
+            <table className="min-w-[980px] text-sm">
+              <thead className="bg-zinc-950">
+                <tr>{["Business Name", "Email", "Username / Owner", "Factiiv Score", "Trade Lines", "Trade Amount", "Balance", "Match Confidence", "Action"].map((header) => (
+                  <th key={header} className="px-3 py-2 text-left text-xs uppercase text-zinc-400">{header}</th>
+                ))}</tr>
+              </thead>
+              <tbody>
+                {factiivResults.map((result) => (
+                  <tr key={result.profileId} className="border-t border-zinc-800">
+                    <td className="px-3 py-3 font-semibold text-zinc-100">{result.businessName || "-"}</td>
+                    <td className="px-3 py-3">{result.email || "-"}</td>
+                    <td className="px-3 py-3">{result.username || "-"}</td>
+                    <td className="px-3 py-3">{result.factiivScore || "-"}</td>
+                    <td className="px-3 py-3">{result.tradeQuantity || "-"}</td>
+                    <td className="px-3 py-3">{money(result.tradeAmountTotal)}</td>
+                    <td className="px-3 py-3">{money(result.tradeBalanceTotal)}</td>
+                    <td className="px-3 py-3">{displayStatus(result.matchConfidence) || "-"}</td>
+                    <td className="px-3 py-3">
+                      <button
+                        onClick={() => attachFactiivProfile(result)}
+                        disabled={attachingProfileId === result.profileId}
+                        className="rounded bg-emerald-700 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {attachingProfileId === result.profileId ? "Attaching..." : "Attach Profile"}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {factiivResults.length === 0 ? <p className="p-3 text-zinc-400">No Factiiv search results loaded yet.</p> : null}
+          </div>
         </div>
       </section>
 
@@ -989,6 +1331,7 @@ export default function CustomerDetailPage() {
             ["Shipping Address", businessInfo.shippingAddress],
             ["City", businessInfo.city],
             ["State", businessInfo.state],
+            ["State Code", businessStateCode || "-"],
             ["ZIP", businessInfo.zip],
             ["Country", businessInfo.country],
             ["Website", businessInfo.website],

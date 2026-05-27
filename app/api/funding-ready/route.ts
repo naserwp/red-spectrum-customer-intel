@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { connectToDatabase } from "@/lib/mongodb";
+import { normalizeStateCode, resolveCustomerStateCode, uniqueStateCodes } from "@/lib/customerState";
 import { computeFundingIntelligence } from "@/lib/fundingIntelligence";
 import { Customer, type CustomerBusinessProfile, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking, type CustomerRankingDocument } from "@/models/CustomerRanking";
@@ -108,6 +109,7 @@ export async function GET(request: Request) {
   const minSpent = Math.max(0, Number(searchParams.get("minSpent") ?? 0));
   const tier = searchParams.get("tier") ?? "";
   const readiness = searchParams.get("readiness") ?? "";
+  const state = normalizeStateCode(searchParams.get("state"));
   const page = Math.max(1, Number(searchParams.get("page") ?? 1));
   const limit = Math.min(100, Math.max(1, Number(searchParams.get("limit") ?? 50)));
   const q = (searchParams.get("q") ?? "").trim().toLowerCase();
@@ -118,6 +120,7 @@ export async function GET(request: Request) {
       lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, attemptedTotal: 1, paidMonths: 1, paidOrderCount: 1,
       activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, recurringNextEstimatedPayment: 1, riskLevel: 1, failedPayments: 1,
       chargebacks: 1, tier: 1, score: 1, lastPaidDate: 1, firstPaidDate: 1, paidProducts: 1, baseProductsPurchased: 1, creditProfile: 1, factiivProfile: 1, publicEnrichment: 1,
+      billingState: 1, shippingState: 1, address: 1, billing: 1, shipping: 1,
     }).sort({ lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1 }).limit(1000).lean<LeanCustomer[]>(),
     CustomerRanking.find({}).sort({ lifetimeSpent: -1 }).limit(1000).lean<CustomerRankingDocument[]>(),
   ]);
@@ -137,6 +140,7 @@ export async function GET(request: Request) {
       email: customer.email,
       phone: customer.phone,
       company: customer.businessProfile?.company || "",
+      stateCode: resolveCustomerStateCode(customer),
       industry: industry.industry,
       industryClassification: industry.classification,
       naicsCode: industry.naicsCode,
@@ -169,7 +173,9 @@ export async function GET(request: Request) {
   }).filter((row) => row.lifetimeSpent >= minSpent)
     .filter((row) => !tier || row.vipTier === tier)
     .filter((row) => !readiness || row.fundingReadinessTier === readiness)
+    .filter((row) => !state || row.stateCode === state)
     .sort((a, b) => b.fundingReadinessScore - a.fundingReadinessScore || b.lifetimeSpent - a.lifetimeSpent);
+  const stateOptions = uniqueStateCodes(customers.map((customer) => ({ stateCode: resolveCustomerStateCode(customer) })));
   const start = (page - 1) * limit;
   const summary = {
     totalCandidates: rows.length,
@@ -184,6 +190,8 @@ export async function GET(request: Request) {
     total: rows.length,
     rows: rows.slice(start, start + limit),
     summary,
+    state,
+    stateOptions,
     totalMs: Date.now() - started,
   });
 }

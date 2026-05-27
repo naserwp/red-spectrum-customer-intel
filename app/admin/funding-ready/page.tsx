@@ -11,6 +11,7 @@ type FundingRow = {
   email: string;
   phone: string;
   company: string;
+  stateCode?: string;
   industry: string;
   industryClassification: string;
   naicsCode: string;
@@ -35,6 +36,7 @@ type FundingRow = {
 
 type FundingResponse = {
   rows: FundingRow[];
+  stateOptions?: string[];
   total: number;
   page: number;
   limit: number;
@@ -66,6 +68,8 @@ export default function FundingReadyPage() {
   const [query, setQuery] = useState("");
   const [minSpent, setMinSpent] = useState("2000");
   const [readiness, setReadiness] = useState("");
+  const [stateFilter, setStateFilter] = useState("");
+  const [stateOptions, setStateOptions] = useState<string[]>([]);
 
   const load = useCallback(async () => {
     setIsLoading(true);
@@ -73,18 +77,20 @@ export default function FundingReadyPage() {
     const params = new URLSearchParams({ limit: "100", minSpent });
     if (query.trim()) params.set("q", query.trim());
     if (readiness) params.set("readiness", readiness);
+    if (stateFilter) params.set("state", stateFilter);
     try {
       const response = await fetch(`/api/funding-ready?${params.toString()}`, { cache: "no-store" });
       const data = await response.json() as FundingResponse & { error?: string };
       if (!response.ok) throw new Error(data.error || "Funding readiness request failed.");
       setRows(data.rows ?? []);
+      setStateOptions(data.stateOptions ?? []);
       setSummary(data.summary ?? null);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Unable to load funding readiness data.");
     } finally {
       setIsLoading(false);
     }
-  }, [minSpent, query, readiness]);
+  }, [minSpent, query, readiness, stateFilter]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -139,6 +145,13 @@ export default function FundingReadyPage() {
             <option value="Not Ready">Not Ready</option>
           </select>
         </label>
+        <label className="space-y-1 text-sm text-zinc-300">
+          <span className="block text-xs uppercase text-zinc-500">State</span>
+          <select value={stateFilter} onChange={(event) => setStateFilter(event.target.value)} className="rounded bg-zinc-950 px-3 py-2 ring-1 ring-zinc-800">
+            <option value="">All States</option>
+            {stateOptions.map((state) => <option key={state} value={state}>{state}</option>)}
+          </select>
+        </label>
         <button onClick={load} className="rounded bg-red-700 px-5 py-2 font-semibold text-white hover:bg-red-600">Apply</button>
       </div>
       {topIndustries.length > 0 && <p className="mt-3 text-sm text-zinc-400">Top industries: {topIndustries.map(([industry, count]) => `${industry} (${count})`).join(", ")}</p>}
@@ -148,10 +161,11 @@ export default function FundingReadyPage() {
     {isLoading ? <AdminLoadingState title="Loading funding readiness..." subtext="Scoring customer value, profile quality, recurring revenue, and risk signals..." /> : <section className="overflow-x-auto rounded-xl border border-zinc-800">
       <table className="min-w-[1080px] text-sm">
         <thead className="sticky top-0 bg-zinc-950">
-          <tr>{["Customer", "Funding Tier", "Factiiv Score", "Lifetime Paid", "MRR", "Credit Limit", "Risk", "Action"].map((heading) => <th key={heading} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{heading}</th>)}</tr>
+          <tr>{["Customer", "State", "Funding Tier", "Factiiv Score", "Lifetime Paid", "MRR", "Credit Limit", "Risk", "Action"].map((heading) => <th key={heading} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{heading}</th>)}</tr>
         </thead>
         <tbody>{rows.map((row) => <tr key={row._id} className="border-t border-zinc-800">
           <td className="px-3 py-3"><p className="font-semibold">{row.name}</p><p className="text-xs text-zinc-400">{row.email}</p><p className="text-xs text-zinc-500">{row.company || row.phone || "-"}</p></td>
+          <td className="px-3 py-3 font-semibold">{row.stateCode || "-"}</td>
           <td className="px-3 py-3">{row.fundingReadinessTier}</td>
           <td className={`px-3 py-3 text-xl font-bold ${scoreClass(row.fundingReadinessScore)}`}>{row.fundingReadinessScore}</td>
           <td className="px-3 py-3 font-semibold">{money(row.lifetimeSpent)}</td>

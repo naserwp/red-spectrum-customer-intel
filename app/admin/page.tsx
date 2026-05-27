@@ -12,7 +12,7 @@ type Customer = {
   lifetimeSpent?: number; periodSpent?: number; monthlySpent?: number; yearlySpent?: number; attemptedPipeline?: number;
   lifetimeValue?: number; rankingPaidTotal?: number; paidOrderCount?: number; gatewayPaidCount?: number; attemptedOrderCount?: number; paidMonths?: number;
   firstPaidDate?: string; latestPaidDate?: string; subscriptionStartDate?: string; stayWithUsMonths?: number; activeSubscriptionCount?: number; estimatedMRR?: number; category?: string; leadStatus?: string; paymentStatus?: string; lastPaidDate?: string; lastAttemptDate?: string;
-  businessName?: string;
+  businessName?: string; stateCode?: string;
   activeSubscriptions: number; failedPayments: number; chargebacks: number; estimatedCreditLimit: number; actualCreditLimit?: number | null; tier: string; riskLevel: string;
   businessProfile?: { approvedCredits?: number; availableCredit?: number; potentialCreditLimit?: number; creditLimit?: number; creditMetaVerified?: boolean; creditMetaSource?: string; creditFallbackReason?: string };
   sourceCoverage?: { creditMetaVerified?: boolean; creditMetaSource?: string; creditFallbackReason?: string };
@@ -555,7 +555,7 @@ function SubscriptionTable({ rows }: { rows: Subscription[] }) {
 function ValueIndex({ rows, rankOffset = 0 }: { rows: Customer[]; rankOffset?: number }) {
   return <div className="overflow-x-auto rounded-xl border border-zinc-800">
     <table className="min-w-[1650px] text-sm">
-      <thead className="sticky top-0 bg-zinc-950"><tr>{["Rank", "Customer", "Business Name", "Lifetime Spent", "Tier", "Payment Status", "Risk", "Score", "Credit Limit", "Paid Months", "Latest Paid", "Stay With Us", "Category", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
+      <thead className="sticky top-0 bg-zinc-950"><tr>{["Rank", "Customer", "Business Name", "State", "Lifetime Spent", "Tier", "Payment Status", "Risk", "Score", "Credit Limit", "Paid Months", "Latest Paid", "Category", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
       <tbody>{rows.map((c, index) => {
         const cat = getCustomerCategory(c);
         const creditLimit = verifiedCreditLimit(c);
@@ -563,6 +563,7 @@ function ValueIndex({ rows, rankOffset = 0 }: { rows: Customer[]; rankOffset?: n
           <td className="px-3 py-3 font-semibold">#{c.rank ?? rankOffset + index + 1}</td>
           <td className="px-3 py-3"><p className="font-semibold">{c.name}</p><p className="text-xs text-zinc-400">{c.email}</p></td>
           <td className="px-3 py-3">{c.businessName || "-"}</td>
+          <td className="px-3 py-3 font-semibold">{c.stateCode || "-"}</td>
           <td className="px-3 py-3 font-semibold">{money(paidAmount(c))}</td>
           <td className="px-3 py-3">{paidAmount(c) > 0 ? c.tier : "Lead"}</td>
           <td className="px-3 py-3">{displayStatus(c.paymentStatus)}</td>
@@ -571,7 +572,6 @@ function ValueIndex({ rows, rankOffset = 0 }: { rows: Customer[]; rankOffset?: n
           <td className="px-3 py-3">{hasVerifiedCreditMeta(c) ? (creditLimit > 0 ? money(creditLimit) : "-") : "WP credit meta not verified"}</td>
           <td className="px-3 py-3">{customerPaidMonths(c)}</td>
           <td className="px-3 py-3">{displayDate(c.latestPaidDate || c.lastPaidDate || c.lastOrderDate)}</td>
-          <td className="px-3 py-3">{customerStayMonths(c)} months</td>
           <td className="px-3 py-3"><span className={`inline-flex rounded border px-2 py-1 text-xs ${badgeClass[cat]}`}>{c.category || categoryLabel[cat]}</span></td>
           <td className="px-3 py-3"><Link className="rounded bg-zinc-700 px-2 py-1" href={customerDetailHref(c)}>View</Link></td>
         </tr>;
@@ -798,6 +798,8 @@ export default function AdminPage() {
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>("all");
   const [highValuePeriod, setHighValuePeriod] = useState<(typeof highValuePeriods)[number]>("all");
   const [highValueSegment, setHighValueSegment] = useState<HighValueSegment>("all");
+  const [highValueState, setHighValueState] = useState("");
+  const [highValueStateOptions, setHighValueStateOptions] = useState<string[]>([]);
   const [upcomingMeta, setUpcomingMeta] = useState<Record<string, unknown>>({});
   const [riskMeta, setRiskMeta] = useState<Record<string, unknown>>({});
   const [error, setError] = useState("");
@@ -884,14 +886,16 @@ export default function AdminPage() {
     setPage(data.page || nextPage);
   }, [fetchJson, pageSize]);
 
-  const loadHighValue = useCallback(async (nextPage = 1, nextPageSize = pageSize, period = highValuePeriod) => {
+  const loadHighValue = useCallback(async (nextPage = 1, nextPageSize = pageSize, period = highValuePeriod, selectedState = highValueState) => {
     const params = new URLSearchParams({ page: String(nextPage), limit: String(nextPageSize), period });
+    if (selectedState) params.set("state", selectedState);
     const data = await fetchJson("high-value", `/api/analytics/high-value?${params.toString()}`);
     if (!data) return;
     setCustomers(data.rows || []);
+    setHighValueStateOptions(data.stateOptions || []);
     setTotal(data.total || 0);
     setPage(data.page || nextPage);
-  }, [fetchJson, highValuePeriod, pageSize]);
+  }, [fetchJson, highValuePeriod, highValueState, pageSize]);
 
   const loadHotLeads = useCallback(async (query = appliedSearchRef.current) => {
     const params = new URLSearchParams({ kind: "hot-leads", limit: "100" });
@@ -1666,6 +1670,10 @@ export default function AdminPage() {
           <Card label="High Value Paid Customers" value={Number(summary.highValueCustomers ?? total)} helper="True top customers sorted by verified paid revenue" />
           <div className="flex flex-wrap gap-3">
             <select value={highValuePeriod} onChange={(e) => { const next = e.target.value as (typeof highValuePeriods)[number]; setHighValuePeriod(next); loadHighValue(1, pageSize, next); }} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">{highValuePeriods.map((period) => <option key={period} value={period}>{period === "all" ? "All time" : period === "yearly" ? "This year" : "This month"}</option>)}</select>
+            <select value={highValueState} onChange={(e) => { const next = e.target.value; setHighValueState(next); loadHighValue(1, pageSize, highValuePeriod, next); }} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">
+              <option value="">All States</option>
+              {highValueStateOptions.map((state) => <option key={state} value={state}>{state}</option>)}
+            </select>
             <select value={highValueSegment} onChange={(e) => setHighValueSegment(e.target.value as HighValueSegment)} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">
               {(Object.keys(highValueSegmentLabel) as HighValueSegment[]).map((segment) => <option key={segment} value={segment}>{highValueSegmentLabel[segment]}</option>)}
             </select>

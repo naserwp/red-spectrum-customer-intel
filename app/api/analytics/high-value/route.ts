@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { normalizeStateCode, resolveCustomerStateCode, uniqueStateCodes } from "@/lib/customerState";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking, type CustomerRankingDocument } from "@/models/CustomerRanking";
@@ -34,22 +35,25 @@ export async function GET(request: Request) {
   const dbStarted = Date.now();
   const { searchParams } = new URL(request.url);
   const period = searchParams.get("period") ?? "all";
+  const state = normalizeStateCode(searchParams.get("state"));
   const page = Math.max(1, Number(searchParams.get("page") ?? 1));
   const limit = Math.min(100, Math.max(1, Number(searchParams.get("limit") ?? 25)));
   const sort = sortForPeriod(period);
+  const shouldFilterState = Boolean(state);
   const [total, records] = await Promise.all([
     CustomerRanking.countDocuments({}),
-    CustomerRanking.find({}).sort(sort).skip((page - 1) * limit).limit(limit).lean<CustomerRankingDocument[]>(),
+    CustomerRanking.find({}).sort(sort).skip(shouldFilterState ? 0 : (page - 1) * limit).limit(shouldFilterState ? 5000 : limit).lean<CustomerRankingDocument[]>(),
   ]);
   if (total === 0) {
+    const fallbackQuery = { $or: [{ lifetimeValue: { $gt: 0 } }, { rankingPaidTotal: { $gt: 0 } }, { paidTotal: { $gt: 0 } }, { attemptedTotal: { $gt: 0 } }] };
     const [fallbackTotal, fallbackCustomers] = await Promise.all([
       Customer.countDocuments({ $or: [{ lifetimeValue: { $gt: 0 } }, { rankingPaidTotal: { $gt: 0 } }, { paidTotal: { $gt: 0 } }, { attemptedTotal: { $gt: 0 } }] }),
       Customer.find(
-        { $or: [{ lifetimeValue: { $gt: 0 } }, { rankingPaidTotal: { $gt: 0 } }, { paidTotal: { $gt: 0 } }, { attemptedTotal: { $gt: 0 } }] },
-        { name: 1, email: 1, phone: 1, lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, attemptedTotal: 1, paidMonths: 1, paidOrderCount: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaidDate: 1, lastOrderDate: 1, activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, stayWithUsMonths: 1, tier: 1, paymentStatus: 1, riskLevel: 1, score: 1, estimatedCreditLimit: 1, actualCreditLimit: 1, businessProfile: 1 },
-      ).sort({ lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1 }).skip((page - 1) * limit).limit(limit).lean<Array<CustomerDocument & { _id: unknown }>>(),
+        fallbackQuery,
+        { name: 1, email: 1, phone: 1, lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, attemptedTotal: 1, paidMonths: 1, paidOrderCount: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaidDate: 1, lastOrderDate: 1, activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, stayWithUsMonths: 1, tier: 1, paymentStatus: 1, riskLevel: 1, score: 1, estimatedCreditLimit: 1, actualCreditLimit: 1, businessProfile: 1, billingState: 1, shippingState: 1, address: 1, billing: 1, shipping: 1 },
+      ).sort({ lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1 }).skip(shouldFilterState ? 0 : (page - 1) * limit).limit(shouldFilterState ? 5000 : limit).lean<Array<CustomerDocument & { _id: unknown }>>(),
     ]);
-    const rows = fallbackCustomers.map((customer, index) => {
+    const allRows = fallbackCustomers.map((customer, index) => {
       const lifetimeSpent = Number(customer.lifetimeValue ?? customer.rankingPaidTotal ?? customer.paidTotal ?? customer.totalPaid ?? 0);
       return {
         _id: String(customer._id),
@@ -71,6 +75,7 @@ export async function GET(request: Request) {
         attemptedPipeline: Number(customer.attemptedTotal ?? 0),
         category: lifetimeSpent >= 2000 ? "VIP Paid Customer" : lifetimeSpent > 0 ? "Paying Customer" : "Hot Lead",
         businessName: customer.businessProfile?.company || "",
+        stateCode: resolveCustomerStateCode(customer),
         tier: customer.tier,
         paymentStatus: customer.paymentStatus,
         riskLevel: customer.riskLevel,
@@ -82,12 +87,16 @@ export async function GET(request: Request) {
         attemptedTotal: Number(customer.attemptedTotal ?? 0),
       };
     });
+    const rows = state ? allRows.filter((row) => row.stateCode === state) : allRows;
+    const pagedRows = state ? rows.slice((page - 1) * limit, page * limit) : rows;
     const payload = {
       page,
       limit,
-      total: fallbackTotal,
-      rows,
+      total: state ? rows.length : fallbackTotal,
+      rows: pagedRows,
       period,
+      state,
+      stateOptions: uniqueStateCodes(allRows),
       from: searchParams.get("from") ?? "",
       to: searchParams.get("to") ?? "",
       analyticsCacheReady: false,
@@ -98,10 +107,10 @@ export async function GET(request: Request) {
   }
   const customerIds = records.map((row) => row.customerId);
   const customerDetails = customerIds.length ? await Customer.find({ _id: { $in: customerIds } }, {
-    businessProfile: 1, tier: 1, paymentStatus: 1, riskLevel: 1, score: 1, estimatedCreditLimit: 1, actualCreditLimit: 1,
+    businessProfile: 1, tier: 1, paymentStatus: 1, riskLevel: 1, score: 1, estimatedCreditLimit: 1, actualCreditLimit: 1, billingState: 1, shippingState: 1, address: 1, billing: 1, shipping: 1,
   }).lean<Array<CustomerDocument & { _id: unknown }>>() : [];
   const customerDetailById = new Map(customerDetails.map((customer) => [String(customer._id), customer]));
-  const rows = records.map((row, index) => {
+  const allRows = records.map((row, index) => {
     const detail = customerDetailById.get(row.customerId);
     return ({
     _id: row.customerId,
@@ -123,6 +132,7 @@ export async function GET(request: Request) {
     attemptedPipeline: row.attemptedPipeline,
     category: row.category,
     businessName: detail?.businessProfile?.company || "",
+    stateCode: resolveCustomerStateCode(detail),
     tier: detail?.tier || "",
     paymentStatus: detail?.paymentStatus || "",
     riskLevel: detail?.riskLevel || "",
@@ -134,12 +144,16 @@ export async function GET(request: Request) {
     attemptedTotal: row.attemptedPipeline,
   });
   });
+  const rows = state ? allRows.filter((row) => row.stateCode === state) : allRows;
+  const pagedRows = state ? rows.slice((page - 1) * limit, page * limit) : rows;
   const payload = {
     page,
     limit,
-    total,
-    rows,
+    total: state ? rows.length : total,
+    rows: pagedRows,
     period,
+    state,
+    stateOptions: uniqueStateCodes(allRows),
     from: searchParams.get("from") ?? "",
     to: searchParams.get("to") ?? "",
     analyticsCacheReady: total > 0,
