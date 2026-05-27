@@ -11,7 +11,11 @@ type FundingRow = {
   email: string;
   phone: string;
   company: string;
+  businessName?: string;
+  businessNameSource?: string;
   stateCode?: string;
+  stateName?: string;
+  stateSource?: string;
   industry: string;
   industryClassification: string;
   naicsCode: string;
@@ -36,7 +40,7 @@ type FundingRow = {
 
 type FundingResponse = {
   rows: FundingRow[];
-  stateOptions?: string[];
+  stateOptions?: Array<{ code: string; name: string; count: number }>;
   total: number;
   page: number;
   limit: number;
@@ -69,7 +73,7 @@ export default function FundingReadyPage() {
   const [minSpent, setMinSpent] = useState("2000");
   const [readiness, setReadiness] = useState("");
   const [stateFilter, setStateFilter] = useState("");
-  const [stateOptions, setStateOptions] = useState<string[]>([]);
+  const [stateOptions, setStateOptions] = useState<Array<{ code: string; name: string; count: number }>>([]);
 
   const load = useCallback(async () => {
     setIsLoading(true);
@@ -149,7 +153,7 @@ export default function FundingReadyPage() {
           <span className="block text-xs uppercase text-zinc-500">State</span>
           <select value={stateFilter} onChange={(event) => setStateFilter(event.target.value)} className="rounded bg-zinc-950 px-3 py-2 ring-1 ring-zinc-800">
             <option value="">All States</option>
-            {stateOptions.map((state) => <option key={state} value={state}>{state}</option>)}
+            {stateOptions.map((state) => <option key={state.code} value={state.code}>{state.code} - {state.name} ({state.count})</option>)}
           </select>
         </label>
         <button onClick={load} className="rounded bg-red-700 px-5 py-2 font-semibold text-white hover:bg-red-600">Apply</button>
@@ -164,8 +168,8 @@ export default function FundingReadyPage() {
           <tr>{["Customer", "State", "Funding Tier", "Factiiv Score", "Lifetime Paid", "MRR", "Credit Limit", "Risk", "Action"].map((heading) => <th key={heading} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{heading}</th>)}</tr>
         </thead>
         <tbody>{rows.map((row) => <tr key={row._id} className="border-t border-zinc-800">
-          <td className="px-3 py-3"><p className="font-semibold">{row.name}</p><p className="text-xs text-zinc-400">{row.email}</p><p className="text-xs text-zinc-500">{row.company || row.phone || "-"}</p></td>
-          <td className="px-3 py-3 font-semibold">{row.stateCode || "-"}</td>
+          <td className="px-3 py-3"><p className="font-semibold">{row.name}</p><p className="text-xs text-zinc-400">{row.email}</p><p className="text-xs text-zinc-500" title={row.businessNameSource || ""}>{row.businessName || row.company || row.phone || "-"}</p></td>
+          <td className="px-3 py-3 font-semibold" title={row.stateSource || row.stateName || ""}>{row.stateCode || "-"}</td>
           <td className="px-3 py-3">{row.fundingReadinessTier}</td>
           <td className={`px-3 py-3 text-xl font-bold ${scoreClass(row.fundingReadinessScore)}`}>{row.fundingReadinessScore}</td>
           <td className="px-3 py-3 font-semibold">{money(row.lifetimeSpent)}</td>

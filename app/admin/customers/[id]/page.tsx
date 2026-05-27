@@ -6,7 +6,7 @@ import { Fragment, type ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AdminHeader } from "@/app/admin/_components/AdminHeader";
 import { AdminLayout, AdminLoadingState } from "@/app/admin/_components/AdminLayout";
-import { resolveCustomerStateCode } from "@/lib/customerState";
+import { resolveCustomerState } from "@/lib/customerState";
 
 type OrderLineItem = {
   productId: number;
@@ -229,6 +229,7 @@ type SubscriptionIntelligence = {
 type BusinessProfile = {
   firstName?: string;
   lastName?: string;
+  businessName?: string;
   company?: string;
   dba?: string;
   email?: string;
@@ -380,6 +381,8 @@ type CustomerDetail = {
   name: string;
   email: string;
   phone?: string;
+  businessName?: string;
+  businessNameSource?: string;
   totalPaid: number;
   paidTotal?: number;
   attemptedTotal?: number;
@@ -903,9 +906,9 @@ export default function CustomerDetailPage() {
   const factiiv = customer.factiivProfile ?? {};
   const enrichment = customer.publicEnrichment ?? {};
   const latestOrderWithBilling = orders.find((order) => order.billingCompany || order.billingPhone || order.billingAddress?.address1 || order.billingEmail) ?? orders[0];
-  const businessStateCode = resolveCustomerStateCode(customer);
+  const businessState = resolveCustomerState(customer);
   const businessInfo = {
-    businessName: profile.company || latestOrderWithBilling?.billingCompany || customer.name || "-",
+    businessName: customer.businessName || profile.businessName || profile.company || latestOrderWithBilling?.billingCompany || customer.name || "-",
     dba: profile.dba || "-",
     ein: profile.ein || "-",
     phone: profile.phone || latestOrderWithBilling?.billingPhone || customer.phone || "-",
@@ -913,7 +916,7 @@ export default function CustomerDetailPage() {
     billingAddress: [profile.address1 || latestOrderWithBilling?.billingAddress?.address1, profile.address2 || latestOrderWithBilling?.billingAddress?.address2].filter(Boolean).join(", ") || "-",
     shippingAddress: [profile.shippingAddress1, profile.shippingAddress2].filter(Boolean).join(", ") || "-",
     city: profile.city || latestOrderWithBilling?.billingAddress?.city || "-",
-    state: businessStateCode || profile.state || latestOrderWithBilling?.billingAddress?.state || "-",
+    state: businessState.stateCode || profile.state || latestOrderWithBilling?.billingAddress?.state || "-",
     zip: profile.zip || latestOrderWithBilling?.billingAddress?.postcode || "-",
     country: profile.country || latestOrderWithBilling?.billingAddress?.country || "-",
     website: profile.website || enrichment.publicBusinessWebsite || enrichment.websiteDomain || "-",
@@ -1323,15 +1326,19 @@ export default function CustomerDetailPage() {
           {[
             ["Customer Name", customer.name],
             ["Business Name", businessInfo.businessName],
-            ["DBA", businessInfo.dba],
+            ["Business State", businessInfo.state],
+            ["Industry", profile.industry || enrichment.inferredIndustry || "-"],
             ["EIN", businessInfo.ein],
+            ["Net30 status", displayStatus(profile.net30Status || profile.accountStatus)],
+            ["Estimated Credit Capacity", money(Number(profile.potentialCreditLimit || profile.creditLimit || customer.estimatedCreditLimit || 0))],
+            ["Business Source", customer.businessNameSource || "-"],
+            ["DBA", businessInfo.dba],
             ["Phone", businessInfo.phone],
             ["Email", businessInfo.email],
             ["Billing Address", businessInfo.billingAddress],
             ["Shipping Address", businessInfo.shippingAddress],
             ["City", businessInfo.city],
-            ["State", businessInfo.state],
-            ["State Code", businessStateCode || "-"],
+            ["State Source", businessState.stateSource || "-"],
             ["ZIP", businessInfo.zip],
             ["Country", businessInfo.country],
             ["Website", businessInfo.website],

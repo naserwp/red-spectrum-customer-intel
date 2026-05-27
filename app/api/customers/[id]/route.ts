@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { resolveBusinessName } from "@/lib/customerBusiness";
 import { calculateCustomerValueMetrics } from "@/lib/customerValue";
 import { connectToDatabase } from "@/lib/mongodb";
 import { buildUnifiedPaymentLedger } from "@/lib/unifiedPaymentLedger";
@@ -290,8 +291,11 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
   const latestAuthorizeNetBusiness = gatewayCandidates.find((transaction) =>
     hasText(transaction.billingCompany) || hasText(transaction.billingPhone) || hasText(transaction.customerEmail)
   );
+  const businessNameInfo = resolveBusinessName(customer, [latestWooOrderWithBusinessData, latestStoredOrderWithBusinessData].filter(Boolean));
   const businessProfileSources: Record<string, string> = {};
   const resolvedBusinessName = pickBusinessValue("company", [
+    { value: businessNameInfo.businessName, source: businessNameInfo.businessNameSource },
+    { value: customer.businessProfile?.businessName, source: customer.businessProfile?.source || "customer" },
     { value: customer.businessProfile?.company, source: customer.businessProfile?.source || "customer" },
     { value: latestWooOrderWithBusinessData?.billingCompany, source: "woocommerce" },
     { value: latestStoredOrderWithBusinessData?.billingCompany, source: "customer" },
@@ -407,6 +411,7 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
   const creditMetaVerified = Boolean(customer.creditProfile?.verified && customer.creditProfile?.source === "wc_cs_credits");
   const enrichedBusinessProfile = {
     ...(customer.businessProfile ?? {}),
+    businessName: String(resolvedBusinessName.value || customer.businessProfile?.businessName || customer.businessProfile?.company || ""),
     company: String(resolvedBusinessName.value || customer.businessProfile?.company || ""),
     dba: String(resolvedDba.value || customer.businessProfile?.dba || ""),
     ein: String(resolvedEin.value || customer.businessProfile?.ein || ""),
@@ -518,6 +523,8 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
       gatewayOnlyPaidTotal: metrics.gatewayOnlyPaidTotal,
       nmiQuickPayPaidTotal: metrics.nmiQuickPayPaidTotal,
       subscriptionPaidTotal: metrics.subscriptionPaidTotal,
+      businessName: String(resolvedBusinessName.value || customer.businessProfile?.businessName || customer.businessProfile?.company || ""),
+      businessNameSource: resolvedBusinessName.source || "",
       actualCreditLimit: creditMetaVerified ? Number(enrichedBusinessProfile.creditLimit ?? 0) : null,
       estimatedCreditLimit: creditMetaVerified ? Number(enrichedBusinessProfile.potentialCreditLimit ?? 0) : 0,
       unifiedPaymentLedger: unifiedPaymentLedger.rows,
@@ -528,6 +535,8 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
       gatewayPayments: mergedGatewayPayments,
       businessProfile: enrichedBusinessProfile,
       creditProfile: customer.creditProfile,
+      factiivProfile: customer.factiivProfile ?? null,
+      publicEnrichment: customer.publicEnrichment ?? null,
       paidProducts: livePaidProducts.length ? livePaidProducts : customer.paidProducts ?? [],
       attemptedProducts: liveAttemptedProducts.length ? liveAttemptedProducts : customer.attemptedProducts ?? [],
       ...liveSummary,

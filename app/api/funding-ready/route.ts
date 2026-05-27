@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
 import { connectToDatabase } from "@/lib/mongodb";
-import { normalizeStateCode, resolveCustomerStateCode, uniqueStateCodes } from "@/lib/customerState";
+import { resolveBusinessName } from "@/lib/customerBusiness";
+import { buildStateOptions, normalizeStateCode, resolveCustomerState } from "@/lib/customerState";
 import { computeFundingIntelligence } from "@/lib/fundingIntelligence";
 import { Customer, type CustomerBusinessProfile, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking, type CustomerRankingDocument } from "@/models/CustomerRanking";
+import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 
 type LeanCustomer = CustomerDocument & { _id: unknown };
 
@@ -13,6 +15,25 @@ type IndustryMatch = {
   naicsCode: string;
   sicCode: string;
 };
+
+function normalizedEmail(value: unknown) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+async function latestWooOrdersByEmail(customers: Array<Partial<CustomerDocument> & { email?: string; normalizedEmail?: string }>) {
+  const emails = Array.from(new Set(customers.map((customer) => normalizedEmail(customer.normalizedEmail || customer.email)).filter(Boolean)));
+  if (!emails.length) return new Map<string, WooCommerceOrderDocument>();
+  const orders = await WooCommerceOrderRecord.find(
+    { normalizedEmail: { $in: emails } },
+    { normalizedEmail: 1, billingCompany: 1, billingState: 1, billing: 1, billingAddress: 1, dateCreated: 1, isPaid: 1 },
+  ).sort({ isPaid: -1, dateCreated: -1 }).limit(Math.min(5000, emails.length * 5)).lean<WooCommerceOrderDocument[]>();
+  const byEmail = new Map<string, WooCommerceOrderDocument>();
+  for (const order of orders) {
+    const email = normalizedEmail(order.normalizedEmail);
+    if (email && !byEmail.has(email)) byEmail.set(email, order);
+  }
+  return byEmail;
+}
 
 const industryRules: Array<{ pattern: RegExp; match: IndustryMatch }> = [
   { pattern: /truck|freight|transport|logistics|carrier|dispatch/i, match: { industry: "Transportation", classification: "General Freight Trucking", naicsCode: "484121", sicCode: "4213" } },
@@ -120,12 +141,13 @@ export async function GET(request: Request) {
       lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, attemptedTotal: 1, paidMonths: 1, paidOrderCount: 1,
       activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, recurringNextEstimatedPayment: 1, riskLevel: 1, failedPayments: 1,
       chargebacks: 1, tier: 1, score: 1, lastPaidDate: 1, firstPaidDate: 1, paidProducts: 1, baseProductsPurchased: 1, creditProfile: 1, factiivProfile: 1, publicEnrichment: 1,
-      billingState: 1, shippingState: 1, address: 1, billing: 1, shipping: 1,
-    }).sort({ lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1 }).limit(1000).lean<LeanCustomer[]>(),
-    CustomerRanking.find({}).sort({ lifetimeSpent: -1 }).limit(1000).lean<CustomerRankingDocument[]>(),
+      profile: 1, billingState: 1, billingAddress: 1, shippingState: 1, address: 1, billing: 1, shipping: 1, state: 1, orders: 1,
+    }).sort({ lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1 }).limit(5000).lean<LeanCustomer[]>(),
+    CustomerRanking.find({}).sort({ lifetimeSpent: -1 }).limit(5000).lean<CustomerRankingDocument[]>(),
   ]);
+  const latestOrders = await latestWooOrdersByEmail(customers);
   const rankingByEmail = new Map(rankings.map((ranking) => [ranking.email.toLowerCase(), ranking]));
-  const rows = customers.map((customer) => {
+  const allRows = customers.map((customer) => {
     const ranking = rankingByEmail.get(customer.email.toLowerCase());
     const lifetime = moneyNumber(ranking?.lifetimeSpent ?? customer.lifetimeValue ?? customer.rankingPaidTotal ?? customer.paidTotal ?? customer.totalPaid);
     const industry = classifyIndustry(customer);
@@ -134,13 +156,20 @@ export async function GET(request: Request) {
     const score = Math.max(funding.estimatedFundingReadiness, funding.factiivScore);
     const readinessTier = funding.fundingTier;
     const insight = insights(customer, score, lifetime, completeness, industry);
+    const extraOrders = [latestOrders.get(normalizedEmail(customer.normalizedEmail || customer.email))].filter(Boolean);
+    const businessInfo = resolveBusinessName(customer, extraOrders);
+    const stateInfo = resolveCustomerState(customer, extraOrders);
     return {
       _id: String(customer._id),
       name: customer.name,
       email: customer.email,
       phone: customer.phone,
-      company: customer.businessProfile?.company || "",
-      stateCode: resolveCustomerStateCode(customer),
+      company: businessInfo.businessName,
+      businessName: businessInfo.businessName,
+      businessNameSource: businessInfo.businessNameSource,
+      stateCode: stateInfo.stateCode,
+      stateName: stateInfo.stateName,
+      stateSource: stateInfo.stateSource,
       industry: industry.industry,
       industryClassification: industry.classification,
       naicsCode: industry.naicsCode,
@@ -173,9 +202,9 @@ export async function GET(request: Request) {
   }).filter((row) => row.lifetimeSpent >= minSpent)
     .filter((row) => !tier || row.vipTier === tier)
     .filter((row) => !readiness || row.fundingReadinessTier === readiness)
-    .filter((row) => !state || row.stateCode === state)
     .sort((a, b) => b.fundingReadinessScore - a.fundingReadinessScore || b.lifetimeSpent - a.lifetimeSpent);
-  const stateOptions = uniqueStateCodes(customers.map((customer) => ({ stateCode: resolveCustomerStateCode(customer) })));
+  const stateOptions = buildStateOptions(allRows);
+  const rows = state ? allRows.filter((row) => row.stateCode === state) : allRows;
   const start = (page - 1) * limit;
   const summary = {
     totalCandidates: rows.length,

@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
-import { normalizeStateCode, resolveCustomerStateCode, uniqueStateCodes } from "@/lib/customerState";
+import { resolveBusinessName } from "@/lib/customerBusiness";
+import { buildStateOptions, normalizeStateCode, resolveCustomerState } from "@/lib/customerState";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking, type CustomerRankingDocument } from "@/models/CustomerRanking";
+import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 
 export const dynamic = "force-dynamic";
 
@@ -29,6 +31,25 @@ function verifiedCreditValue(customer?: Partial<CustomerDocument> | null) {
   );
 }
 
+function normalizedEmail(value: unknown) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+async function latestWooOrdersByEmail(customers: Array<Partial<CustomerDocument> & { email?: string; normalizedEmail?: string }>) {
+  const emails = Array.from(new Set(customers.map((customer) => normalizedEmail(customer.normalizedEmail || customer.email)).filter(Boolean)));
+  if (!emails.length) return new Map<string, WooCommerceOrderDocument>();
+  const orders = await WooCommerceOrderRecord.find(
+    { normalizedEmail: { $in: emails } },
+    { normalizedEmail: 1, billingCompany: 1, billingState: 1, billing: 1, billingAddress: 1, dateCreated: 1, isPaid: 1 },
+  ).sort({ isPaid: -1, dateCreated: -1 }).limit(Math.min(5000, emails.length * 5)).lean<WooCommerceOrderDocument[]>();
+  const byEmail = new Map<string, WooCommerceOrderDocument>();
+  for (const order of orders) {
+    const email = normalizedEmail(order.normalizedEmail);
+    if (email && !byEmail.has(email)) byEmail.set(email, order);
+  }
+  return byEmail;
+}
+
 export async function GET(request: Request) {
   const started = Date.now();
   await connectToDatabase();
@@ -39,10 +60,9 @@ export async function GET(request: Request) {
   const page = Math.max(1, Number(searchParams.get("page") ?? 1));
   const limit = Math.min(100, Math.max(1, Number(searchParams.get("limit") ?? 25)));
   const sort = sortForPeriod(period);
-  const shouldFilterState = Boolean(state);
   const [total, records] = await Promise.all([
     CustomerRanking.countDocuments({}),
-    CustomerRanking.find({}).sort(sort).skip(shouldFilterState ? 0 : (page - 1) * limit).limit(shouldFilterState ? 5000 : limit).lean<CustomerRankingDocument[]>(),
+    CustomerRanking.find({}).sort(sort).limit(10000).lean<CustomerRankingDocument[]>(),
   ]);
   if (total === 0) {
     const fallbackQuery = { $or: [{ lifetimeValue: { $gt: 0 } }, { rankingPaidTotal: { $gt: 0 } }, { paidTotal: { $gt: 0 } }, { attemptedTotal: { $gt: 0 } }] };
@@ -50,11 +70,15 @@ export async function GET(request: Request) {
       Customer.countDocuments({ $or: [{ lifetimeValue: { $gt: 0 } }, { rankingPaidTotal: { $gt: 0 } }, { paidTotal: { $gt: 0 } }, { attemptedTotal: { $gt: 0 } }] }),
       Customer.find(
         fallbackQuery,
-        { name: 1, email: 1, phone: 1, lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, attemptedTotal: 1, paidMonths: 1, paidOrderCount: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaidDate: 1, lastOrderDate: 1, activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, stayWithUsMonths: 1, tier: 1, paymentStatus: 1, riskLevel: 1, score: 1, estimatedCreditLimit: 1, actualCreditLimit: 1, businessProfile: 1, billingState: 1, shippingState: 1, address: 1, billing: 1, shipping: 1 },
-      ).sort({ lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1 }).skip(shouldFilterState ? 0 : (page - 1) * limit).limit(shouldFilterState ? 5000 : limit).lean<Array<CustomerDocument & { _id: unknown }>>(),
+        { name: 1, email: 1, normalizedEmail: 1, phone: 1, lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, attemptedTotal: 1, paidMonths: 1, paidOrderCount: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaidDate: 1, lastOrderDate: 1, activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, stayWithUsMonths: 1, tier: 1, paymentStatus: 1, riskLevel: 1, score: 1, estimatedCreditLimit: 1, actualCreditLimit: 1, businessProfile: 1, profile: 1, billingState: 1, billingAddress: 1, shippingState: 1, address: 1, billing: 1, shipping: 1, state: 1, orders: 1 },
+      ).sort({ lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1 }).limit(10000).lean<Array<CustomerDocument & { _id: unknown }>>(),
     ]);
+    const latestOrders = await latestWooOrdersByEmail(fallbackCustomers);
     const allRows = fallbackCustomers.map((customer, index) => {
       const lifetimeSpent = Number(customer.lifetimeValue ?? customer.rankingPaidTotal ?? customer.paidTotal ?? customer.totalPaid ?? 0);
+      const extraOrders = [latestOrders.get(normalizedEmail(customer.normalizedEmail || customer.email))].filter(Boolean);
+      const businessInfo = resolveBusinessName(customer, extraOrders);
+      const stateInfo = resolveCustomerState(customer, extraOrders);
       return {
         _id: String(customer._id),
         name: customer.name,
@@ -74,8 +98,11 @@ export async function GET(request: Request) {
         stayWithUsMonths: Number(customer.stayWithUsMonths ?? 0),
         attemptedPipeline: Number(customer.attemptedTotal ?? 0),
         category: lifetimeSpent >= 2000 ? "VIP Paid Customer" : lifetimeSpent > 0 ? "Paying Customer" : "Hot Lead",
-        businessName: customer.businessProfile?.company || "",
-        stateCode: resolveCustomerStateCode(customer),
+        businessName: businessInfo.businessName,
+        businessNameSource: businessInfo.businessNameSource,
+        stateCode: stateInfo.stateCode,
+        stateName: stateInfo.stateName,
+        stateSource: stateInfo.stateSource,
         tier: customer.tier,
         paymentStatus: customer.paymentStatus,
         riskLevel: customer.riskLevel,
@@ -88,7 +115,7 @@ export async function GET(request: Request) {
       };
     });
     const rows = state ? allRows.filter((row) => row.stateCode === state) : allRows;
-    const pagedRows = state ? rows.slice((page - 1) * limit, page * limit) : rows;
+    const pagedRows = rows.slice((page - 1) * limit, page * limit);
     const payload = {
       page,
       limit,
@@ -96,7 +123,7 @@ export async function GET(request: Request) {
       rows: pagedRows,
       period,
       state,
-      stateOptions: uniqueStateCodes(allRows),
+      stateOptions: buildStateOptions(allRows),
       from: searchParams.get("from") ?? "",
       to: searchParams.get("to") ?? "",
       analyticsCacheReady: false,
@@ -107,11 +134,15 @@ export async function GET(request: Request) {
   }
   const customerIds = records.map((row) => row.customerId);
   const customerDetails = customerIds.length ? await Customer.find({ _id: { $in: customerIds } }, {
-    businessProfile: 1, tier: 1, paymentStatus: 1, riskLevel: 1, score: 1, estimatedCreditLimit: 1, actualCreditLimit: 1, billingState: 1, shippingState: 1, address: 1, billing: 1, shipping: 1,
+    email: 1, normalizedEmail: 1, businessProfile: 1, profile: 1, tier: 1, paymentStatus: 1, riskLevel: 1, score: 1, estimatedCreditLimit: 1, actualCreditLimit: 1, billingState: 1, billingAddress: 1, shippingState: 1, address: 1, billing: 1, shipping: 1, state: 1, orders: 1,
   }).lean<Array<CustomerDocument & { _id: unknown }>>() : [];
+  const latestOrders = await latestWooOrdersByEmail(customerDetails);
   const customerDetailById = new Map(customerDetails.map((customer) => [String(customer._id), customer]));
   const allRows = records.map((row, index) => {
     const detail = customerDetailById.get(row.customerId);
+    const extraOrders = [latestOrders.get(normalizedEmail(detail?.normalizedEmail || detail?.email || row.email))].filter(Boolean);
+    const businessInfo = resolveBusinessName(detail, extraOrders);
+    const stateInfo = resolveCustomerState(detail, extraOrders);
     return ({
     _id: row.customerId,
     name: row.name,
@@ -131,8 +162,11 @@ export async function GET(request: Request) {
     stayWithUsMonths: row.stayWithUsMonths,
     attemptedPipeline: row.attemptedPipeline,
     category: row.category,
-    businessName: detail?.businessProfile?.company || "",
-    stateCode: resolveCustomerStateCode(detail),
+    businessName: businessInfo.businessName,
+    businessNameSource: businessInfo.businessNameSource,
+    stateCode: stateInfo.stateCode,
+    stateName: stateInfo.stateName,
+    stateSource: stateInfo.stateSource,
     tier: detail?.tier || "",
     paymentStatus: detail?.paymentStatus || "",
     riskLevel: detail?.riskLevel || "",
@@ -145,7 +179,7 @@ export async function GET(request: Request) {
   });
   });
   const rows = state ? allRows.filter((row) => row.stateCode === state) : allRows;
-  const pagedRows = state ? rows.slice((page - 1) * limit, page * limit) : rows;
+  const pagedRows = rows.slice((page - 1) * limit, page * limit);
   const payload = {
     page,
     limit,
@@ -153,7 +187,7 @@ export async function GET(request: Request) {
     rows: pagedRows,
     period,
     state,
-    stateOptions: uniqueStateCodes(allRows),
+    stateOptions: buildStateOptions(allRows),
     from: searchParams.get("from") ?? "",
     to: searchParams.get("to") ?? "",
     analyticsCacheReady: total > 0,

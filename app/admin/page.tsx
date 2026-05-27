@@ -12,7 +12,7 @@ type Customer = {
   lifetimeSpent?: number; periodSpent?: number; monthlySpent?: number; yearlySpent?: number; attemptedPipeline?: number;
   lifetimeValue?: number; rankingPaidTotal?: number; paidOrderCount?: number; gatewayPaidCount?: number; attemptedOrderCount?: number; paidMonths?: number;
   firstPaidDate?: string; latestPaidDate?: string; subscriptionStartDate?: string; stayWithUsMonths?: number; activeSubscriptionCount?: number; estimatedMRR?: number; category?: string; leadStatus?: string; paymentStatus?: string; lastPaidDate?: string; lastAttemptDate?: string;
-  businessName?: string; stateCode?: string;
+  businessName?: string; businessNameSource?: string; stateCode?: string; stateName?: string; stateSource?: string;
   activeSubscriptions: number; failedPayments: number; chargebacks: number; estimatedCreditLimit: number; actualCreditLimit?: number | null; tier: string; riskLevel: string;
   businessProfile?: { approvedCredits?: number; availableCredit?: number; potentialCreditLimit?: number; creditLimit?: number; creditMetaVerified?: boolean; creditMetaSource?: string; creditFallbackReason?: string };
   sourceCoverage?: { creditMetaVerified?: boolean; creditMetaSource?: string; creditFallbackReason?: string };
@@ -25,6 +25,7 @@ type Customer = {
 
 type Subscription = {
   _id?: string; subscriptionId: string; source: string; customerEmail: string; customerName: string; status: string; amount: number;
+  businessName?: string;
   monthlyRecurringRevenue?: number; billingInterval?: string; nextBillingDate?: string; lastBillingDate?: string; failedPaymentCount?: number;
   lastPaymentStatus?: string; sourceStatus?: string; recordType?: string; productNames?: string[]; startDate?: string; paymentMethodTitle?: string; churnRisk?: string; action?: string;
 };
@@ -534,7 +535,7 @@ function SubscriptionTable({ rows }: { rows: Subscription[] }) {
       <thead className="sticky top-0 bg-zinc-950"><tr>{["Customer", "Source", "Product/Plan", "Status", "Amount", "MRR", "Start Date", "Next Payment", "Last Payment", "Payment Method", "Churn Risk", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
       <tbody>{rows.map((s) => {
         return <tr key={s._id ?? s.subscriptionId} className="border-t border-zinc-800">
-          <td className="px-3 py-3"><p className="font-semibold">{s.customerName || "-"}</p><p className="text-xs text-zinc-400">{s.customerEmail}</p></td>
+          <td className="px-3 py-3"><p className="font-semibold">{s.customerName || "-"}</p><p className="text-xs text-zinc-300">{s.businessName || "-"}</p><p className="text-xs text-zinc-400">{s.customerEmail}</p></td>
           <td className="px-3 py-3">{s.source === "authorize_net" ? "Authorize.net" : "WooCommerce"}</td>
           <td className="px-3 py-3">{s.productNames?.join(", ") || s.source}</td>
           <td className="px-3 py-3">{displayStatus(s.status)}</td>
@@ -562,8 +563,8 @@ function ValueIndex({ rows, rankOffset = 0 }: { rows: Customer[]; rankOffset?: n
         return <tr key={c._id} className="border-t border-zinc-800">
           <td className="px-3 py-3 font-semibold">#{c.rank ?? rankOffset + index + 1}</td>
           <td className="px-3 py-3"><p className="font-semibold">{c.name}</p><p className="text-xs text-zinc-400">{c.email}</p></td>
-          <td className="px-3 py-3">{c.businessName || "-"}</td>
-          <td className="px-3 py-3 font-semibold">{c.stateCode || "-"}</td>
+          <td className="px-3 py-3" title={c.businessNameSource || ""}>{c.businessName || "-"}</td>
+          <td className="px-3 py-3 font-semibold" title={c.stateSource || c.stateName || ""}>{c.stateCode || "-"}</td>
           <td className="px-3 py-3 font-semibold">{money(paidAmount(c))}</td>
           <td className="px-3 py-3">{paidAmount(c) > 0 ? c.tier : "Lead"}</td>
           <td className="px-3 py-3">{displayStatus(c.paymentStatus)}</td>
@@ -799,7 +800,7 @@ export default function AdminPage() {
   const [highValuePeriod, setHighValuePeriod] = useState<(typeof highValuePeriods)[number]>("all");
   const [highValueSegment, setHighValueSegment] = useState<HighValueSegment>("all");
   const [highValueState, setHighValueState] = useState("");
-  const [highValueStateOptions, setHighValueStateOptions] = useState<string[]>([]);
+  const [highValueStateOptions, setHighValueStateOptions] = useState<Array<{ code: string; name: string; count: number }>>([]);
   const [upcomingMeta, setUpcomingMeta] = useState<Record<string, unknown>>({});
   const [riskMeta, setRiskMeta] = useState<Record<string, unknown>>({});
   const [error, setError] = useState("");
@@ -1672,7 +1673,7 @@ export default function AdminPage() {
             <select value={highValuePeriod} onChange={(e) => { const next = e.target.value as (typeof highValuePeriods)[number]; setHighValuePeriod(next); loadHighValue(1, pageSize, next); }} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">{highValuePeriods.map((period) => <option key={period} value={period}>{period === "all" ? "All time" : period === "yearly" ? "This year" : "This month"}</option>)}</select>
             <select value={highValueState} onChange={(e) => { const next = e.target.value; setHighValueState(next); loadHighValue(1, pageSize, highValuePeriod, next); }} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">
               <option value="">All States</option>
-              {highValueStateOptions.map((state) => <option key={state} value={state}>{state}</option>)}
+              {highValueStateOptions.map((state) => <option key={state.code} value={state.code}>{state.code} - {state.name} ({state.count})</option>)}
             </select>
             <select value={highValueSegment} onChange={(e) => setHighValueSegment(e.target.value as HighValueSegment)} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">
               {(Object.keys(highValueSegmentLabel) as HighValueSegment[]).map((segment) => <option key={segment} value={segment}>{highValueSegmentLabel[segment]}</option>)}
