@@ -121,6 +121,8 @@ export interface CustomerGatewayPayment {
 export interface CustomerBusinessProfile {
   firstName: string;
   lastName: string;
+  businessName?: string;
+  businessNameSource?: string;
   company: string;
   dba: string;
   email: string;
@@ -135,6 +137,8 @@ export interface CustomerBusinessProfile {
   shippingCountry: string;
   city: string;
   state: string;
+  stateCode?: string;
+  stateSource?: string;
   zip: string;
   country: string;
   website: string;
@@ -190,6 +194,7 @@ export interface CustomerCreditProfile {
 }
 
 export interface CustomerFactiivProfile {
+  profileId?: string;
   factiivProfileId: string;
   factiivScore: number;
   reputationScore: number;
@@ -206,9 +211,37 @@ export interface CustomerFactiivProfile {
   matchedUsername: string;
   factiivMatched: boolean;
   factiivMatchConfidence: string;
+  matchedBy: string;
+  autoPersisted: boolean;
+  autoPersistReason: string;
   factiivSearchQuery: string;
   factiivMatchReason: string;
   lastFactiivSync: string;
+  manualAttachedBy: string;
+  manualAttachedAt: string;
+  trades: Array<{
+    tradeId: string;
+    tradeName: string;
+    tradeType: string;
+    relation: string;
+    amount: number;
+    balance: number;
+    tradeStatus: string;
+    adminStatus: string;
+    fromCompanyName: string;
+    toCompanyName: string;
+    lastActivity: string;
+    utilizationPercent: number;
+  }>;
+  activities: Array<{
+    activityDate: string;
+    activityType: string;
+    paymentAmount: number;
+    chargeAmount: number;
+    interest: number;
+    daysLate: number;
+    paymentStatus: string;
+  }>;
   source: string;
   rawSummary: string;
 }
@@ -366,6 +399,11 @@ export interface CustomerSourceCoverage {
   selectedEinKey?: string;
   factiivSearchQuery?: string;
   factiivMatchReason?: string;
+  lastFactiivSearchQueries?: string[];
+  lastFactiivSearchResultsCount?: number;
+  lastFactiivMatchReason?: string;
+  manualAttachedBy?: string;
+  manualAttachedAt?: string;
   enrichmentSources?: string[];
   socialProfilesFound?: number;
   publicBusinessDataFound?: boolean;
@@ -515,6 +553,11 @@ const customerSourceCoverageSchema = new Schema<CustomerSourceCoverage>(
     selectedEinKey: { type: String, default: "" },
     factiivSearchQuery: { type: String, default: "" },
     factiivMatchReason: { type: String, default: "" },
+    lastFactiivSearchQueries: { type: [String], default: [] },
+    lastFactiivSearchResultsCount: { type: Number, default: 0 },
+    lastFactiivMatchReason: { type: String, default: "" },
+    manualAttachedBy: { type: String, default: "" },
+    manualAttachedAt: { type: String, default: "" },
     enrichmentSources: { type: [String], default: [] },
     socialProfilesFound: { type: Number, default: 0 },
     publicBusinessDataFound: { type: Boolean, default: false },
@@ -561,6 +604,8 @@ const customerBusinessProfileSchema = new Schema<CustomerBusinessProfile>(
   {
     firstName: { type: String, default: "" },
     lastName: { type: String, default: "" },
+    businessName: { type: String, default: "" },
+    businessNameSource: { type: String, default: "" },
     company: { type: String, default: "" },
     dba: { type: String, default: "" },
     email: { type: String, default: "" },
@@ -575,6 +620,8 @@ const customerBusinessProfileSchema = new Schema<CustomerBusinessProfile>(
     shippingCountry: { type: String, default: "" },
     city: { type: String, default: "" },
     state: { type: String, default: "" },
+    stateCode: { type: String, default: "" },
+    stateSource: { type: String, default: "" },
     zip: { type: String, default: "" },
     country: { type: String, default: "" },
     website: { type: String, default: "" },
@@ -636,6 +683,7 @@ const customerCreditProfileSchema = new Schema<CustomerCreditProfile>(
 
 const customerFactiivProfileSchema = new Schema<CustomerFactiivProfile>(
   {
+    profileId: { type: String, default: "" },
     factiivProfileId: { type: String, default: "" },
     factiivScore: { type: Number, default: 0 },
     reputationScore: { type: Number, default: 0 },
@@ -652,9 +700,43 @@ const customerFactiivProfileSchema = new Schema<CustomerFactiivProfile>(
     matchedUsername: { type: String, default: "" },
     factiivMatched: { type: Boolean, default: false },
     factiivMatchConfidence: { type: String, default: "" },
+    matchedBy: { type: String, default: "" },
+    autoPersisted: { type: Boolean, default: false },
+    autoPersistReason: { type: String, default: "" },
     factiivSearchQuery: { type: String, default: "" },
     factiivMatchReason: { type: String, default: "" },
     lastFactiivSync: { type: String, default: "" },
+    manualAttachedBy: { type: String, default: "" },
+    manualAttachedAt: { type: String, default: "" },
+    trades: {
+      type: [{
+        tradeId: { type: String, default: "" },
+        tradeName: { type: String, default: "" },
+        tradeType: { type: String, default: "" },
+        relation: { type: String, default: "" },
+        amount: { type: Number, default: 0 },
+        balance: { type: Number, default: 0 },
+        tradeStatus: { type: String, default: "" },
+        adminStatus: { type: String, default: "" },
+        fromCompanyName: { type: String, default: "" },
+        toCompanyName: { type: String, default: "" },
+        lastActivity: { type: String, default: "" },
+        utilizationPercent: { type: Number, default: 0 },
+      }],
+      default: [],
+    },
+    activities: {
+      type: [{
+        activityDate: { type: String, default: "" },
+        activityType: { type: String, default: "" },
+        paymentAmount: { type: Number, default: 0 },
+        chargeAmount: { type: Number, default: 0 },
+        interest: { type: Number, default: 0 },
+        daysLate: { type: Number, default: 0 },
+        paymentStatus: { type: String, default: "" },
+      }],
+      default: [],
+    },
     source: { type: String, default: "" },
     rawSummary: { type: String, default: "" },
   },

@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { resolveBusinessName } from "@/lib/customerBusiness";
-import { buildStateOptions, normalizeStateCode, resolveCustomerState } from "@/lib/customerState";
+import { buildStateOptions, normalizeStateCode, resolveCustomerBusinessName, resolveCustomerState } from "@/lib/customerBusinessResolver";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking, type CustomerRankingDocument } from "@/models/CustomerRanking";
@@ -76,9 +75,10 @@ export async function GET(request: Request) {
     const latestOrders = await latestWooOrdersByEmail(fallbackCustomers);
     const allRows = fallbackCustomers.map((customer, index) => {
       const lifetimeSpent = Number(customer.lifetimeValue ?? customer.rankingPaidTotal ?? customer.paidTotal ?? customer.totalPaid ?? 0);
-      const extraOrders = [latestOrders.get(normalizedEmail(customer.normalizedEmail || customer.email))].filter(Boolean);
-      const businessInfo = resolveBusinessName(customer, extraOrders);
-      const stateInfo = resolveCustomerState(customer, extraOrders);
+      const latestWooOrder = latestOrders.get(normalizedEmail(customer.normalizedEmail || customer.email));
+      const resolverInput = latestWooOrder ? { ...customer, latestWooOrder } : customer;
+      const businessInfo = resolveCustomerBusinessName(resolverInput);
+      const stateInfo = resolveCustomerState(resolverInput);
       return {
         _id: String(customer._id),
         name: customer.name,
@@ -140,9 +140,12 @@ export async function GET(request: Request) {
   const customerDetailById = new Map(customerDetails.map((customer) => [String(customer._id), customer]));
   const allRows = records.map((row, index) => {
     const detail = customerDetailById.get(row.customerId);
-    const extraOrders = [latestOrders.get(normalizedEmail(detail?.normalizedEmail || detail?.email || row.email))].filter(Boolean);
-    const businessInfo = resolveBusinessName(detail, extraOrders);
-    const stateInfo = resolveCustomerState(detail, extraOrders);
+    const latestWooOrder = latestOrders.get(normalizedEmail(detail?.normalizedEmail || detail?.email || row.email));
+    const resolverInput = detail && latestWooOrder ? { ...detail, latestWooOrder } : detail;
+    const businessInfo = resolveCustomerBusinessName(resolverInput);
+    const stateInfo = resolveCustomerState(resolverInput);
+    const businessName = businessInfo.businessName || row.businessName || "";
+    const stateCode = stateInfo.stateCode || row.stateCode || "";
     return ({
     _id: row.customerId,
     name: row.name,
@@ -162,11 +165,11 @@ export async function GET(request: Request) {
     stayWithUsMonths: row.stayWithUsMonths,
     attemptedPipeline: row.attemptedPipeline,
     category: row.category,
-    businessName: businessInfo.businessName,
-    businessNameSource: businessInfo.businessNameSource,
-    stateCode: stateInfo.stateCode,
-    stateName: stateInfo.stateName,
-    stateSource: stateInfo.stateSource,
+    businessName,
+    businessNameSource: businessInfo.businessNameSource || row.businessNameSource || "",
+    stateCode,
+    stateName: stateInfo.stateName || row.stateName || "",
+    stateSource: stateInfo.stateSource || row.stateSource || "",
     tier: detail?.tier || "",
     paymentStatus: detail?.paymentStatus || "",
     riskLevel: detail?.riskLevel || "",

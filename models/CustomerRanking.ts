@@ -5,6 +5,11 @@ export interface CustomerRankingDocument {
   name: string;
   email: string;
   phone: string;
+  businessName: string;
+  businessNameSource: string;
+  stateCode: string;
+  stateName: string;
+  stateSource: string;
   lifetimeSpent: number;
   periodSpent: number;
   monthlySpent: number;
@@ -28,6 +33,11 @@ const customerRankingSchema = new Schema<CustomerRankingDocument>(
     name: { type: String, default: "" },
     email: { type: String, default: "", index: true },
     phone: { type: String, default: "" },
+    businessName: { type: String, default: "" },
+    businessNameSource: { type: String, default: "" },
+    stateCode: { type: String, default: "", index: true },
+    stateName: { type: String, default: "" },
+    stateSource: { type: String, default: "" },
     lifetimeSpent: { type: Number, default: 0, index: true },
     periodSpent: { type: Number, default: 0 },
     monthlySpent: { type: Number, default: 0, index: true },

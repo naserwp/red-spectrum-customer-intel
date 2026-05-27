@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { connectToDatabase } from "@/lib/mongodb";
-import { resolveBusinessName } from "@/lib/customerBusiness";
-import { buildStateOptions, normalizeStateCode, resolveCustomerState } from "@/lib/customerState";
+import { buildStateOptions, normalizeStateCode, resolveCustomerBusinessName, resolveCustomerState } from "@/lib/customerBusinessResolver";
 import { computeFundingIntelligence } from "@/lib/fundingIntelligence";
 import { Customer, type CustomerBusinessProfile, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking, type CustomerRankingDocument } from "@/models/CustomerRanking";
@@ -156,20 +155,23 @@ export async function GET(request: Request) {
     const score = Math.max(funding.estimatedFundingReadiness, funding.factiivScore);
     const readinessTier = funding.fundingTier;
     const insight = insights(customer, score, lifetime, completeness, industry);
-    const extraOrders = [latestOrders.get(normalizedEmail(customer.normalizedEmail || customer.email))].filter(Boolean);
-    const businessInfo = resolveBusinessName(customer, extraOrders);
-    const stateInfo = resolveCustomerState(customer, extraOrders);
+    const latestWooOrder = latestOrders.get(normalizedEmail(customer.normalizedEmail || customer.email));
+    const resolverInput = latestWooOrder ? { ...customer, latestWooOrder } : customer;
+    const businessInfo = resolveCustomerBusinessName(resolverInput);
+    const stateInfo = resolveCustomerState(resolverInput);
+    const businessName = businessInfo.businessName || ranking?.businessName || "";
+    const stateCode = stateInfo.stateCode || ranking?.stateCode || "";
     return {
       _id: String(customer._id),
       name: customer.name,
       email: customer.email,
       phone: customer.phone,
-      company: businessInfo.businessName,
-      businessName: businessInfo.businessName,
-      businessNameSource: businessInfo.businessNameSource,
-      stateCode: stateInfo.stateCode,
-      stateName: stateInfo.stateName,
-      stateSource: stateInfo.stateSource,
+      company: businessName,
+      businessName,
+      businessNameSource: businessInfo.businessNameSource || ranking?.businessNameSource || "",
+      stateCode,
+      stateName: stateInfo.stateName || ranking?.stateName || "",
+      stateSource: stateInfo.stateSource || ranking?.stateSource || "",
       industry: industry.industry,
       industryClassification: industry.classification,
       naicsCode: industry.naicsCode,

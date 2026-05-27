@@ -1,10 +1,13 @@
 import { dateInRange, monthEnd, monthStart, monthsBetween, wooSubscriptionMrr } from "@/lib/revenueAnalytics";
+import { resolveBusinessName } from "@/lib/customerBusiness";
+import { resolveCustomerBusinessName, resolveCustomerState } from "@/lib/customerBusinessResolver";
 import { calculateCustomerValueMetrics } from "@/lib/customerValue";
 import { AnalyticsSnapshot } from "@/models/AnalyticsSnapshot";
 import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking } from "@/models/CustomerRanking";
 import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
+import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
 
 type LeanWooSubscription = WooCommerceSubscriptionDocument & { _id: unknown };
@@ -20,6 +23,25 @@ function category(lifetimeSpent: number, attemptedPipeline: number) {
 
 function paidValue(customer: Partial<CustomerDocument>) {
   return Number(customer.lifetimeValue ?? customer.rankingPaidTotal ?? customer.paidTotal ?? customer.totalPaid ?? 0);
+}
+
+function normalizedEmail(value: unknown) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+async function latestWooOrdersByEmail(customers: Array<Partial<CustomerDocument> & { email?: string; normalizedEmail?: string }>) {
+  const emails = Array.from(new Set(customers.map((customer) => normalizedEmail(customer.normalizedEmail || customer.email)).filter(Boolean)));
+  if (!emails.length) return new Map<string, WooCommerceOrderDocument>();
+  const orders = await WooCommerceOrderRecord.find(
+    { normalizedEmail: { $in: emails } },
+    { normalizedEmail: 1, billingCompany: 1, billingState: 1, billing: 1, billingAddress: 1, dateCreated: 1, isPaid: 1 },
+  ).sort({ isPaid: -1, dateCreated: -1 }).limit(Math.min(5000, emails.length * 5)).lean<WooCommerceOrderDocument[]>();
+  const byEmail = new Map<string, WooCommerceOrderDocument>();
+  for (const order of orders) {
+    const email = normalizedEmail(order.normalizedEmail);
+    if (email && !byEmail.has(email)) byEmail.set(email, order);
+  }
+  return byEmail;
 }
 
 export async function readAnalyticsSnapshot<T extends Record<string, unknown>>(key: string, fallback: T) {
@@ -46,7 +68,7 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
     Customer.find({}, {
       name: 1, email: 1, normalizedEmail: 1, phone: 1, attemptedTotal: 1, attemptedOrderCount: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaidDate: 1, lastOrderDate: 1,
       activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, recurringNextEstimatedPayment: 1, recurringLastPayment: 1, paidMonths: 1, stayWithUsMonths: 1, riskLevel: 1,
-      lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, orders: 1, gatewayPayments: 1, paidOrderCount: 1,
+      lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, orders: 1, gatewayPayments: 1, paidOrderCount: 1, businessProfile: 1, profile: 1, company: 1, billing: 1, billingCompany: 1, billingAddress: 1, billingState: 1, address: 1, state: 1,
     }).sort({ lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1 }).skip(safeOffset).limit(safeLimit).lean<Array<CustomerDocument & { _id: unknown }>>(),
     Customer.estimatedDocumentCount(),
     WooCommerceSubscriptionRecord.find({}).lean<LeanWooSubscription[]>(),
@@ -96,6 +118,7 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
     const email = transaction.normalizedEmail || transaction.emailNormalized || transaction.customerEmail;
     if (email) nmiByEmail.set(email, [...(nmiByEmail.get(email) ?? []), transaction]);
   }
+  const latestOrders = await latestWooOrdersByEmail(customers);
   const rankingRows = [];
   const customerMetricUpdates = [];
   for (const customer of customers) {
@@ -111,29 +134,47 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
     ].filter((transaction, index, rows) => rows.findIndex((row) => row.transactionId === transaction.transactionId) === index);
     const metrics = calculateCustomerValueMetrics({ customer, authorizeNetTransactions: customerAuthTransactions, nmiTransactions: customerNmiTransactions, subscriptions: subscriptions.filter((sub) => sub.normalizedEmail === customerEmail) });
     const lifetimeSpent = metrics.rankingTotal || paidValue(customer);
+    const latestWooOrder = latestOrders.get(customerEmail);
+    const resolverInput = latestWooOrder ? { ...customer, latestWooOrder } : customer;
+    const businessInfo = resolveCustomerBusinessName(resolverInput);
+    const stateInfo = resolveCustomerState(resolverInput);
+    console.log("[business-resolver]", customerEmail, businessInfo.businessName, stateInfo.stateCode);
     const firstPaidDate = metrics.firstPaidDate || customer.firstPaidDate || customer.firstOrderDate || "";
     const latestPaidDate = metrics.lastPaidDate || customer.lastPaidDate || customer.lastOrderDate || "";
     const attemptedPipeline = metrics.attemptedTotal;
+    const customerSet: Record<string, unknown> = {
+      lifetimeValue: lifetimeSpent,
+      rankingPaidTotal: lifetimeSpent,
+      paidTotal: lifetimeSpent,
+      totalPaid: lifetimeSpent,
+      wooPaidTotal: metrics.wooPaidTotal,
+      authorizeNetPaidTotal: metrics.authorizeNetPaidTotal,
+      gatewayOnlyPaidTotal: metrics.gatewayOnlyPaidTotal,
+      nmiQuickPayPaidTotal: metrics.nmiQuickPayPaidTotal,
+      subscriptionPaidTotal: metrics.subscriptionPaidTotal,
+      attemptedTotal: attemptedPipeline,
+      paidMonths: metrics.paidMonths,
+      firstPaidDate,
+      lastPaidDate: latestPaidDate,
+      stayWithUsMonths: metrics.stayWithUsMonths,
+    };
+    if (businessInfo.businessName) {
+      customerSet["businessProfile.businessName"] = businessInfo.businessName;
+      customerSet["businessProfile.company"] = businessInfo.businessName;
+      customerSet["businessProfile.businessNameSource"] = businessInfo.businessNameSource;
+      customerSet["sourceCoverage.businessNameSource"] = businessInfo.businessNameSource;
+    }
+    if (stateInfo.stateCode) {
+      customerSet["businessProfile.state"] = stateInfo.stateCode;
+      customerSet["businessProfile.stateCode"] = stateInfo.stateCode;
+      customerSet["businessProfile.stateSource"] = stateInfo.stateSource;
+      customerSet["sourceCoverage.stateSource"] = stateInfo.stateSource;
+    }
     customerMetricUpdates.push({
       updateOne: {
         filter: { _id: customer._id },
         update: {
-          $set: {
-            lifetimeValue: lifetimeSpent,
-            rankingPaidTotal: lifetimeSpent,
-            paidTotal: lifetimeSpent,
-            totalPaid: lifetimeSpent,
-            wooPaidTotal: metrics.wooPaidTotal,
-            authorizeNetPaidTotal: metrics.authorizeNetPaidTotal,
-            gatewayOnlyPaidTotal: metrics.gatewayOnlyPaidTotal,
-            nmiQuickPayPaidTotal: metrics.nmiQuickPayPaidTotal,
-            subscriptionPaidTotal: metrics.subscriptionPaidTotal,
-            attemptedTotal: attemptedPipeline,
-            paidMonths: metrics.paidMonths,
-            firstPaidDate,
-            lastPaidDate: latestPaidDate,
-            stayWithUsMonths: metrics.stayWithUsMonths,
-          },
+          $set: customerSet,
         },
       },
     });
@@ -142,6 +183,11 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
       name: customer.name,
       email: customer.email,
       phone: customer.phone,
+      businessName: businessInfo.businessName,
+      businessNameSource: businessInfo.businessNameSource,
+      stateCode: stateInfo.stateCode,
+      stateName: stateInfo.stateName,
+      stateSource: stateInfo.stateSource,
       lifetimeSpent,
       periodSpent: lifetimeSpent,
       monthlySpent: dateInRange(latestPaidDate, currentMonthStart, now) ? lifetimeSpent : 0,
@@ -178,6 +224,7 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
     customerEmail: record.customerEmail,
     customerName: record.customerName,
     customerPhone: record.customerPhone,
+    businessName: "",
     status: record.status,
     amount: Number(record.recurringTotal ?? record.amount ?? 0),
     monthlyRecurringRevenue: Number(record.recurringTotal ?? record.amount ?? 0),
@@ -200,6 +247,7 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
     customerEmail: customer.email,
     customerName: customer.name,
     customerPhone: customer.phone,
+    businessName: resolveBusinessName(customer).businessName,
     status: "estimated_recurring",
     amount: Number(customer.recurringAmount ?? 0),
     monthlyRecurringRevenue: Number(customer.recurringAmount ?? 0),
