@@ -1,6 +1,6 @@
 import { dateInRange, monthEnd, monthStart, monthsBetween, wooSubscriptionMrr } from "@/lib/revenueAnalytics";
 import { resolveBusinessName } from "@/lib/customerBusiness";
-import { resolveCustomerBusinessName, resolveCustomerState } from "@/lib/customerBusinessResolver";
+import { enrichCustomerProfile } from "@/lib/customerEnrichment";
 import { calculateCustomerValueMetrics } from "@/lib/customerValue";
 import { AnalyticsSnapshot } from "@/models/AnalyticsSnapshot";
 import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
@@ -136,9 +136,8 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
     const lifetimeSpent = metrics.rankingTotal || paidValue(customer);
     const latestWooOrder = latestOrders.get(customerEmail);
     const resolverInput = latestWooOrder ? { ...customer, latestWooOrder } : customer;
-    const businessInfo = resolveCustomerBusinessName(resolverInput);
-    const stateInfo = resolveCustomerState(resolverInput);
-    console.log("[business-resolver]", customerEmail, businessInfo.businessName, stateInfo.stateCode);
+    const enrichment = enrichCustomerProfile(resolverInput);
+    console.log("[business-resolver]", customerEmail, enrichment.businessName, enrichment.stateCode);
     const firstPaidDate = metrics.firstPaidDate || customer.firstPaidDate || customer.firstOrderDate || "";
     const latestPaidDate = metrics.lastPaidDate || customer.lastPaidDate || customer.lastOrderDate || "";
     const attemptedPipeline = metrics.attemptedTotal;
@@ -158,18 +157,21 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
       lastPaidDate: latestPaidDate,
       stayWithUsMonths: metrics.stayWithUsMonths,
     };
-    if (businessInfo.businessName) {
-      customerSet["businessProfile.businessName"] = businessInfo.businessName;
-      customerSet["businessProfile.company"] = businessInfo.businessName;
-      customerSet["businessProfile.businessNameSource"] = businessInfo.businessNameSource;
-      customerSet["sourceCoverage.businessNameSource"] = businessInfo.businessNameSource;
+    if (enrichment.businessName) {
+      customerSet["businessProfile.businessName"] = enrichment.businessName;
+      customerSet["businessProfile.company"] = enrichment.businessName;
+      customerSet["businessProfile.businessNameSource"] = enrichment.businessNameSource;
+      customerSet["businessProfile.businessNameConfidence"] = enrichment.businessNameConfidence;
+      customerSet["sourceCoverage.businessNameSource"] = enrichment.businessNameSource;
     }
-    if (stateInfo.stateCode) {
-      customerSet["businessProfile.state"] = stateInfo.stateCode;
-      customerSet["businessProfile.stateCode"] = stateInfo.stateCode;
-      customerSet["businessProfile.stateSource"] = stateInfo.stateSource;
-      customerSet["sourceCoverage.stateSource"] = stateInfo.stateSource;
+    if (enrichment.stateCode) {
+      customerSet["businessProfile.state"] = enrichment.stateCode;
+      customerSet["businessProfile.stateCode"] = enrichment.stateCode;
+      customerSet["businessProfile.stateSource"] = enrichment.stateSource;
+      customerSet["businessProfile.stateConfidence"] = enrichment.stateConfidence;
+      customerSet["sourceCoverage.stateSource"] = enrichment.stateSource;
     }
+    if (enrichment.resolved) customerSet["businessProfile.enrichmentSource"] = enrichment.enrichmentSource;
     customerMetricUpdates.push({
       updateOne: {
         filter: { _id: customer._id },
@@ -183,11 +185,14 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
       name: customer.name,
       email: customer.email,
       phone: customer.phone,
-      businessName: businessInfo.businessName,
-      businessNameSource: businessInfo.businessNameSource,
-      stateCode: stateInfo.stateCode,
-      stateName: stateInfo.stateName,
-      stateSource: stateInfo.stateSource,
+      businessName: enrichment.businessName,
+      businessNameSource: enrichment.businessNameSource,
+      businessNameConfidence: enrichment.businessNameConfidence,
+      stateCode: enrichment.stateCode,
+      stateName: enrichment.stateName,
+      stateSource: enrichment.stateSource,
+      stateConfidence: enrichment.stateConfidence,
+      enrichmentSource: enrichment.enrichmentSource,
       lifetimeSpent,
       periodSpent: lifetimeSpent,
       monthlySpent: dateInRange(latestPaidDate, currentMonthStart, now) ? lifetimeSpent : 0,

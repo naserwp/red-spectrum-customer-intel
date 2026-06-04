@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { isAuthorizeNetConfigured, fetchSettledBatchIds, fetchTransactionDetails, fetchTransactionIdsForBatch, fetchUnsettledTransactionIds, normalizeAuthorizeNetTransaction } from "@/lib/authorizeNet";
 import { reconcileAuthorizeNetTransaction } from "@/lib/authorizeNetReconciliation";
 import { rebuildAnalyticsCacheBatch } from "@/lib/analyticsCache";
+import { resolveBusinessName } from "@/lib/customerBusiness";
 import { calculateCustomerScore, scoreToStars, type CustomerScoreInput } from "@/lib/customerScore";
 import { monthsSince } from "@/lib/customerValue";
 import { customerLedgerRecords, detectAuthorizeNetRecurring } from "@/lib/revenueAnalytics";
@@ -14,9 +15,10 @@ import { fetchNmiTransactions, isNmiConfigured, normalizeNmiPaymentEvent } from 
 import { reconcileNmiTransaction } from "@/lib/nmiReconciliation";
 import { countBy, normalizeWooOrder, orderHistoryItemFromStoredOrder, unique } from "@/lib/wooOrderImport";
 import { normalizeWooSubscription } from "@/lib/wooSubscriptionImport";
-import { syncFactiivProfile } from "@/lib/factiv";
+import { syncFactiivProfile, shouldAutoPersistFactiiv } from "@/lib/factiv";
 import { buildPublicEnrichment } from "@/lib/publicEnrichment";
 import { computeFundingIntelligence } from "@/lib/fundingIntelligence";
+import { enrichMissingCustomerProfilesBatch } from "@/lib/customerEnrichmentBatch";
 import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking, type CustomerRankingDocument } from "@/models/CustomerRanking";
@@ -38,9 +40,10 @@ const wordpressCreditLimit = 25;
 const factiivSyncLimit = 25;
 const publicEnrichmentLimit = 25;
 const fundingIntelligenceLimit = 50;
+const missingProfileEnrichmentLimit = 100;
 
 type SyncCursor = {
-  phase?: "orders" | "customers" | "subscriptions" | "wordpress_profiles" | "wordpress_credit_records" | "authorize_net_import" | "authorize_net_reconcile" | "nmi_import" | "nmi_reconcile" | "factiv_sync" | "public_enrichment" | "funding_intelligence" | "analytics" | "done";
+  phase?: "orders" | "customers" | "subscriptions" | "wordpress_profiles" | "wordpress_credit_records" | "authorize_net_import" | "authorize_net_reconcile" | "nmi_import" | "nmi_reconcile" | "factiv_sync" | "public_enrichment" | "funding_intelligence" | "missing_profile_enrichment" | "analytics" | "done";
   orderStatusIndex?: number;
   orderPage?: number;
   rebuildOffset?: number;
@@ -56,6 +59,7 @@ type SyncCursor = {
   factiivOffset?: number;
   publicEnrichmentOffset?: number;
   fundingIntelligenceOffset?: number;
+  missingProfileEnrichmentOffset?: number;
   analyticsOffset?: number;
   completedSteps?: string[];
 };
@@ -106,12 +110,16 @@ function buildCustomerFromOrders(key: string, orders: WooCommerceOrderDocument[]
   const paidProducts = unique(paidOrders.flatMap((order) => order.lineItems.map((item) => item.name)));
   const attemptedProducts = unique(attemptedOrders.flatMap((order) => order.lineItems.map((item) => item.name)));
   const name = latest?.billingName || email;
+  const businessInfo = resolveBusinessName({ orders: history }, sorted);
   return {
     name,
     email,
     normalizedEmail: email.toLowerCase(),
     externalCustomerKey: `woocommerce:auto:${key}`.slice(0, 180),
     phone: latest?.billingPhone || "",
+    "businessProfile.businessName": businessInfo.businessName,
+    "businessProfile.company": businessInfo.businessName,
+    "businessProfile.source": businessInfo.businessNameSource,
     paidTotal,
     totalPaid: paidTotal,
     lifetimeValue: paidTotal,
@@ -130,6 +138,9 @@ function buildCustomerFromOrders(key: string, orders: WooCommerceOrderDocument[]
     subscriptionStartDate: "",
     stayWithUsMonths: monthsSince(firstPaid?.dateCreated ?? first?.dateCreated ?? ""),
     firstOrderDate: first?.dateCreated ?? rebuildAt,
+    latestOrderDate: latest?.dateCreated ?? rebuildAt,
+    customerCreatedAt: first?.dateCreated ?? rebuildAt,
+    latestCustomerCreatedAt: first?.dateCreated ?? rebuildAt,
     lastOrderDate: latest?.dateCreated ?? rebuildAt,
     lastPaidDate: latestPaid?.dateCreated ?? "",
     lastAttemptDate: latestAttempt?.dateCreated ?? "",
@@ -172,6 +183,7 @@ function buildCustomerFromOrders(key: string, orders: WooCommerceOrderDocument[]
       syncStatus: "success",
       lastSyncedAt: rebuildAt,
       lastCustomerRebuildAt: rebuildAt,
+      businessNameSource: businessInfo.businessNameSource,
       warningSummary: "",
       warnings: [],
     },
@@ -522,13 +534,47 @@ async function syncFactiivStep(cursor: SyncCursor) {
   for (const customer of customers) {
     const result = await syncFactiivProfile(customer as Partial<CustomerDocument>);
     warnings.push(...result.warnings);
+    const shouldPersist = result.profile.factiivMatched && shouldAutoPersistFactiiv(result.profile);
+    const ranking = customer.email
+      ? await CustomerRanking.findOne({ email: String(customer.email).toLowerCase() }).lean<CustomerRankingDocument | null>()
+      : null;
+    const profile = shouldPersist
+      ? {
+        ...result.profile,
+        matchedBy: "auto",
+        autoPersisted: true,
+        autoPersistReason: result.profile.factiivMatchReason || result.profile.factiivMatchConfidence,
+      }
+      : {
+        ...result.profile,
+        factiivMatched: false,
+        matchedBy: "",
+        autoPersisted: false,
+        autoPersistReason: "",
+      };
+    const funding = computeFundingIntelligence({ ...customer, factiivProfile: profile } as Partial<CustomerDocument>, ranking);
     await Customer.updateOne(
       { _id: customer._id },
       {
         $set: {
-          factiivProfile: result.profile,
+          factiivProfile: profile,
+          "businessProfile.fundingReadinessScore": funding.estimatedFundingReadiness,
+          "businessProfile.fundingReadinessTier": funding.fundingTier,
+          "businessProfile.fundingScore": funding.fundingScore,
+          "businessProfile.fundingCategory": funding.fundingCategory,
+          "businessProfile.recommendedFundingProducts": funding.recommendedFundingProducts,
+          "businessProfile.fundingStrengths": funding.fundingStrengths,
+          "businessProfile.fundingWeaknesses": funding.fundingWeaknesses,
+          "businessProfile.nextBestAction": funding.nextBestAction,
+          "businessProfile.fundingSummary": funding.fundingSummary,
+          "businessProfile.businessVerificationScore": funding.businessVerificationScore,
+          "businessProfile.industryRiskScore": funding.industryRiskScore,
+          "businessProfile.fundingScoreBreakdown": funding.scoreBreakdown,
           "sourceCoverage.factiivSearchQuery": result.profile.factiivSearchQuery,
           "sourceCoverage.factiivMatchReason": result.profile.factiivMatchReason,
+          "sourceCoverage.lastFactiivSearchQueries": [result.profile.factiivSearchQuery].filter(Boolean),
+          "sourceCoverage.lastFactiivSearchResultsCount": result.profile.factiivProfileId ? 1 : 0,
+          "sourceCoverage.lastFactiivMatchReason": result.profile.factiivMatchReason,
         },
       }
     ).exec();
@@ -622,6 +668,16 @@ async function rebuildFundingIntelligenceStep(cursor: SyncCursor) {
         $set: {
           "businessProfile.fundingReadinessScore": summary.estimatedFundingReadiness,
           "businessProfile.fundingReadinessTier": summary.fundingTier,
+          "businessProfile.fundingScore": summary.fundingScore,
+          "businessProfile.fundingCategory": summary.fundingCategory,
+          "businessProfile.recommendedFundingProducts": summary.recommendedFundingProducts,
+          "businessProfile.fundingStrengths": summary.fundingStrengths,
+          "businessProfile.fundingWeaknesses": summary.fundingWeaknesses,
+          "businessProfile.nextBestAction": summary.nextBestAction,
+          "businessProfile.fundingSummary": summary.fundingSummary,
+          "businessProfile.businessVerificationScore": summary.businessVerificationScore,
+          "businessProfile.industryRiskScore": summary.industryRiskScore,
+          "businessProfile.fundingScoreBreakdown": summary.scoreBreakdown,
           "businessProfile.industry": String((customer.businessProfile?.industry as string) || (customer.publicEnrichment?.inferredIndustry as string) || ""),
           "businessProfile.naicsCode": String((customer.businessProfile?.naicsCode as string) || (customer.publicEnrichment?.naicsCode as string) || ""),
           "businessProfile.sicCode": String((customer.businessProfile?.sicCode as string) || (customer.publicEnrichment?.sicCode as string) || ""),
@@ -633,7 +689,7 @@ async function rebuildFundingIntelligenceStep(cursor: SyncCursor) {
 
   const hasMore = customers.length === fundingIntelligenceLimit;
   return {
-    cursor: hasMore ? nextCursor(cursor, { phase: "funding_intelligence", fundingIntelligenceOffset: offset + customers.length }) : nextCursor(cursor, { phase: "analytics", analyticsOffset: 0, completedSteps: ["funding_intelligence"] }),
+    cursor: hasMore ? nextCursor(cursor, { phase: "funding_intelligence", fundingIntelligenceOffset: offset + customers.length }) : nextCursor(cursor, { phase: "missing_profile_enrichment", missingProfileEnrichmentOffset: 0, completedSteps: ["funding_intelligence"] }),
     fundingProfilesUpdated,
     label: hasMore ? `Rebuilding funding intelligence ${offset}-${offset + customers.length}...` : `Funding intelligence rebuilt for ${fundingProfilesUpdated} customers.`,
   };
@@ -646,6 +702,16 @@ async function rebuildAnalyticsStep(cursor: SyncCursor) {
     cursor: result.hasMore ? nextCursor(cursor, { phase: "analytics", analyticsOffset: result.nextOffset }) : nextCursor(cursor, { phase: "done", completedSteps: ["analytics"] }),
     analyticsRecordsUpdated: result.rankingUpdated,
     label: result.hasMore ? `Rebuilding dashboard analytics ${offset}-${result.nextOffset}...` : `Rebuilt dashboard analytics cache for ${result.rankingUpdated} ranked customers.`,
+  };
+}
+
+async function enrichMissingProfilesStep(cursor: SyncCursor) {
+  const offset = cursor.missingProfileEnrichmentOffset ?? 0;
+  const result = await enrichMissingCustomerProfilesBatch({ limit: missingProfileEnrichmentLimit, offset });
+  return {
+    cursor: result.hasMore ? nextCursor(cursor, { phase: "missing_profile_enrichment", missingProfileEnrichmentOffset: result.nextOffset }) : nextCursor(cursor, { phase: "analytics", analyticsOffset: 0, completedSteps: ["missing_profile_enrichment"] }),
+    missingProfilesEnriched: result.updated,
+    label: result.hasMore ? `Enriching missing profiles ${offset}-${result.nextOffset}...` : `Enriched ${result.updated} missing customer profiles.`,
   };
 }
 
@@ -670,6 +736,7 @@ export async function POST(request: Request) {
     factiivProfilesUpdated?: number;
     publicProfilesUpdated?: number;
     fundingProfilesUpdated?: number;
+    missingProfilesEnriched?: number;
     analyticsRecordsUpdated?: number;
   };
 
@@ -685,6 +752,7 @@ export async function POST(request: Request) {
   else if (cursor.phase === "factiv_sync") result = await syncFactiivStep(cursor);
   else if (cursor.phase === "public_enrichment") result = await publicEnrichmentStep(cursor);
   else if (cursor.phase === "funding_intelligence") result = await rebuildFundingIntelligenceStep(cursor);
+  else if (cursor.phase === "missing_profile_enrichment") result = await enrichMissingProfilesStep(cursor);
   else if (cursor.phase === "analytics") result = await rebuildAnalyticsStep(cursor);
   else result = { cursor: nextCursor(cursor, { phase: "done" }), label: "Sync complete." };
   if (result.warning) warnings.push(result.warning);
@@ -698,10 +766,10 @@ export async function POST(request: Request) {
     progress: hasMore ? 50 : 100,
     totalPages: 1,
     pagesFetched: 1,
-    recordsProcessed: (result.ordersImported ?? 0) + (result.customersUpdated ?? 0) + (result.subscriptionsImported ?? 0) + (result.wordpressProfilesImported ?? 0) + (result.wordpressCreditProfilesImported ?? 0) + (result.authorizeNetTransactionsImported ?? 0) + (result.authorizeNetPaymentsReconciled ?? 0) + (result.nmiTransactionsImported ?? 0) + (result.nmiPaymentsReconciled ?? 0) + (result.factiivProfilesUpdated ?? 0) + (result.publicProfilesUpdated ?? 0) + (result.fundingProfilesUpdated ?? 0) + (result.analyticsRecordsUpdated ?? 0),
+    recordsProcessed: (result.ordersImported ?? 0) + (result.customersUpdated ?? 0) + (result.subscriptionsImported ?? 0) + (result.wordpressProfilesImported ?? 0) + (result.wordpressCreditProfilesImported ?? 0) + (result.authorizeNetTransactionsImported ?? 0) + (result.authorizeNetPaymentsReconciled ?? 0) + (result.nmiTransactionsImported ?? 0) + (result.nmiPaymentsReconciled ?? 0) + (result.factiivProfilesUpdated ?? 0) + (result.publicProfilesUpdated ?? 0) + (result.fundingProfilesUpdated ?? 0) + (result.missingProfilesEnriched ?? 0) + (result.analyticsRecordsUpdated ?? 0),
     errors: [],
     warnings,
-    lastCursor: { page: result.cursor.orderPage ?? result.cursor.rebuildOffset ?? result.cursor.subscriptionPage ?? result.cursor.wordpressProfileOffset ?? result.cursor.wordpressCreditOffset ?? result.cursor.authorizeNetOffset ?? result.cursor.reconcileOffset ?? result.cursor.nmiOffset ?? result.cursor.nmiReconcileOffset ?? result.cursor.factiivOffset ?? result.cursor.publicEnrichmentOffset ?? result.cursor.fundingIntelligenceOffset ?? 0, status: result.cursor.phase ?? "" },
+    lastCursor: { page: result.cursor.orderPage ?? result.cursor.rebuildOffset ?? result.cursor.subscriptionPage ?? result.cursor.wordpressProfileOffset ?? result.cursor.wordpressCreditOffset ?? result.cursor.authorizeNetOffset ?? result.cursor.reconcileOffset ?? result.cursor.nmiOffset ?? result.cursor.nmiReconcileOffset ?? result.cursor.factiivOffset ?? result.cursor.publicEnrichmentOffset ?? result.cursor.fundingIntelligenceOffset ?? result.cursor.missingProfileEnrichmentOffset ?? 0, status: result.cursor.phase ?? "" },
   });
 
   return NextResponse.json({
@@ -723,6 +791,7 @@ export async function POST(request: Request) {
     factiivProfilesUpdated: result.factiivProfilesUpdated ?? 0,
     publicProfilesUpdated: result.publicProfilesUpdated ?? 0,
     fundingProfilesUpdated: result.fundingProfilesUpdated ?? 0,
+    missingProfilesEnriched: result.missingProfilesEnriched ?? 0,
     analyticsRecordsUpdated: result.analyticsRecordsUpdated ?? 0,
     warnings,
   });

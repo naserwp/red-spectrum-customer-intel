@@ -1,5 +1,6 @@
 import type { CustomerBusinessProfile, CustomerDocument, CustomerFactiivProfile, CustomerPublicEnrichment } from "@/models/Customer";
 import type { CustomerRankingDocument } from "@/models/CustomerRanking";
+import { monthsSince } from "@/lib/customerValue";
 
 export type FundingSegment =
   | "funding_ready"
@@ -33,6 +34,24 @@ export type FundingIntelligenceSummary = {
   failedPaymentTrend: string;
   activeSubscriptionCount: number;
   segments: FundingSegment[];
+  fundingScore: number;
+  fundingCategory: string;
+  recommendedFundingProducts: string[];
+  fundingStrengths: string[];
+  fundingWeaknesses: string[];
+  nextBestAction: string;
+  fundingSummary: string;
+  businessVerificationScore: number;
+  industryRiskScore: number;
+  scoreBreakdown: {
+    businessAgeScore: number;
+    revenueScore: number;
+    tradelineScore: number;
+    paymentHistoryScore: number;
+    subscriptionStabilityScore: number;
+    businessVerificationScore: number;
+    industryRiskScore: number;
+  };
 };
 
 function money(value: unknown) {
@@ -84,6 +103,31 @@ export function computeVipTier(lifetime: number) {
   return "Standard";
 }
 
+function fundingCategory(score: number) {
+  if (score >= 80) return "Ready Now";
+  if (score >= 65) return "Ready in 30 Days";
+  if (score >= 45) return "Ready in 90 Days";
+  return "Needs More Credit Building";
+}
+
+function industryRiskScore(profile: Partial<CustomerBusinessProfile>, enrichment: Partial<CustomerPublicEnrichment>) {
+  const industry = `${profile.industry ?? ""} ${profile.industryClassification ?? ""} ${profile.businessType ?? ""} ${enrichment.inferredIndustry ?? ""}`.toLowerCase();
+  if (/gambl|adult|crypto|cannabis|marijuana/.test(industry)) return 1;
+  if (/transport|truck|construction|restaurant|retail/.test(industry)) return 3;
+  if (/professional|consult|medical|health|software|technology|service/.test(industry)) return 5;
+  return 4;
+}
+
+function recommendedProducts(score: number, lifetime: number, activeSubscriptionCount: number, paymentStabilityScore: number, factiivScore: number, completeness: number) {
+  if (score < 45) return ["Needs Credit Building"];
+  const products: string[] = [];
+  if (lifetime >= 2500 && paymentStabilityScore >= 60 && completeness >= 50) products.push("Equipment Financing");
+  if (lifetime >= 5000 && paymentStabilityScore >= 45) products.push("MCA");
+  if (completeness >= 60 && paymentStabilityScore >= 65 && lifetime >= 1000) products.push("Business Credit Card");
+  if (lifetime >= 5000 && activeSubscriptionCount > 0 && factiivScore >= 50) products.push("Credit Line");
+  return products.length ? products : ["Needs Credit Building"];
+}
+
 export function computePaymentStabilityScore(customer: LeanCustomer) {
   const paidMonths = money(customer.paidMonths ?? customer.paidOrderCount);
   const failed = money(customer.failedPayments);
@@ -110,6 +154,18 @@ export function computeFundingIntelligence(customer: LeanCustomer, ranking?: Cus
   const verifiedCreditLimit = verifiedCreditValue(customer);
   const completeness = profileCompleteness(profile, enrichment);
   const factiivScore = money(factiv.factiivScore);
+  const firstActivity = customer.firstPaidDate || customer.firstOrderDate || customer.customerCreatedAt || customer.lastSyncedAt || "";
+  const businessAgeMonths = monthsSince(firstActivity);
+  const businessAgeScore = Math.min(15, Math.round(businessAgeMonths / 4));
+  const revenueScore = Math.min(20, Math.round(lifetime / 500));
+  const tradelineScore = Math.min(20, Math.round(Math.max(factiivScore * 0.2, money(factiv.tradeQuantity) * 4, verifiedCreditLimit / 1000)));
+  const paymentHistoryScore = Math.min(15, Math.round(paymentStabilityScore * 0.15));
+  const subscriptionStabilityScore = Math.min(15, activeSubscriptionCount > 0 ? 8 + Math.min(7, Math.round(estimatedMRR / 150)) : 0);
+  const businessVerificationScore = Math.min(10, Math.round(completeness * 0.1));
+  const riskScore = industryRiskScore(profile, enrichment);
+  const fundingScore = Math.max(0, Math.min(100, businessAgeScore + revenueScore + tradelineScore + paymentHistoryScore + subscriptionStabilityScore + businessVerificationScore + riskScore));
+  const category = fundingCategory(fundingScore);
+  const recommendedFundingProducts = recommendedProducts(fundingScore, lifetime, activeSubscriptionCount, paymentStabilityScore, factiivScore, completeness);
   let estimatedFundingReadiness = 0;
   estimatedFundingReadiness += Math.min(30, lifetime / 250);
   estimatedFundingReadiness += Math.min(18, monthlyPaymentConsistency * 0.18);
@@ -151,6 +207,28 @@ export function computeFundingIntelligence(customer: LeanCustomer, ranking?: Cus
     : roundedReadiness >= 55
       ? `${customer.name ?? "Customer"} has usable revenue and profile data, but underwriting would benefit from stronger tradeline or recurring-payment verification.`
       : `${customer.name ?? "Customer"} is not funding-ready yet; complete enrichment and verify more payment history before outreach.`;
+  const fundingStrengths = [
+    lifetime >= 5000 ? "Strong customer revenue history" : "",
+    activeSubscriptionCount > 0 ? "Recurring payment stability" : "",
+    paymentStabilityScore >= 70 ? "Clean payment behavior" : "",
+    factiivScore >= 60 || money(factiv.tradeQuantity) > 0 ? "Tradeline or Factiiv signal present" : "",
+    completeness >= 70 ? "Business profile is substantially verified" : "",
+  ].filter(Boolean);
+  const fundingWeaknesses = [
+    lifetime < 1000 ? "Revenue history is still limited" : "",
+    activeSubscriptionCount === 0 ? "No active recurring revenue signal" : "",
+    paymentStabilityScore < 55 ? "Payment history needs review" : "",
+    factiivScore <= 0 && money(factiv.tradeQuantity) <= 0 ? "No tradeline signal found" : "",
+    completeness < 60 ? "Business verification fields are incomplete" : "",
+  ].filter(Boolean);
+  const nextBestAction = category === "Ready Now"
+    ? "Prioritize funding outreach and verify preferred product fit."
+    : category === "Ready in 30 Days"
+      ? "Complete missing verification fields and prepare funding outreach."
+      : category === "Ready in 90 Days"
+        ? "Build payment consistency and enrich business profile before outreach."
+        : "Focus on credit building, profile completion, and additional successful payments.";
+  const fundingSummary = `${customer.name ?? "This customer"} has spent $${lifetime.toFixed(2)}, has ${money(customer.paidOrderCount)} successful payments, is active since ${firstActivity ? firstActivity.slice(0, 10) : "unknown"}, and is ${category.toLowerCase()}. Suggested products: ${recommendedFundingProducts.join(", ")}.`;
 
   return {
     factiivScore,
@@ -171,5 +249,23 @@ export function computeFundingIntelligence(customer: LeanCustomer, ranking?: Cus
     failedPaymentTrend,
     activeSubscriptionCount,
     segments: Array.from(new Set(segments)),
+    fundingScore,
+    fundingCategory: category,
+    recommendedFundingProducts,
+    fundingStrengths,
+    fundingWeaknesses,
+    nextBestAction,
+    fundingSummary,
+    businessVerificationScore,
+    industryRiskScore: riskScore,
+    scoreBreakdown: {
+      businessAgeScore,
+      revenueScore,
+      tradelineScore,
+      paymentHistoryScore,
+      subscriptionStabilityScore,
+      businessVerificationScore,
+      industryRiskScore: riskScore,
+    },
   };
 }

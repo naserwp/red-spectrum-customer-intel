@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
-import { syncFactiivProfile } from "@/lib/factiv";
+import { syncFactiivProfile, shouldAutoPersistFactiiv } from "@/lib/factiv";
 import { connectToDatabase } from "@/lib/mongodb";
+import { computeFundingIntelligence } from "@/lib/fundingIntelligence";
 import { Customer, type CustomerDocument } from "@/models/Customer";
+import { CustomerRanking, type CustomerRankingDocument } from "@/models/CustomerRanking";
 
 type LeanCustomer = Partial<CustomerDocument> & { _id: unknown };
 
@@ -40,15 +42,49 @@ export async function POST(request: Request) {
   for (const customer of customers) {
     const result = await syncFactiivProfile(customer);
     warnings.push(...result.warnings);
-    if (result.profile.factiivMatched) matched += 1;
+    const shouldPersist = result.profile.factiivMatched && shouldAutoPersistFactiiv(result.profile);
+    if (shouldPersist) matched += 1;
     if (dryRun) continue;
+    const ranking = customer.email
+      ? await CustomerRanking.findOne({ email: customer.email.toLowerCase() }).lean<CustomerRankingDocument | null>()
+      : null;
+    const profile = shouldPersist
+      ? {
+        ...result.profile,
+        matchedBy: "auto",
+        autoPersisted: true,
+        autoPersistReason: result.profile.factiivMatchReason || result.profile.factiivMatchConfidence,
+      }
+      : {
+        ...result.profile,
+        factiivMatched: false,
+        matchedBy: "",
+        autoPersisted: false,
+        autoPersistReason: "",
+      };
+    const funding = computeFundingIntelligence({ ...customer, factiivProfile: profile }, ranking);
     await Customer.updateOne(
       { _id: customer._id },
       {
         $set: {
-          factiivProfile: result.profile,
+          factiivProfile: profile,
+          "businessProfile.fundingReadinessScore": funding.estimatedFundingReadiness,
+          "businessProfile.fundingReadinessTier": funding.fundingTier,
+          "businessProfile.fundingScore": funding.fundingScore,
+          "businessProfile.fundingCategory": funding.fundingCategory,
+          "businessProfile.recommendedFundingProducts": funding.recommendedFundingProducts,
+          "businessProfile.fundingStrengths": funding.fundingStrengths,
+          "businessProfile.fundingWeaknesses": funding.fundingWeaknesses,
+          "businessProfile.nextBestAction": funding.nextBestAction,
+          "businessProfile.fundingSummary": funding.fundingSummary,
+          "businessProfile.businessVerificationScore": funding.businessVerificationScore,
+          "businessProfile.industryRiskScore": funding.industryRiskScore,
+          "businessProfile.fundingScoreBreakdown": funding.scoreBreakdown,
           "sourceCoverage.factiivSearchQuery": result.profile.factiivSearchQuery,
           "sourceCoverage.factiivMatchReason": result.profile.factiivMatchReason,
+          "sourceCoverage.lastFactiivSearchQueries": [result.profile.factiivSearchQuery].filter(Boolean),
+          "sourceCoverage.lastFactiivSearchResultsCount": result.profile.factiivProfileId ? 1 : 0,
+          "sourceCoverage.lastFactiivMatchReason": result.profile.factiivMatchReason,
         },
       }
     ).exec();

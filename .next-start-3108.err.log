@@ -1,0 +1,52 @@
+⨯ MongoServerError: Executor error during find command: red-spectrum-customer-intel.customers :: caused by :: Sort exceeded memory limit of 33554432 bytes, but did not opt in to external sorting.
+    at ignore-listed frames {
+  errorLabelSet: Set(0) {},
+  errorResponse: {
+    ok: 0,
+    errmsg: 'Executor error during find command: red-spectrum-customer-intel.customers :: caused by :: Sort exceeded memory limit of 33554432 bytes, but did not opt in to external sorting.',
+    code: 292,
+    codeName: 'QueryExceededMemoryLimitNoDiskUseAllowed',
+    '$clusterTime': {
+      clusterTime: new Timestamp({ t: 1780595394, i: 1 }),
+      signature: [Object]
+    },
+    operationTime: new Timestamp({ t: 1780595394, i: 1 })
+  },
+  ok: 0,
+  code: 292,
+  codeName: 'QueryExceededMemoryLimitNoDiskUseAllowed',
+  '$clusterTime': {
+    clusterTime: new Timestamp({ t: 1780595394, i: 1 }),
+    signature: {
+      hash: Binary.createFromBase64('xMz+/JPehceT+IWsQdo1GbYqshI=', 0),
+      keyId: new Long('7592293442386919428')
+    }
+  },
+  operationTime: new Timestamp({ t: 1780595394, i: 1 })
+}
+⨯ MongoServerError: Executor error during find command: red-spectrum-customer-intel.customers :: caused by :: Sort exceeded memory limit of 33554432 bytes, but did not opt in to external sorting.
+    at ignore-listed frames {
+  errorLabelSet: Set(0) {},
+  errorResponse: {
+    ok: 0,
+    errmsg: 'Executor error during find command: red-spectrum-customer-intel.customers :: caused by :: Sort exceeded memory limit of 33554432 bytes, but did not opt in to external sorting.',
+    code: 292,
+    codeName: 'QueryExceededMemoryLimitNoDiskUseAllowed',
+    '$clusterTime': {
+      clusterTime: new Timestamp({ t: 1780595409, i: 7 }),
+      signature: [Object]
+    },
+    operationTime: new Timestamp({ t: 1780595409, i: 7 })
+  },
+  ok: 0,
+  code: 292,
+  codeName: 'QueryExceededMemoryLimitNoDiskUseAllowed',
+  '$clusterTime': {
+    clusterTime: new Timestamp({ t: 1780595409, i: 7 }),
+    signature: {
+      hash: Binary.createFromBase64('IAoA3lBJTd+E43bM+5K02Zw+UBo=', 0),
+      keyId: new Long('7592293442386919428')
+    }
+  },
+  operationTime: new Timestamp({ t: 1780595409, i: 7 })
+}

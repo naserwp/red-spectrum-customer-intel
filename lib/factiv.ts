@@ -1,4 +1,5 @@
 import type { CustomerDocument, CustomerFactiivProfile } from "@/models/Customer";
+import { resolveFactiivScore } from "@/lib/factivScore";
 
 const factiivApiBaseUrl = process.env.FACTIIV_API_BASE_URL?.trim() || "https://api.credit.factiiv.io";
 const factiivApiToken = process.env.FACTIIV_API_TOKEN?.trim() || "";
@@ -195,10 +196,20 @@ function scoreMatch(customer: Partial<CustomerDocument>, record: FactiivApiRecor
 }
 
 function mapFactiivRecord(record: FactiivApiRecord, query: string, matchReason: string, confidence: string): CustomerFactiivProfile {
+  const resolvedScore = resolveFactiivScore(record);
+  const score = asNumber(getNestedRecordValue(record, ["score"]));
+  const businessScore = asNumber(getNestedRecordValue(record, ["businessscore", "business_score"]));
+  const creditScore = asNumber(getNestedRecordValue(record, ["creditscore", "credit_score"]));
   return {
     profileId: asText(getNestedRecordValue(record, ["profileid", "id", "accountid", "publicaccountid"])),
     factiivProfileId: asText(getNestedRecordValue(record, ["id", "profileid", "accountid", "publicaccountid"])),
-    factiivScore: asNumber(getNestedRecordValue(record, ["factiivscore", "factivscore"])),
+    score,
+    businessScore,
+    creditScore,
+    report: getRecordValue(record, ["report"]) as Record<string, unknown>,
+    analytics: getRecordValue(record, ["analytics"]) as Record<string, unknown>,
+    funding: getRecordValue(record, ["funding"]) as Record<string, unknown>,
+    factiivScore: asNumber(resolvedScore.scoreValue ?? getNestedRecordValue(record, ["factiivscore", "factivscore"])),
     reputationScore: asNumber(getNestedRecordValue(record, ["reputationscore"])),
     historyScore: asNumber(getNestedRecordValue(record, ["historyscore"])),
     utilizationScore: asNumber(getNestedRecordValue(record, ["utilizationscore"])),

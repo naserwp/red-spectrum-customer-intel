@@ -1,0 +1,8 @@
+
+> red-spectrum-customer-intel@0.1.0 start
+> next start -p 3108
+
+▲ Next.js 16.2.6
+- Local:         http://localhost:3108
+- Network:       http://172.19.64.1:3108
+✓ Ready in 520ms

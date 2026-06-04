@@ -134,6 +134,22 @@ function getWooCommerceConfig() {
   };
 }
 
+export async function fetchWooCommerceOrderById(orderId: number | string) {
+  const config = getWooCommerceConfig();
+  if (!config) return null;
+  const id = String(orderId).replace(/\D/g, "");
+  if (!id) return null;
+  const auth = Buffer.from(`${config.consumerKey}:${config.consumerSecret}`).toString("base64");
+  const timeoutMs = getNumericEnv("WC_REQUEST_TIMEOUT_MS", 12000);
+  const url = new URL(`${config.storeUrl}/wp-json/wc/v3/orders/${id}`);
+  const response = await fetchWithTimeout(url, {
+    Authorization: `Basic ${auth}`,
+    Accept: "application/json",
+  }, timeoutMs);
+  if (!response.ok) return null;
+  return await response.json() as WooCommerceOrder;
+}
+
 export function isWooCommerceConfigured() {
   return Boolean(WC_STORE_URL && WC_CONSUMER_KEY && WC_CONSUMER_SECRET);
 }

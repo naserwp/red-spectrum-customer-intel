@@ -1,10 +1,11 @@
-import { isDeclinedOrFailed, isSettledSuccessful } from "@/lib/authorizeNet";
+import { isAuthorizeNetPaidStatus, isDeclinedOrFailed } from "@/lib/authorizeNet";
 import { calculateCustomerValueMetrics } from "@/lib/customerValue";
 import { monthsSince } from "@/lib/customerValue";
 import { customerLedgerRecords, detectAuthorizeNetRecurring } from "@/lib/revenueAnalytics";
 import { normalizePhone } from "@/lib/wooOrderImport";
 import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer, type CustomerDocument, type CustomerGatewayPayment, type CustomerOrderHistoryItem, type CustomerProductJourneyItem } from "@/models/Customer";
+import { CustomerRanking } from "@/models/CustomerRanking";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 
 export type LeanCustomer = CustomerDocument & { _id: unknown };
@@ -18,6 +19,7 @@ export type ReconcileResult = {
   matchedBy: string;
   matchConfidence: "exact" | "high" | "medium" | "low" | "not_found";
   customerId?: string;
+  gatewayOnlyCreated?: boolean;
 };
 
 export function gatewayVerification(transaction: AuthorizeNetTransactionDocument, matchedBy: string, confidence: CustomerOrderHistoryItem["gatewayVerification"]["confidence"]) {
@@ -53,6 +55,19 @@ function productName(transaction: AuthorizeNetTransactionDocument) {
 
 function transactionDate(transaction: AuthorizeNetTransactionDocument) {
   return transaction.settledAt || transaction.submittedAt;
+}
+
+function clean(value: unknown) {
+  return String(value ?? "").trim();
+}
+
+function normalizedEmail(value: unknown) {
+  return clean(value).toLowerCase();
+}
+
+function gatewayOnlyEmail(transaction: AuthorizeNetTransactionDocument) {
+  const email = normalizedEmail(transaction.normalizedEmail || transaction.emailNormalized || transaction.customerEmail);
+  return email || `no-email-authorize-net-${transaction.transactionId}@authorize.local`.slice(0, 180);
 }
 
 function sameDay(a?: string, b?: string) {
@@ -94,7 +109,7 @@ export function gatewayPayment(transaction: AuthorizeNetTransactionDocument, mat
 }
 
 export function syntheticOrder(transaction: AuthorizeNetTransactionDocument, matchedBy: string, confidence: CustomerOrderHistoryItem["gatewayVerification"]["confidence"]): CustomerOrderHistoryItem {
-  const settled = isSettledSuccessful(transaction.transactionStatus);
+  const paid = isAuthorizeNetPaidStatus(transaction.transactionStatus);
   const lineItem = {
     productId: 0,
     variationId: 0,
@@ -109,7 +124,7 @@ export function syntheticOrder(transaction: AuthorizeNetTransactionDocument, mat
     orderId: `authorize-net-${transaction.transactionId}`,
     orderNumber: transaction.invoiceNumber || transaction.transactionId,
     customerId: 0,
-    status: settled ? "paid" : isDeclinedOrFailed(transaction.transactionStatus) ? "failed" : "attempted",
+    status: paid ? "paid" : isDeclinedOrFailed(transaction.transactionStatus) ? "failed" : "attempted",
     dateCreated: transaction.submittedAt || transaction.settledAt,
     dateModified: transactionDate(transaction),
     total: transaction.amount,
@@ -117,10 +132,10 @@ export function syntheticOrder(transaction: AuthorizeNetTransactionDocument, mat
     paymentMethod: "authorize_net",
     paymentMethodTitle: "Credit Card Payment",
     transactionId: transaction.transactionId,
-    paidDate: settled ? transactionDate(transaction) : "",
-    attemptedDate: settled ? "" : transaction.submittedAt,
-    isPaid: settled,
-    isAttempted: !settled,
+    paidDate: paid ? transactionDate(transaction) : "",
+    attemptedDate: paid ? "" : transaction.submittedAt,
+    isPaid: paid,
+    isAttempted: !paid,
     billingName: transaction.customerName,
     billingEmail: transaction.normalizedEmail || transaction.customerEmail,
     billingPhone: transaction.billingPhone,
@@ -175,6 +190,9 @@ export async function findAuthorizeNetCustomerMatch(transaction: AuthorizeNetTra
     const customer = phone.length >= 7 ? await Customer.findOne({ phone: { $regex: phone.slice(-7), $options: "i" } }).lean<LeanCustomer | null>().exec() : null;
     if (customer) return { customer, matchedBy: "phone", confidence: "medium" as const, wooOrderNumberMatched: "", wooOrderIdMatched: 0 };
   }
+  if (transaction.normalizedEmail) {
+    return { customer: null, matchedBy: "", confidence: "not_found" as const, wooOrderNumberMatched: "", wooOrderIdMatched: 0 };
+  }
   if (transaction.customerName && transaction.amount > 0) {
     const parts = transaction.customerName.split(/\s+/).filter(Boolean);
     const customer = await Customer.findOne({ name: { $regex: parts.join(".*"), $options: "i" }, orders: { $elemMatch: { total: transaction.amount } } }).lean<LeanCustomer | null>().exec();
@@ -201,17 +219,17 @@ export async function findAuthorizeNetCustomerMatch(transaction: AuthorizeNetTra
 }
 
 function productJourneyItem(transaction: AuthorizeNetTransactionDocument): CustomerProductJourneyItem {
-  const settled = isSettledSuccessful(transaction.transactionStatus);
+  const paid = isAuthorizeNetPaidStatus(transaction.transactionStatus);
   return {
     date: transactionDate(transaction),
     orderNumber: transaction.invoiceNumber || transaction.transactionId,
-    status: settled ? "paid" : isDeclinedOrFailed(transaction.transactionStatus) ? "failed" : "attempted",
+    status: paid ? "paid" : isDeclinedOrFailed(transaction.transactionStatus) ? "failed" : "attempted",
     paymentMethod: "Credit Card Payment",
     productName: productName(transaction),
     category: "other",
     productType: "Authorize.net Payment",
     amount: transaction.amount,
-    type: settled ? "paid" : "attempted",
+    type: paid ? "paid" : "attempted",
   };
 }
 
@@ -223,7 +241,7 @@ export function buildReconciledCustomerUpdate(customer: LeanCustomer, transactio
   const attemptedProducts = [...(customer.attemptedProducts ?? [])];
   const alreadyDuplicate = duplicatePayment(customer, transaction);
   const orderIndex = orders.findIndex((order) => order.orderNumber === transaction.invoiceNumber || order.transactionId === transaction.transactionId);
-  const settled = isSettledSuccessful(transaction.transactionStatus);
+  const paid = isAuthorizeNetPaidStatus(transaction.transactionStatus);
   let attachedAuthorizeNetOnly = false;
   let verifiedWooOrder = false;
   let source = "authorize_net_reconciled";
@@ -234,22 +252,22 @@ export function buildReconciledCustomerUpdate(customer: LeanCustomer, transactio
     verifiedWooOrder = true;
     orders[orderIndex] = {
       ...existing,
-      status: settled ? "paid" : existingPaid ? existing.status : isDeclinedOrFailed(transaction.transactionStatus) ? "failed" : "attempted",
+      status: paid ? "paid" : existingPaid ? existing.status : isDeclinedOrFailed(transaction.transactionStatus) ? "failed" : "attempted",
       transactionId: transaction.transactionId || existing.transactionId,
-      isPaid: settled ? true : existingPaid,
-      isAttempted: settled ? false : existingPaid ? false : true,
-      paidDate: settled ? transactionDate(transaction) : existing.paidDate,
-      attemptedDate: settled ? existing.attemptedDate : transaction.submittedAt || existing.attemptedDate,
+      isPaid: paid ? true : existingPaid,
+      isAttempted: paid ? false : existingPaid ? false : true,
+      paidDate: paid ? transactionDate(transaction) : existing.paidDate,
+      attemptedDate: paid ? existing.attemptedDate : transaction.submittedAt || existing.attemptedDate,
       paymentMethod: "authorize_net",
       paymentMethodTitle: "Credit Card Payment",
       gatewayVerification: gatewayVerification(transaction, matchedBy, confidence),
     };
   } else if (!alreadyDuplicate) {
     source = "authorize_net_only";
-    attachedAuthorizeNetOnly = settled;
+    attachedAuthorizeNetOnly = paid;
     orders.unshift(syntheticOrder(transaction, matchedBy, confidence));
     productJourney.unshift(productJourneyItem(transaction));
-    if (settled) {
+    if (paid) {
       if (!paidProducts.includes(productName(transaction))) paidProducts.unshift(productName(transaction));
     } else if (!attemptedProducts.includes(productName(transaction))) {
       attemptedProducts.unshift(productName(transaction));
@@ -266,8 +284,8 @@ export function buildReconciledCustomerUpdate(customer: LeanCustomer, transactio
   const gatewayPaidCount = orders.filter((order) => order.source === "authorize_net_only" && order.isPaid).length;
   const attemptedTotal = metrics.attemptedTotal;
   const attemptedOrderCount = Math.max(Number(customer.attemptedOrderCount ?? 0), orders.filter((order) => order.isAttempted).length);
-  const lastPaidDate = settled && transactionDate(transaction) > (customer.lastPaidDate ?? "") ? transactionDate(transaction) : customer.lastPaidDate;
-  const firstPaidDate = metrics.firstPaidDate || customer.firstPaidDate || customer.firstOrderDate || (settled ? transactionDate(transaction) : "");
+  const lastPaidDate = paid && transactionDate(transaction) > (customer.lastPaidDate ?? "") ? transactionDate(transaction) : customer.lastPaidDate;
+  const firstPaidDate = metrics.firstPaidDate || customer.firstPaidDate || customer.firstOrderDate || (paid ? transactionDate(transaction) : "");
   const paidMonths = metrics.paidMonths;
   const gatewayOnlyPaymentsAttached = orders.filter((order) => order.source === "authorize_net_only").length;
   const authorizeNetTransactionsFound = gatewayPayments.filter((payment) => payment.provider === "authorize_net").length;
@@ -318,9 +336,9 @@ export function buildReconciledCustomerUpdate(customer: LeanCustomer, transactio
       paymentStatus: paidTotal > 0 ? "paid" : customer.paymentStatus,
       leadStatus: paidTotal > 0 ? "customer" : customer.leadStatus,
       gatewayVerification: gatewayVerification(transaction, matchedBy, confidence),
-      lastPaymentMethod: settled ? "Credit Card Payment" : customer.lastPaymentMethod,
+      lastPaymentMethod: paid ? "Credit Card Payment" : customer.lastPaymentMethod,
       lastPurchasedProduct: attachedAuthorizeNetOnly ? productName(transaction) : customer.lastPurchasedProduct,
-      lastAttemptedProduct: !settled ? productName(transaction) : customer.lastAttemptedProduct,
+      lastAttemptedProduct: !paid ? productName(transaction) : customer.lastAttemptedProduct,
       sourceCoverage,
       lastSyncedAt: new Date().toISOString(),
     },
@@ -330,9 +348,184 @@ export function buildReconciledCustomerUpdate(customer: LeanCustomer, transactio
   };
 }
 
+async function createGatewayOnlyCustomer(transaction: AuthorizeNetTransactionDocument, dryRun = false): Promise<ReconcileResult> {
+  const paid = isAuthorizeNetPaidStatus(transaction.transactionStatus);
+  const attempted = !paid && !isDeclinedOrFailed(transaction.transactionStatus);
+  const hasIdentity = Boolean(gatewayOnlyEmail(transaction) || transaction.billingPhone || transaction.customerName || transaction.billingCompany);
+  if (!hasIdentity || (!paid && !attempted)) {
+    return { matched: false, updated: false, attachedAuthorizeNetOnly: false, verifiedWooOrder: false, skippedDuplicate: false, matchedBy: "", matchConfidence: "not_found", gatewayOnlyCreated: false };
+  }
+  const email = gatewayOnlyEmail(transaction);
+  const now = new Date().toISOString();
+  const order = syntheticOrder(transaction, "gateway_only_identity", paid ? "medium" : "low");
+  const gateway = gatewayPayment(transaction, "gateway_only_identity", paid ? "medium" : "low", "authorize_net_only");
+  const customerName = clean(transaction.customerName) || [transaction.billingFirstName, transaction.billingLastName].map(clean).filter(Boolean).join(" ") || email;
+  const metrics = calculateCustomerValueMetrics({ customer: { orders: [order], gatewayPayments: [gateway] } });
+  if (dryRun) {
+    return { matched: true, updated: false, attachedAuthorizeNetOnly: paid, verifiedWooOrder: false, skippedDuplicate: false, matchedBy: "gateway_only_identity", matchConfidence: paid ? "medium" : "low", customerId: "", gatewayOnlyCreated: true };
+  }
+  const created = await Customer.findOneAndUpdate(
+    { $or: [{ normalizedEmail: email }, { email }, { externalCustomerKey: `authorize-net:${transaction.transactionId}` }] },
+    {
+      $set: {
+        name: customerName,
+        email,
+        normalizedEmail: email,
+        emailNormalized: email,
+        phone: transaction.billingPhone,
+        phoneNormalized: normalizePhone(transaction.billingPhone),
+        externalCustomerKey: `authorize-net:${transaction.transactionId}`,
+        sourcePlatform: "authorize.net",
+        orders: [order],
+        gatewayPayments: [gateway],
+        productJourney: [productJourneyItem(transaction)],
+        paidProducts: paid ? [productName(transaction)] : [],
+        attemptedProducts: paid ? [] : [productName(transaction)],
+        paidTotal: metrics.rankingTotal,
+        totalPaid: metrics.rankingTotal,
+        lifetimeValue: metrics.rankingTotal,
+        rankingPaidTotal: metrics.rankingTotal,
+        wooPaidTotal: metrics.wooPaidTotal,
+        authorizeNetPaidTotal: metrics.authorizeNetPaidTotal,
+        gatewayOnlyPaidTotal: metrics.gatewayOnlyPaidTotal,
+        attemptedTotal: metrics.attemptedTotal,
+        orderCount: 1,
+        paidOrderCount: paid ? 1 : 0,
+        gatewayPaidCount: paid ? 1 : 0,
+        attemptedOrderCount: paid ? 0 : 1,
+        paidMonths: metrics.paidMonths,
+        firstPaidDate: metrics.firstPaidDate,
+        firstOrderDate: transaction.submittedAt || now,
+        latestOrderDate: transaction.submittedAt || now,
+        customerCreatedAt: transaction.submittedAt || now,
+        latestCustomerCreatedAt: transaction.submittedAt || now,
+        lastOrderDate: transaction.submittedAt || now,
+        lastPaidDate: metrics.lastPaidDate,
+        lastAttemptDate: paid ? "" : transaction.submittedAt,
+        lastPaymentMethod: paid ? "Credit Card Payment" : "",
+        lastAttemptPaymentMethod: paid ? "" : "Credit Card Payment",
+        leadStatus: paid ? "customer" : "hot_lead",
+        paymentStatus: paid ? "paid" : "attempted_unpaid",
+        "businessProfile.businessName": transaction.billingCompany,
+        "businessProfile.company": transaction.billingCompany,
+        "businessProfile.businessNameSource": transaction.billingCompany ? "Authorize.net billing company" : "",
+        "businessProfile.email": email,
+        "businessProfile.phone": transaction.billingPhone,
+        "businessProfile.sourcePlatform": "authorize.net",
+        "businessProfile.source": "authorize.net",
+        "sourceCoverage.syncStatus": "success",
+        "sourceCoverage.dataConfidenceStatus": "Gateway Only / Needs Review",
+        "sourceCoverage.authorizeNetTransactionsFound": 1,
+        "sourceCoverage.gatewayOnlyPaymentsAttached": paid ? 1 : 0,
+        "sourceCoverage.lastAuthorizeNetSyncAt": now,
+        "sourceCoverage.lastSyncedAt": now,
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  ).lean<LeanCustomer | null>().exec();
+  if (!created) {
+    return { matched: false, updated: false, attachedAuthorizeNetOnly: false, verifiedWooOrder: false, skippedDuplicate: false, matchedBy: "", matchConfidence: "not_found", gatewayOnlyCreated: false };
+  }
+  await CustomerRanking.updateOne(
+    { customerId: String(created._id) },
+    {
+      $set: {
+        customerId: String(created._id),
+        name: customerName,
+        email,
+        phone: transaction.billingPhone,
+        businessName: transaction.billingCompany,
+        businessNameSource: transaction.billingCompany ? "Authorize.net billing company" : "",
+        businessNameConfidence: transaction.billingCompany ? "medium" : "",
+        stateCode: "",
+        stateName: "",
+        stateSource: "",
+        stateConfidence: "",
+        enrichmentSource: "authorize.net",
+        lifetimeSpent: metrics.rankingTotal,
+        periodSpent: metrics.rankingTotal,
+        monthlySpent: metrics.rankingTotal,
+        yearlySpent: metrics.rankingTotal,
+        paidMonths: metrics.paidMonths,
+        firstPaidDate: metrics.firstPaidDate,
+        latestPaidDate: metrics.lastPaidDate,
+        activeSubscriptionCount: 0,
+        estimatedMRR: 0,
+        stayWithUsMonths: metrics.stayWithUsMonths,
+        attemptedPipeline: metrics.attemptedTotal,
+        category: metrics.rankingTotal > 0 ? "Paying Customer" : "Hot Lead",
+        generatedAt: now,
+        lastVerifiedAt: now,
+      },
+    },
+    { upsert: true }
+  ).exec();
+  await AuthorizeNetTransaction.updateOne(
+    { transactionId: transaction.transactionId },
+    { $set: { matchedCustomerId: String(created._id), matchedBy: "gateway_only_identity", matchConfidence: paid ? "medium" : "low" } }
+  ).exec();
+  return { matched: true, updated: true, attachedAuthorizeNetOnly: paid, verifiedWooOrder: false, skippedDuplicate: false, matchedBy: "gateway_only_identity", matchConfidence: paid ? "medium" : "low", customerId: String(created._id), gatewayOnlyCreated: true };
+}
+
+async function detachMismatchedEmailAttachment(transaction: AuthorizeNetTransactionDocument, dryRun = false) {
+  const transactionEmail = normalizedEmail(transaction.normalizedEmail || transaction.emailNormalized || transaction.customerEmail);
+  if (!transactionEmail || !transaction.matchedCustomerId) return false;
+  const customer = await Customer.findOne({ _id: transaction.matchedCustomerId }).lean<LeanCustomer | null>().exec();
+  if (!customer) return false;
+  const customerEmail = normalizedEmail(customer.normalizedEmail || customer.email);
+  if (!customerEmail || customerEmail === transactionEmail) return false;
+  const orders = (customer.orders ?? []).filter((order) => order.transactionId !== transaction.transactionId);
+  const gatewayPayments = (customer.gatewayPayments ?? []).filter((payment) => payment.transactionId !== transaction.transactionId);
+  const productJourney = (customer.productJourney ?? []).filter((item) => item.orderNumber !== transaction.invoiceNumber && item.orderNumber !== transaction.transactionId);
+  const metrics = calculateCustomerValueMetrics({ customer: { ...customer, orders, gatewayPayments, productJourney } });
+  if (!dryRun) {
+    await Customer.updateOne({ _id: customer._id }, {
+      $set: {
+        orders,
+        gatewayPayments,
+        productJourney,
+        orderCount: orders.length,
+        paidOrderCount: orders.filter((order) => order.isPaid).length,
+        attemptedOrderCount: orders.filter((order) => order.isAttempted).length,
+        gatewayPaidCount: orders.filter((order) => order.source === "authorize_net_only" && order.isPaid).length,
+        paidTotal: metrics.rankingTotal,
+        totalPaid: metrics.rankingTotal,
+        lifetimeValue: metrics.rankingTotal,
+        rankingPaidTotal: metrics.rankingTotal,
+        wooPaidTotal: metrics.wooPaidTotal,
+        authorizeNetPaidTotal: metrics.authorizeNetPaidTotal,
+        gatewayOnlyPaidTotal: metrics.gatewayOnlyPaidTotal,
+        attemptedTotal: metrics.attemptedTotal,
+        paidMonths: metrics.paidMonths,
+        firstPaidDate: metrics.firstPaidDate,
+        lastPaidDate: metrics.lastPaidDate,
+        paymentStatus: metrics.rankingTotal > 0 ? "paid" : metrics.attemptedTotal > 0 ? "attempted_unpaid" : "unpaid",
+        leadStatus: metrics.rankingTotal > 0 ? "customer" : metrics.attemptedTotal > 0 ? "hot_lead" : "cold_lead",
+        "sourceCoverage.authorizeNetEmailMismatchDetachedAt": new Date().toISOString(),
+      },
+    }).exec();
+    await CustomerRanking.updateOne({ customerId: String(customer._id) }, {
+      $set: {
+        lifetimeSpent: metrics.rankingTotal,
+        periodSpent: metrics.rankingTotal,
+        monthlySpent: metrics.rankingTotal,
+        yearlySpent: metrics.rankingTotal,
+        paidMonths: metrics.paidMonths,
+        latestPaidDate: metrics.lastPaidDate,
+        attemptedPipeline: metrics.attemptedTotal,
+        category: metrics.rankingTotal > 0 ? "Paying Customer" : metrics.attemptedTotal > 0 ? "Hot Lead" : "Cold Lead",
+        lastVerifiedAt: new Date().toISOString(),
+      },
+    }).exec();
+  }
+  return true;
+}
+
 export async function reconcileAuthorizeNetTransaction(transaction: AuthorizeNetTransactionDocument, dryRun = false): Promise<ReconcileResult> {
-  const match = await findAuthorizeNetCustomerMatch(transaction);
-  if (!match.customer) return { matched: false, updated: false, attachedAuthorizeNetOnly: false, verifiedWooOrder: false, skippedDuplicate: false, matchedBy: "", matchConfidence: "not_found" };
+  const detachedMismatch = await detachMismatchedEmailAttachment(transaction, dryRun);
+  const transactionForMatch = detachedMismatch ? { ...transaction, matchedCustomerId: "" } : transaction;
+  const match = await findAuthorizeNetCustomerMatch(transactionForMatch);
+  if (!match.customer) return createGatewayOnlyCustomer(transaction, dryRun);
   const { updates, attachedAuthorizeNetOnly, verifiedWooOrder, skippedDuplicate } = buildReconciledCustomerUpdate(match.customer, transaction, match.matchedBy, match.confidence);
   if (!dryRun) {
     await Customer.updateOne({ _id: match.customer._id }, { $set: updates }).exec();
@@ -350,5 +543,6 @@ export async function reconcileAuthorizeNetTransaction(transaction: AuthorizeNet
     matchedBy: match.matchedBy,
     matchConfidence: match.confidence,
     customerId: String(match.customer._id),
+    gatewayOnlyCreated: false,
   };
 }

@@ -1,4 +1,4 @@
-import { isDeclinedOrFailed, isRefundedOrChargeback, isSettledSuccessful } from "@/lib/authorizeNet";
+import { isAuthorizeNetPaidStatus, isDeclinedOrFailed, isRefundedOrChargeback } from "@/lib/authorizeNet";
 import { isNmiDeclined, isNmiRefundOrChargeback, isNmiSuccessful } from "@/lib/nmiQuickPay";
 import type { AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import type { CustomerDocument, CustomerGatewayPayment, CustomerOrderHistoryItem } from "@/models/Customer";
@@ -51,6 +51,12 @@ function dateKey(value?: string) {
   return value ? value.slice(0, 10) : "";
 }
 
+function amountDateKey(amount: unknown, date?: string) {
+  const rounded = roundMoney(Number(amount ?? 0)).toFixed(2);
+  const day = dateKey(date);
+  return rounded !== "0.00" && day ? `${rounded}:${day}` : "";
+}
+
 function monthKey(value?: string) {
   return value ? value.slice(0, 7) : "";
 }
@@ -100,12 +106,12 @@ function maxDate(values: string[]) {
 }
 
 function isGatewayPaid(payment: CustomerGatewayPayment) {
-  return isSettledSuccessful(payment.status) || /paid|settled/i.test(payment.status ?? "");
+  return isAuthorizeNetPaidStatus(payment.status) || /paid|settled/i.test(payment.status ?? "");
 }
 
 function signedGatewayAmount(status: string, amount: number) {
   if (isRefundedOrChargeback(status)) return -Math.abs(amount);
-  if (isSettledSuccessful(status) || /paid|settled/i.test(status ?? "")) return Math.abs(amount);
+  if (isAuthorizeNetPaidStatus(status) || /paid|settled/i.test(status ?? "")) return Math.abs(amount);
   return 0;
 }
 
@@ -122,6 +128,7 @@ export function calculateCustomerValueMetrics(input: {
 }): CustomerValueMetrics {
   const customer = input.customer ?? {};
   const seen = new Set<string>();
+  const wooAmountDateKeys = new Set<string>();
   const monthKeys = new Set<string>();
   const paidDates: string[] = [];
   const totals: Record<PaidSource, number> = { woocommerce: 0, authorize_net: 0, gateway_only: 0, nmi_quick_pay: 0, subscription: 0 };
@@ -132,6 +139,8 @@ export function calculateCustomerValueMetrics(input: {
   for (const order of input.wooOrders ?? []) {
     if (!order.isPaid) continue;
     const date = order.dateCreated ?? "";
+    const fingerprint = amountDateKey(order.paidAmount ?? order.total, date);
+    if (fingerprint) wooAmountDateKeys.add(fingerprint);
     paidDates.push(date);
     duplicateSkipped += addPaidRecord({
       amount: Number(order.paidAmount ?? order.total ?? 0),
@@ -148,6 +157,10 @@ export function calculateCustomerValueMetrics(input: {
     if (!order.isPaid) continue;
     const source: PaidSource = order.source === "authorize_net_only" ? "gateway_only" : "woocommerce";
     const date = order.paidDate || order.dateCreated;
+    if (source === "woocommerce") {
+      const fingerprint = amountDateKey(order.total, date);
+      if (fingerprint) wooAmountDateKeys.add(fingerprint);
+    }
     paidDates.push(date);
     duplicateSkipped += addPaidRecord({
       amount: Number(order.total ?? 0),
@@ -176,6 +189,11 @@ export function calculateCustomerValueMetrics(input: {
     const signedAmount = nmiPayment
       ? isNmiRefundOrChargeback(payment.status) ? -Math.abs(Number(payment.amount ?? 0)) : Math.abs(Number(payment.amount ?? 0))
       : signedGatewayAmount(payment.status, Number(payment.amount ?? 0));
+    const gatewayDuplicatesWoo = !nmiPayment && signedAmount > 0 && wooAmountDateKeys.has(amountDateKey(signedAmount, payment.date));
+    if (gatewayDuplicatesWoo) {
+      duplicateSkipped += 1;
+      continue;
+    }
     if (signedAmount < 0) hasNegativeGatewayRecord = true;
     paidDates.push(payment.date);
     duplicateSkipped += addPaidRecord({
@@ -190,12 +208,16 @@ export function calculateCustomerValueMetrics(input: {
 
   for (const transaction of input.authorizeNetTransactions ?? []) {
     const status = transaction.transactionStatus ?? "";
-    if (!isSettledSuccessful(status) && !isRefundedOrChargeback(status)) {
+    if (!isAuthorizeNetPaidStatus(status) && !isRefundedOrChargeback(status)) {
       if (isAttemptedGatewayStatus(status)) attemptedGatewayTotal += Math.abs(Number(transaction.amount ?? 0));
       continue;
     }
     const date = transaction.settledAt || transaction.submittedAt || "";
     const signedAmount = isRefundedOrChargeback(status) ? -Math.abs(Number(transaction.amount ?? 0)) : Math.abs(Number(transaction.amount ?? 0));
+    if (signedAmount > 0 && wooAmountDateKeys.has(amountDateKey(signedAmount, date))) {
+      duplicateSkipped += 1;
+      continue;
+    }
     if (signedAmount < 0) hasNegativeGatewayRecord = true;
     paidDates.push(date);
     duplicateSkipped += addPaidRecord({

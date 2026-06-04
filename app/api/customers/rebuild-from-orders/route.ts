@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { resolveBusinessName } from "@/lib/customerBusiness";
 import { calculateCustomerScore, scoreToStars, type CustomerScoreInput } from "@/lib/customerScore";
 import { monthsSince } from "@/lib/customerValue";
 import { customerLedgerRecords, detectAuthorizeNetRecurring } from "@/lib/revenueAnalytics";
@@ -137,6 +138,7 @@ function buildCustomer(group: OrderGroup, rebuildAt: string) {
   const attemptedProducts = unique(attemptedOrders.flatMap((order) => order.lineItems.map((item) => item.name)));
   const summary = buildRuleSummary(latest?.billingName || email, paidTotal, paidOrders.length, attemptedTotal);
   const normalizedEmail = email.trim().toLowerCase();
+  const businessInfo = resolveBusinessName({ orders }, sortedStoredOrders);
 
   return {
     name: latest?.billingName || email,
@@ -144,6 +146,9 @@ function buildCustomer(group: OrderGroup, rebuildAt: string) {
     normalizedEmail,
     externalCustomerKey,
     phone: latest?.billingPhone || "",
+    "businessProfile.businessName": businessInfo.businessName,
+    "businessProfile.company": businessInfo.businessName,
+    "businessProfile.source": businessInfo.businessNameSource,
     paidTotal,
     attemptedTotal,
     totalPaid: paidTotal,
@@ -162,6 +167,9 @@ function buildCustomer(group: OrderGroup, rebuildAt: string) {
     subscriptionStartDate: "",
     stayWithUsMonths: monthsSince(firstPaid?.dateCreated ?? first?.dateCreated ?? ""),
     firstOrderDate: first?.dateCreated ?? rebuildAt,
+    latestOrderDate: latest?.dateCreated ?? rebuildAt,
+    customerCreatedAt: first?.dateCreated ?? rebuildAt,
+    latestCustomerCreatedAt: first?.dateCreated ?? rebuildAt,
     lastOrderDate: latest?.dateCreated ?? rebuildAt,
     lastPaidDate: latestPaid?.dateCreated ?? "",
     lastAttemptDate: latestAttempt?.dateCreated ?? "",
@@ -236,6 +244,7 @@ function buildCustomer(group: OrderGroup, rebuildAt: string) {
       aggregationKeyType: group.keyType,
       lastBackfillImportAt: sortedStoredOrders[0]?.importedAt ?? "",
       lastCustomerRebuildAt: rebuildAt,
+      businessNameSource: businessInfo.businessNameSource,
     },
     ...summary,
   };

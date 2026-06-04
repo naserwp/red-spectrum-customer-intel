@@ -1,4 +1,7 @@
 import { NextResponse } from "next/server";
+import { buildStateOptions } from "@/lib/customerBusinessResolver";
+import { enrichCustomerProfile } from "@/lib/customerEnrichment";
+import { customerSort, dateRangeQuery, normalizedStateParam } from "@/lib/customerTableQuery";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
@@ -51,11 +54,16 @@ const customerProjection = {
   averageOrderValue: 1,
   firstOrderDate: 1,
   lastOrderDate: 1,
+  latestOrderDate: 1,
+  customerCreatedAt: 1,
+  latestCustomerCreatedAt: 1,
   refunds: 1,
   riskExplanation: 1,
   recommendedAction: 1,
   attemptedProducts: 1,
   lastAttemptedProduct: 1,
+  factiivProfile: 1,
+  publicEnrichment: 1,
 } as const;
 
 type LeanCustomer = CustomerDocument & { _id: unknown };
@@ -123,6 +131,9 @@ export async function GET(request: Request) {
   const q = (searchParams.get("q") ?? "").trim();
   const risk = searchParams.get("risk") ?? "";
   const kind = searchParams.get("kind") ?? "";
+  const state = normalizedStateParam(searchParams.get("state"));
+  const newCustomers = searchParams.get("newCustomers") === "true";
+  const newOrders = searchParams.get("newOrders") === "true";
   if (kind === "hot-leads") {
     const textMatch = (row: { name?: string; email?: string; phone?: string }) => {
       if (!q) return true;
@@ -192,6 +203,11 @@ export async function GET(request: Request) {
   }
   const and: Record<string, unknown>[] = [];
   if (risk) and.push({ riskLevel: risk });
+  if (state) and.push({ $or: [{ "businessProfile.stateCode": state }, { "businessProfile.state": state }] });
+  const newCustomerRange = dateRangeQuery(searchParams, "customerCreatedAt");
+  const newOrderRange = dateRangeQuery(searchParams, "latestOrderDate");
+  if (newCustomers && Object.keys(newCustomerRange).length) and.push(newCustomerRange);
+  if (newOrders && Object.keys(newOrderRange).length) and.push(newOrderRange);
   if (q) {
     const normalizedQuery = q.toLowerCase();
     const looksLikeExactEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedQuery);
@@ -206,7 +222,7 @@ export async function GET(request: Request) {
     }
   }
   const query: Record<string, unknown> = and.length ? { $and: and } : {};
-  const sort: Record<string, 1 | -1> = { lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1, attemptedTotal: -1 };
+  const sort = customerSort(searchParams);
   const queryPromise = (async () => {
     const rowsPromise = Customer.find(query, customerProjection).sort(sort).skip((page - 1) * limit).limit(limit).maxTimeMS(7500).lean();
     if (q) {
@@ -225,7 +241,23 @@ export async function GET(request: Request) {
     console.log(`[api] customers-table dbMs=${Date.now() - dbStarted} totalMs=${Date.now() - started} recordsScanned=0 recordsReturned=0 timeout=true responseBytes=${JSON.stringify(payload).length}`);
     return NextResponse.json(payload);
   }
-  const payload = { page, limit, total: result.total, rows: result.rows, partial: false };
+  const rows = result.rows.map((customer) => {
+    const enrichment = enrichCustomerProfile(customer);
+    return {
+      ...customer,
+      _id: String(customer._id),
+      businessName: enrichment.businessName || customer.businessProfile?.businessName || customer.businessProfile?.company || "",
+      businessNameSource: enrichment.businessNameSource || customer.businessProfile?.businessNameSource || "",
+      businessNameConfidence: enrichment.businessNameConfidence || customer.businessProfile?.businessNameConfidence || "",
+      stateCode: enrichment.stateCode || customer.businessProfile?.stateCode || customer.businessProfile?.state || "",
+      stateName: enrichment.stateName,
+      stateSource: enrichment.stateSource || customer.businessProfile?.stateSource || "",
+      stateConfidence: enrichment.stateConfidence || customer.businessProfile?.stateConfidence || "",
+      enrichmentSource: enrichment.enrichmentSource || customer.businessProfile?.enrichmentSource || "",
+    };
+  });
+  const stateOptions = buildStateOptions(rows);
+  const payload = { page, limit, total: result.total, rows, partial: false, state, stateOptions };
   console.log(`[api] customers-table dbMs=${Date.now() - dbStarted} totalMs=${Date.now() - started} recordsScanned=${result.recordsScanned} recordsReturned=${result.rows.length} timeout=false responseBytes=${JSON.stringify(payload).length}`);
   return NextResponse.json(payload);
 }

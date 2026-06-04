@@ -290,6 +290,16 @@ export function isSettledSuccessful(status: string) {
   return normalized.includes("settled");
 }
 
+export function isCapturedPendingSettlement(status: string) {
+  const normalized = status.toLowerCase();
+  if (isRefundedOrChargeback(status) || isDeclinedOrFailed(status)) return false;
+  return normalized.includes("captured") && normalized.includes("pending") && normalized.includes("settlement");
+}
+
+export function isAuthorizeNetPaidStatus(status: string) {
+  return isSettledSuccessful(status) || isCapturedPendingSettlement(status);
+}
+
 export function isDeclinedOrFailed(status: string) {
   const normalized = status.toLowerCase();
   return normalized.includes("declin") || normalized.includes("fail") || normalized.includes("void") || normalized.includes("error");

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { connectToDatabase } from "@/lib/mongodb";
-import { buildStateOptions, normalizeStateCode, resolveCustomerBusinessName, resolveCustomerState } from "@/lib/customerBusinessResolver";
+import { buildStateOptions, normalizeStateCode } from "@/lib/customerBusinessResolver";
+import { enrichCustomerProfile } from "@/lib/customerEnrichment";
 import { computeFundingIntelligence } from "@/lib/fundingIntelligence";
 import { Customer, type CustomerBusinessProfile, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking, type CustomerRankingDocument } from "@/models/CustomerRanking";
@@ -46,6 +47,20 @@ const industryRules: Array<{ pattern: RegExp; match: IndustryMatch }> = [
 function moneyNumber(value: unknown) {
   const n = Number(value ?? 0);
   return Number.isFinite(n) ? n : 0;
+}
+
+function compareRows(sortBy: string, sortDir: string) {
+  const dir = sortDir === "asc" ? 1 : -1;
+  return (a: { lifetimeSpent: number; estimatedMRR: number; paidMonths: number; fundingReadinessScore: number; lastPaidDate?: string; firstPaidDate?: string }, b: { lifetimeSpent: number; estimatedMRR: number; paidMonths: number; fundingReadinessScore: number; lastPaidDate?: string; firstPaidDate?: string }) => {
+    if (sortBy === "monthlyValue") return (Number(a.estimatedMRR) - Number(b.estimatedMRR)) * dir || b.lifetimeSpent - a.lifetimeSpent;
+    if (sortBy === "yearlyValue") return ((Number(a.estimatedMRR) * 12) - (Number(b.estimatedMRR) * 12)) * dir || b.lifetimeSpent - a.lifetimeSpent;
+    if (sortBy === "lastPaid" || sortBy === "latestOrder") return String(a.lastPaidDate ?? "").localeCompare(String(b.lastPaidDate ?? "")) * dir || b.lifetimeSpent - a.lifetimeSpent;
+    if (sortBy === "oldestOrder") return String(a.lastPaidDate ?? "").localeCompare(String(b.lastPaidDate ?? "")) || b.lifetimeSpent - a.lifetimeSpent;
+    if (sortBy === "newestCustomer") return String(a.firstPaidDate ?? "").localeCompare(String(b.firstPaidDate ?? "")) * -1 || b.lifetimeSpent - a.lifetimeSpent;
+    if (sortBy === "oldestCustomer") return String(a.firstPaidDate ?? "").localeCompare(String(b.firstPaidDate ?? "")) || b.lifetimeSpent - a.lifetimeSpent;
+    if (sortBy === "lifetimeValue") return (a.lifetimeSpent - b.lifetimeSpent) * dir;
+    return b.fundingReadinessScore - a.fundingReadinessScore || b.lifetimeSpent - a.lifetimeSpent;
+  };
 }
 
 function classifyIndustry(customer: LeanCustomer): IndustryMatch {
@@ -133,6 +148,8 @@ export async function GET(request: Request) {
   const page = Math.max(1, Number(searchParams.get("page") ?? 1));
   const limit = Math.min(100, Math.max(1, Number(searchParams.get("limit") ?? 50)));
   const q = (searchParams.get("q") ?? "").trim().toLowerCase();
+  const sortBy = searchParams.get("sortBy") ?? "";
+  const sortDir = searchParams.get("sortDir") ?? "desc";
 
   const [customers, rankings] = await Promise.all([
     Customer.find(q ? { $or: [{ normalizedEmail: q }, { emailNormalized: q }, { name: { $regex: q, $options: "i" } }, { "businessProfile.company": { $regex: q, $options: "i" } }] } : {}, {
@@ -141,7 +158,7 @@ export async function GET(request: Request) {
       activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, recurringNextEstimatedPayment: 1, riskLevel: 1, failedPayments: 1,
       chargebacks: 1, tier: 1, score: 1, lastPaidDate: 1, firstPaidDate: 1, paidProducts: 1, baseProductsPurchased: 1, creditProfile: 1, factiivProfile: 1, publicEnrichment: 1,
       profile: 1, billingState: 1, billingAddress: 1, shippingState: 1, address: 1, billing: 1, shipping: 1, state: 1, orders: 1,
-    }).sort({ lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1 }).limit(5000).lean<LeanCustomer[]>(),
+    }).sort({ _id: 1 }).limit(5000).lean<LeanCustomer[]>(),
     CustomerRanking.find({}).sort({ lifetimeSpent: -1 }).limit(5000).lean<CustomerRankingDocument[]>(),
   ]);
   const latestOrders = await latestWooOrdersByEmail(customers);
@@ -157,10 +174,9 @@ export async function GET(request: Request) {
     const insight = insights(customer, score, lifetime, completeness, industry);
     const latestWooOrder = latestOrders.get(normalizedEmail(customer.normalizedEmail || customer.email));
     const resolverInput = latestWooOrder ? { ...customer, latestWooOrder } : customer;
-    const businessInfo = resolveCustomerBusinessName(resolverInput);
-    const stateInfo = resolveCustomerState(resolverInput);
-    const businessName = businessInfo.businessName || ranking?.businessName || "";
-    const stateCode = stateInfo.stateCode || ranking?.stateCode || "";
+    const enrichment = enrichCustomerProfile(resolverInput);
+    const businessName = enrichment.businessName || ranking?.businessName || "";
+    const stateCode = enrichment.stateCode || ranking?.stateCode || "";
     return {
       _id: String(customer._id),
       name: customer.name,
@@ -168,16 +184,29 @@ export async function GET(request: Request) {
       phone: customer.phone,
       company: businessName,
       businessName,
-      businessNameSource: businessInfo.businessNameSource || ranking?.businessNameSource || "",
+      businessNameSource: enrichment.businessNameSource || ranking?.businessNameSource || "",
+      businessNameConfidence: enrichment.businessName ? enrichment.businessNameConfidence : ranking?.businessNameConfidence || "",
       stateCode,
-      stateName: stateInfo.stateName || ranking?.stateName || "",
-      stateSource: stateInfo.stateSource || ranking?.stateSource || "",
+      stateName: enrichment.stateName || ranking?.stateName || "",
+      stateSource: enrichment.stateSource || ranking?.stateSource || "",
+      stateConfidence: enrichment.stateCode ? enrichment.stateConfidence : ranking?.stateConfidence || "",
+      enrichmentSource: enrichment.enrichmentSource !== "unresolved" ? enrichment.enrichmentSource : ranking?.enrichmentSource || "",
       industry: industry.industry,
       industryClassification: industry.classification,
       naicsCode: industry.naicsCode,
       sicCode: industry.sicCode,
       fundingReadinessScore: score,
       fundingReadinessTier: readinessTier,
+      fundingScore: funding.fundingScore,
+      fundingCategory: funding.fundingCategory,
+      recommendedFundingProducts: funding.recommendedFundingProducts,
+      fundingStrengths: funding.fundingStrengths,
+      fundingWeaknesses: funding.fundingWeaknesses,
+      nextBestAction: funding.nextBestAction,
+      fundingSummary: funding.fundingSummary,
+      businessVerificationScore: funding.businessVerificationScore,
+      industryRiskScore: funding.industryRiskScore,
+      scoreBreakdown: funding.scoreBreakdown,
       vipTier: funding.vipTier,
       lifetimeSpent: lifetime,
       estimatedMRR: moneyNumber(ranking?.estimatedMRR ?? customer.recurringAmount),
@@ -204,7 +233,7 @@ export async function GET(request: Request) {
   }).filter((row) => row.lifetimeSpent >= minSpent)
     .filter((row) => !tier || row.vipTier === tier)
     .filter((row) => !readiness || row.fundingReadinessTier === readiness)
-    .sort((a, b) => b.fundingReadinessScore - a.fundingReadinessScore || b.lifetimeSpent - a.lifetimeSpent);
+    .sort(compareRows(sortBy, sortDir));
   const stateOptions = buildStateOptions(allRows);
   const rows = state ? allRows.filter((row) => row.stateCode === state) : allRows;
   const start = (page - 1) * limit;
@@ -214,6 +243,13 @@ export async function GET(request: Request) {
     vipReady: rows.filter((row) => row.fundingReadinessScore >= 75 && row.lifetimeSpent >= 5000).length,
     averageScore: rows.length ? Math.round(rows.reduce((sum, row) => sum + row.fundingReadinessScore, 0) / rows.length) : 0,
     totalLifetimeValue: rows.reduce((sum, row) => sum + row.lifetimeSpent, 0),
+    readyNow: rows.filter((row) => row.fundingCategory === "Ready Now").length,
+    readyIn30Days: rows.filter((row) => row.fundingCategory === "Ready in 30 Days").length,
+    readyIn90Days: rows.filter((row) => row.fundingCategory === "Ready in 90 Days").length,
+    needsCreditBuilding: rows.filter((row) => row.fundingCategory === "Needs More Credit Building").length,
+    averageFundingScore: rows.length ? Math.round(rows.reduce((sum, row) => sum + Number(row.fundingScore ?? 0), 0) / rows.length) : 0,
+    readyNowRevenue: rows.filter((row) => row.fundingCategory === "Ready Now").reduce((sum, row) => sum + row.lifetimeSpent, 0),
+    topFundingReadyCustomers: rows.filter((row) => row.fundingCategory === "Ready Now").slice(0, 10),
   };
   return NextResponse.json({
     page,

@@ -272,6 +272,16 @@ type BusinessProfile = {
   sicCode?: string;
   fundingReadinessScore?: number;
   fundingReadinessTier?: string;
+  fundingScore?: number;
+  fundingCategory?: string;
+  recommendedFundingProducts?: string[];
+  fundingStrengths?: string[];
+  fundingWeaknesses?: string[];
+  nextBestAction?: string;
+  fundingSummary?: string;
+  businessVerificationScore?: number;
+  industryRiskScore?: number;
+  fundingScoreBreakdown?: Record<string, number>;
   source?: string;
   importedAt?: string;
 };
@@ -1160,6 +1170,9 @@ export default function CustomerDetailPage() {
         </div> : null}
         <div className="mt-3 grid gap-3 md:grid-cols-4">
           {[
+            ["Funding Score", String(Number(profile.fundingScore ?? profile.fundingReadinessScore ?? 0))],
+            ["Funding Category", profile.fundingCategory || profile.fundingReadinessTier || fundingTierDisplay],
+            ["Eligible Products", profile.recommendedFundingProducts?.length ? profile.recommendedFundingProducts.join(", ") : "-"],
             ["Factiiv Score", factiiv.factiivMatched ? String(Number(factiiv.factiivScore ?? profile.fundingReadinessScore ?? 0)) : "Not matched"],
             ["Funding Tier", fundingTierDisplay],
             ["Trade Lines", factiiv.factiivMatched ? String(factiiv.tradeQuantity ?? 0) : "Not matched"],
@@ -1175,6 +1188,36 @@ export default function CustomerDetailPage() {
             <p className="mt-2 text-sm font-semibold text-zinc-100">{String(value)}</p>
           </div>)}
         </div>
+        {(profile.fundingStrengths?.length || profile.fundingWeaknesses?.length || profile.nextBestAction || profile.fundingSummary || profile.fundingScoreBreakdown) ? <div className="mt-4 grid gap-3 lg:grid-cols-3">
+          <div className="rounded border border-sky-900/60 bg-zinc-950/70 p-4">
+            <p className="text-xs font-semibold uppercase text-sky-200/80">Score Breakdown</p>
+            <div className="mt-3 space-y-2 text-sm text-zinc-300">
+              {Object.entries(profile.fundingScoreBreakdown ?? {}).length ? Object.entries(profile.fundingScoreBreakdown ?? {}).map(([key, value]) => (
+                <p key={key} className="flex justify-between gap-3"><span>{displayStatus(key)}</span><span className="font-semibold text-zinc-100">{Number(value)}</span></p>
+              )) : <>
+                <p className="flex justify-between gap-3"><span>Business Verification</span><span className="font-semibold text-zinc-100">{Number(profile.businessVerificationScore ?? 0)}</span></p>
+                <p className="flex justify-between gap-3"><span>Industry Risk</span><span className="font-semibold text-zinc-100">{Number(profile.industryRiskScore ?? 0)}</span></p>
+              </>}
+            </div>
+          </div>
+          <div className="rounded border border-sky-900/60 bg-zinc-950/70 p-4">
+            <p className="text-xs font-semibold uppercase text-sky-200/80">Strengths</p>
+            <ul className="mt-3 space-y-2 text-sm text-zinc-200">
+              {(profile.fundingStrengths?.length ? profile.fundingStrengths : ["-"]).map((item) => <li key={item}>{item}</li>)}
+            </ul>
+          </div>
+          <div className="rounded border border-sky-900/60 bg-zinc-950/70 p-4">
+            <p className="text-xs font-semibold uppercase text-sky-200/80">Weaknesses / Next Action</p>
+            <ul className="mt-3 space-y-2 text-sm text-zinc-200">
+              {(profile.fundingWeaknesses?.length ? profile.fundingWeaknesses : ["-"]).map((item) => <li key={item}>{item}</li>)}
+            </ul>
+            {profile.nextBestAction ? <p className="mt-3 border-t border-zinc-800 pt-3 text-sm text-zinc-100">{profile.nextBestAction}</p> : null}
+          </div>
+          {profile.fundingSummary ? <div className="rounded border border-sky-900/60 bg-zinc-950/70 p-4 lg:col-span-3">
+            <p className="text-xs font-semibold uppercase text-sky-200/80">Funding Summary</p>
+            <p className="mt-2 text-sm text-zinc-100">{profile.fundingSummary}</p>
+          </div> : null}
+        </div> : null}
         {factiivTrades.length > 0 ? <div className="mt-4 rounded border border-sky-900/60 bg-zinc-950/70 p-4">
           <p className="text-xs font-semibold uppercase text-sky-200/80">Factiiv Trades</p>
           <div className="mt-3 grid gap-3 lg:grid-cols-2">

@@ -44,6 +44,20 @@ type CustomerGatewayMetric = {
   lastOrderDate: string;
 };
 
+type GatewayTransactionRow = {
+  sourceGateway: Provider;
+  transactionId: string;
+  invoiceNumber: string;
+  amount: number;
+  status: string;
+  submittedAt: string;
+  settledAt: string;
+  cardLast4: string;
+  customerProfileId: string;
+  paymentProfileId: string;
+  matchedCustomer: string;
+};
+
 const defaultProviders: Provider[] = ["authorize_net", "nmi", "stripe", "crypto", "woocommerce", "unknown"];
 const statusFilters: StatusFilter[] = ["all", "paid", "attempted", "failed", "refunded", "verified", "not_verified"];
 const intervals: Interval[] = ["lifetime", "year", "month", "week", "day"];
@@ -462,6 +476,45 @@ export async function GET(request: Request) {
     .sort((a, b) => b.paidRevenue - a.paidRevenue || b.attemptedPipeline - a.attemptedPipeline || b.orderCount - a.orderCount)
     .slice(0, 50);
 
+  const recentTransactions: GatewayTransactionRow[] = [
+    ...authorizeNetTransactions
+      .filter((transaction) => {
+        const date = new Date(transaction.settledAt || transaction.submittedAt || "");
+        return !Number.isNaN(date.getTime()) && date >= from && date <= to && (requestedProvider === "all" || requestedProvider === "authorize_net") && includeTransactionStatus(transaction, status);
+      })
+      .map((transaction) => ({
+        sourceGateway: "authorize_net" as const,
+        transactionId: transaction.transactionId,
+        invoiceNumber: transaction.invoiceNumber,
+        amount: transaction.amount,
+        status: transaction.transactionStatus,
+        submittedAt: transaction.submittedAt,
+        settledAt: transaction.settledAt,
+        cardLast4: transaction.cardLast4,
+        customerProfileId: transaction.customerProfileId,
+        paymentProfileId: transaction.customerPaymentProfileId,
+        matchedCustomer: transaction.matchedCustomerId || transaction.normalizedEmail || transaction.customerName,
+      })),
+    ...nmiTransactions
+      .filter((transaction) => {
+        const date = new Date(transaction.settledAt || transaction.submittedAt || "");
+        return !Number.isNaN(date.getTime()) && date >= from && date <= to && (requestedProvider === "all" || requestedProvider === "nmi") && includeNmiTransactionStatus(transaction, status);
+      })
+      .map((transaction) => ({
+        sourceGateway: "nmi" as const,
+        transactionId: transaction.transactionId,
+        invoiceNumber: transaction.invoiceNumber,
+        amount: transaction.amount,
+        status: transaction.transactionStatus,
+        submittedAt: transaction.submittedAt,
+        settledAt: transaction.settledAt,
+        cardLast4: transaction.cardLast4,
+        customerProfileId: transaction.customerVaultId,
+        paymentProfileId: transaction.customerPaymentProfileId,
+        matchedCustomer: transaction.matchedCustomerId || transaction.normalizedEmail || transaction.customerName,
+      })),
+  ].sort((a, b) => String(b.settledAt || b.submittedAt).localeCompare(String(a.settledAt || a.submittedAt))).slice(0, 100);
+
   return {
     filters: {
       from: from.toISOString().slice(0, 10),
@@ -487,6 +540,8 @@ export async function GET(request: Request) {
     byProvider,
     timeline,
     topCustomersByGateway,
+    recentTransactions,
+    historyNote: "Gateway API may limit historical reporting. Stored historical transactions are preserved.",
   };
   });
 }

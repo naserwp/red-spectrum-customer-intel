@@ -20,6 +20,9 @@ type SyncedCustomer = CustomerScoreInput & ProductJourneySummary & {
   paidOrderCount: number;
   attemptedOrderCount: number;
   firstOrderDate: string;
+  latestOrderDate?: string;
+  customerCreatedAt?: string;
+  latestCustomerCreatedAt?: string;
   lastPaidDate: string;
   lastAttemptDate: string;
   lastOrderAmount: number;
@@ -344,6 +347,7 @@ async function transformOrdersToCustomers(orders: WooCommerceOrder[]) {
       paidOrderCount: (existing?.paidOrderCount ?? 0) + (isPaidOrder(order) ? 1 : 0),
       attemptedOrderCount: (existing?.attemptedOrderCount ?? 0) + (!isPaidOrder(order) ? 1 : 0),
       firstOrderDate: !existing ? orderDate : new Date(orderDate) < new Date(existing.firstOrderDate) ? orderDate : existing.firstOrderDate,
+      latestOrderDate: isLatest || !existing ? orderDate : existing.lastOrderDate,
       lastOrderDate: isLatest || !existing ? orderDate : existing.lastOrderDate,
       lastPaidDate: isLatestPaid ? orderDate : existing?.lastPaidDate ?? "",
       lastAttemptDate: isLatestAttempt ? orderDate : existing?.lastAttemptDate ?? "",
@@ -389,6 +393,8 @@ async function transformOrdersToCustomers(orders: WooCommerceOrder[]) {
       paymentStatus: getPaymentStatus(customer.paidTotal, customer.attemptedTotal, customer.lastAttemptStatus, customer.lastAttemptPaymentMethod),
       riskLevel: getRiskLevel(customer, score),
       lastSyncedAt: todayIso,
+      customerCreatedAt: customer.firstOrderDate,
+      latestCustomerCreatedAt: customer.firstOrderDate,
       score,
       stars: scoreToStars(score),
       leadUrgency,

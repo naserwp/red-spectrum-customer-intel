@@ -123,6 +123,7 @@ export interface CustomerBusinessProfile {
   lastName: string;
   businessName?: string;
   businessNameSource?: string;
+  businessNameConfidence?: string;
   company: string;
   dba: string;
   email: string;
@@ -139,6 +140,8 @@ export interface CustomerBusinessProfile {
   state: string;
   stateCode?: string;
   stateSource?: string;
+  stateConfidence?: string;
+  enrichmentSource?: string;
   zip: string;
   country: string;
   website: string;
@@ -167,6 +170,16 @@ export interface CustomerBusinessProfile {
   sicCode: string;
   fundingReadinessScore: number;
   fundingReadinessTier: string;
+  fundingScore?: number;
+  fundingCategory?: string;
+  recommendedFundingProducts?: string[];
+  fundingStrengths?: string[];
+  fundingWeaknesses?: string[];
+  nextBestAction?: string;
+  fundingSummary?: string;
+  businessVerificationScore?: number;
+  industryRiskScore?: number;
+  fundingScoreBreakdown?: Record<string, number>;
   source: string;
   importedAt: string;
 }
@@ -196,6 +209,12 @@ export interface CustomerCreditProfile {
 export interface CustomerFactiivProfile {
   profileId?: string;
   factiivProfileId: string;
+  score?: number;
+  businessScore?: number;
+  creditScore?: number;
+  report?: Record<string, unknown>;
+  analytics?: Record<string, unknown>;
+  funding?: Record<string, unknown>;
   factiivScore: number;
   reputationScore: number;
   historyScore: number;
@@ -293,6 +312,9 @@ export interface CustomerDocument {
   subscriptionStartDate: string;
   stayWithUsMonths: number;
   firstOrderDate: string;
+  latestOrderDate?: string;
+  customerCreatedAt?: string;
+  latestCustomerCreatedAt?: string;
   lastOrderDate: string;
   lastPaidDate: string;
   lastAttemptDate: string;
@@ -408,6 +430,11 @@ export interface CustomerSourceCoverage {
   socialProfilesFound?: number;
   publicBusinessDataFound?: boolean;
   lastEnrichmentRun?: string;
+  lastCustomerVerificationAt?: string;
+  customerVerificationSources?: Record<string, unknown>;
+  customerVerificationChangedFields?: string[];
+  lastWooLiveSyncAt?: string;
+  liveWooSyncOrderIds?: number[];
 }
 
 const customerOrderLineItemSchema = new Schema<CustomerOrderLineItem>(
@@ -562,6 +589,11 @@ const customerSourceCoverageSchema = new Schema<CustomerSourceCoverage>(
     socialProfilesFound: { type: Number, default: 0 },
     publicBusinessDataFound: { type: Boolean, default: false },
     lastEnrichmentRun: { type: String, default: "" },
+    lastCustomerVerificationAt: { type: String, default: "" },
+    customerVerificationSources: { type: Schema.Types.Mixed, default: () => ({}) },
+    customerVerificationChangedFields: { type: [String], default: [] },
+    lastWooLiveSyncAt: { type: String, default: "" },
+    liveWooSyncOrderIds: { type: [Number], default: [] },
   },
   { _id: false }
 );
@@ -606,6 +638,7 @@ const customerBusinessProfileSchema = new Schema<CustomerBusinessProfile>(
     lastName: { type: String, default: "" },
     businessName: { type: String, default: "" },
     businessNameSource: { type: String, default: "" },
+    businessNameConfidence: { type: String, default: "" },
     company: { type: String, default: "" },
     dba: { type: String, default: "" },
     email: { type: String, default: "" },
@@ -622,6 +655,8 @@ const customerBusinessProfileSchema = new Schema<CustomerBusinessProfile>(
     state: { type: String, default: "" },
     stateCode: { type: String, default: "" },
     stateSource: { type: String, default: "" },
+    stateConfidence: { type: String, default: "" },
+    enrichmentSource: { type: String, default: "" },
     zip: { type: String, default: "" },
     country: { type: String, default: "" },
     website: { type: String, default: "" },
@@ -650,6 +685,16 @@ const customerBusinessProfileSchema = new Schema<CustomerBusinessProfile>(
     sicCode: { type: String, default: "" },
     fundingReadinessScore: { type: Number, default: 0 },
     fundingReadinessTier: { type: String, default: "" },
+    fundingScore: { type: Number, default: 0 },
+    fundingCategory: { type: String, default: "" },
+    recommendedFundingProducts: { type: [String], default: [] },
+    fundingStrengths: { type: [String], default: [] },
+    fundingWeaknesses: { type: [String], default: [] },
+    nextBestAction: { type: String, default: "" },
+    fundingSummary: { type: String, default: "" },
+    businessVerificationScore: { type: Number, default: 0 },
+    industryRiskScore: { type: Number, default: 0 },
+    fundingScoreBreakdown: { type: Schema.Types.Mixed, default: () => ({}) },
     source: { type: String, default: "" },
     importedAt: { type: String, default: "" },
   },
@@ -685,6 +730,12 @@ const customerFactiivProfileSchema = new Schema<CustomerFactiivProfile>(
   {
     profileId: { type: String, default: "" },
     factiivProfileId: { type: String, default: "" },
+    score: { type: Number, default: 0 },
+    businessScore: { type: Number, default: 0 },
+    creditScore: { type: Number, default: 0 },
+    report: { type: Schema.Types.Mixed, default: () => ({}) },
+    analytics: { type: Schema.Types.Mixed, default: () => ({}) },
+    funding: { type: Schema.Types.Mixed, default: () => ({}) },
     factiivScore: { type: Number, default: 0 },
     reputationScore: { type: Number, default: 0 },
     historyScore: { type: Number, default: 0 },
@@ -794,6 +845,9 @@ const customerSchema = new Schema<CustomerDocument>(
     subscriptionStartDate: { type: String, default: "" },
     stayWithUsMonths: { type: Number, default: 0 },
     firstOrderDate: { type: String, default: new Date(0).toISOString() },
+    latestOrderDate: { type: String, default: "", index: true },
+    customerCreatedAt: { type: String, default: "", index: true },
+    latestCustomerCreatedAt: { type: String, default: "", index: true },
     lastOrderDate: { type: String, required: true },
     lastPaidDate: { type: String, default: "" },
     lastAttemptDate: { type: String, default: "" },
@@ -871,6 +925,9 @@ customerSchema.pre("validate", function () {
   this.lifetimeValue = paidValue;
   this.rankingPaidTotal = paidValue;
   if (!this.firstPaidDate) this.firstPaidDate = this.lastPaidDate || this.firstOrderDate || "";
+  if (!this.latestOrderDate) this.latestOrderDate = this.lastOrderDate || this.firstOrderDate || "";
+  if (!this.customerCreatedAt) this.customerCreatedAt = this.firstOrderDate || "";
+  if (!this.latestCustomerCreatedAt) this.latestCustomerCreatedAt = this.customerCreatedAt || "";
   if (!this.paidMonths) this.paidMonths = this.paidOrderCount ?? 0;
   if (!this.score) this.score = calculateCustomerScore(this as unknown as CustomerDocument);
   if (!this.stars) this.stars = scoreToStars(this.score);
@@ -882,6 +939,13 @@ customerSchema.index({ phoneNormalized: 1 });
 customerSchema.index({ name: 1 });
 customerSchema.index({ rankingPaidTotal: -1 });
 customerSchema.index({ lifetimeValue: -1 });
+customerSchema.index({ lifetimeValue: -1, rankingPaidTotal: -1 });
+customerSchema.index({ lastPaidDate: -1 });
+customerSchema.index({ lastOrderDate: -1 });
+customerSchema.index({ latestOrderDate: -1 });
+customerSchema.index({ latestCustomerCreatedAt: -1 });
+customerSchema.index({ "businessProfile.stateCode": 1 });
+customerSchema.index({ "businessProfile.state": 1 });
 customerSchema.index({ isGatewayRecurring: 1, recurringNextEstimatedPayment: 1 });
 customerSchema.index({ createdAt: -1 });
 customerSchema.index({ "orders.transactionId": 1 });

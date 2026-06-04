@@ -1,4 +1,4 @@
-import { isSettledSuccessful } from "@/lib/authorizeNet";
+import { isAuthorizeNetPaidStatus } from "@/lib/authorizeNet";
 import type { AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import type { CustomerGatewayPayment, CustomerOrderHistoryItem } from "@/models/Customer";
 import type { WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
@@ -112,7 +112,7 @@ export function dedupePaidRecords(records: PaidLedgerRecord[]) {
 }
 
 function isGatewayPaid(payment: CustomerGatewayPayment) {
-  return isSettledSuccessful(payment.status) || /paid|settled/i.test(payment.status ?? "");
+  return isAuthorizeNetPaidStatus(payment.status) || /paid|settled/i.test(payment.status ?? "");
 }
 
 export function customerLedgerRecords(customer: LedgerCustomer) {
@@ -169,7 +169,7 @@ export function wooOrderLedgerRecords(orders: Partial<WooCommerceOrderDocument>[
 }
 
 export function authorizeNetLedgerRecords(transactions: Partial<AuthorizeNetTransactionDocument>[]) {
-  return transactions.filter((transaction) => isSettledSuccessful(transaction.transactionStatus ?? "")).map((transaction) => ({
+  return transactions.filter((transaction) => isAuthorizeNetPaidStatus(transaction.transactionStatus ?? "")).map((transaction) => ({
     customerId: transaction.matchedCustomerId,
     customerName: transaction.customerName,
     email: transaction.normalizedEmail || transaction.emailNormalized || transaction.customerEmail,

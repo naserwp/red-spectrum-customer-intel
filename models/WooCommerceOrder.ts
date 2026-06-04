@@ -123,6 +123,8 @@ const wooCommerceOrderSchema = new Schema<WooCommerceOrderDocument>(
 wooCommerceOrderSchema.index({ normalizedCompany: 1, billingName: 1 });
 wooCommerceOrderSchema.index({ orderNumber: 1 });
 wooCommerceOrderSchema.index({ transactionId: 1 });
+wooCommerceOrderSchema.index({ normalizedEmail: 1, dateCreated: -1 });
+wooCommerceOrderSchema.index({ isPaid: 1, dateCreated: -1 });
 wooCommerceOrderSchema.index({ createdAt: -1 });
 
 export const WooCommerceOrderRecord = mongoose.models.WooCommerceOrderRecord || mongoose.model<WooCommerceOrderDocument>("WooCommerceOrderRecord", wooCommerceOrderSchema);

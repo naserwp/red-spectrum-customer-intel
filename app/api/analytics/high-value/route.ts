@@ -1,17 +1,13 @@
 import { NextResponse } from "next/server";
-import { buildStateOptions, normalizeStateCode, resolveCustomerBusinessName, resolveCustomerState } from "@/lib/customerBusinessResolver";
+import { buildStateOptions, normalizeStateCode } from "@/lib/customerBusinessResolver";
+import { enrichCustomerProfile } from "@/lib/customerEnrichment";
+import { rankingSort } from "@/lib/customerTableQuery";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking, type CustomerRankingDocument } from "@/models/CustomerRanking";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 
 export const dynamic = "force-dynamic";
-
-function sortForPeriod(period: string): Record<string, 1 | -1> {
-  if (period === "monthly") return { monthlySpent: -1, lifetimeSpent: -1 };
-  if (period === "yearly") return { yearlySpent: -1, lifetimeSpent: -1 };
-  return { lifetimeSpent: -1 };
-}
 
 function periodSpent(row: CustomerRankingDocument, period: string) {
   if (period === "monthly") return row.monthlySpent;
@@ -58,7 +54,7 @@ export async function GET(request: Request) {
   const state = normalizeStateCode(searchParams.get("state"));
   const page = Math.max(1, Number(searchParams.get("page") ?? 1));
   const limit = Math.min(100, Math.max(1, Number(searchParams.get("limit") ?? 25)));
-  const sort = sortForPeriod(period);
+  const sort = rankingSort(searchParams, period);
   const [total, records] = await Promise.all([
     CustomerRanking.countDocuments({}),
     CustomerRanking.find({}).sort(sort).limit(10000).lean<CustomerRankingDocument[]>(),
@@ -69,7 +65,7 @@ export async function GET(request: Request) {
       Customer.countDocuments({ $or: [{ lifetimeValue: { $gt: 0 } }, { rankingPaidTotal: { $gt: 0 } }, { paidTotal: { $gt: 0 } }, { attemptedTotal: { $gt: 0 } }] }),
       Customer.find(
         fallbackQuery,
-        { name: 1, email: 1, normalizedEmail: 1, phone: 1, lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, attemptedTotal: 1, paidMonths: 1, paidOrderCount: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaidDate: 1, lastOrderDate: 1, activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, stayWithUsMonths: 1, tier: 1, paymentStatus: 1, riskLevel: 1, score: 1, estimatedCreditLimit: 1, actualCreditLimit: 1, businessProfile: 1, profile: 1, billingState: 1, billingAddress: 1, shippingState: 1, address: 1, billing: 1, shipping: 1, state: 1, orders: 1 },
+        { name: 1, email: 1, normalizedEmail: 1, phone: 1, lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, attemptedTotal: 1, paidMonths: 1, paidOrderCount: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaidDate: 1, lastOrderDate: 1, activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, stayWithUsMonths: 1, tier: 1, paymentStatus: 1, riskLevel: 1, score: 1, estimatedCreditLimit: 1, actualCreditLimit: 1, businessProfile: 1, profile: 1, billingState: 1, billingAddress: 1, shippingState: 1, address: 1, billing: 1, shipping: 1, state: 1, orders: 1, factiivProfile: 1, publicEnrichment: 1 },
       ).sort({ lifetimeValue: -1, rankingPaidTotal: -1, paidTotal: -1 }).limit(10000).lean<Array<CustomerDocument & { _id: unknown }>>(),
     ]);
     const latestOrders = await latestWooOrdersByEmail(fallbackCustomers);
@@ -77,8 +73,7 @@ export async function GET(request: Request) {
       const lifetimeSpent = Number(customer.lifetimeValue ?? customer.rankingPaidTotal ?? customer.paidTotal ?? customer.totalPaid ?? 0);
       const latestWooOrder = latestOrders.get(normalizedEmail(customer.normalizedEmail || customer.email));
       const resolverInput = latestWooOrder ? { ...customer, latestWooOrder } : customer;
-      const businessInfo = resolveCustomerBusinessName(resolverInput);
-      const stateInfo = resolveCustomerState(resolverInput);
+      const enrichment = enrichCustomerProfile(resolverInput);
       return {
         _id: String(customer._id),
         name: customer.name,
@@ -98,11 +93,14 @@ export async function GET(request: Request) {
         stayWithUsMonths: Number(customer.stayWithUsMonths ?? 0),
         attemptedPipeline: Number(customer.attemptedTotal ?? 0),
         category: lifetimeSpent >= 2000 ? "VIP Paid Customer" : lifetimeSpent > 0 ? "Paying Customer" : "Hot Lead",
-        businessName: businessInfo.businessName,
-        businessNameSource: businessInfo.businessNameSource,
-        stateCode: stateInfo.stateCode,
-        stateName: stateInfo.stateName,
-        stateSource: stateInfo.stateSource,
+        businessName: enrichment.businessName,
+        businessNameSource: enrichment.businessNameSource,
+        businessNameConfidence: enrichment.businessNameConfidence,
+        stateCode: enrichment.stateCode,
+        stateName: enrichment.stateName,
+        stateSource: enrichment.stateSource,
+        stateConfidence: enrichment.stateConfidence,
+        enrichmentSource: enrichment.enrichmentSource,
         tier: customer.tier,
         paymentStatus: customer.paymentStatus,
         riskLevel: customer.riskLevel,
@@ -134,7 +132,7 @@ export async function GET(request: Request) {
   }
   const customerIds = records.map((row) => row.customerId);
   const customerDetails = customerIds.length ? await Customer.find({ _id: { $in: customerIds } }, {
-    email: 1, normalizedEmail: 1, businessProfile: 1, profile: 1, tier: 1, paymentStatus: 1, riskLevel: 1, score: 1, estimatedCreditLimit: 1, actualCreditLimit: 1, billingState: 1, billingAddress: 1, shippingState: 1, address: 1, billing: 1, shipping: 1, state: 1, orders: 1,
+    email: 1, normalizedEmail: 1, businessProfile: 1, profile: 1, tier: 1, paymentStatus: 1, riskLevel: 1, score: 1, estimatedCreditLimit: 1, actualCreditLimit: 1, billingState: 1, billingAddress: 1, shippingState: 1, address: 1, billing: 1, shipping: 1, state: 1, orders: 1, factiivProfile: 1, publicEnrichment: 1,
   }).lean<Array<CustomerDocument & { _id: unknown }>>() : [];
   const latestOrders = await latestWooOrdersByEmail(customerDetails);
   const customerDetailById = new Map(customerDetails.map((customer) => [String(customer._id), customer]));
@@ -142,10 +140,9 @@ export async function GET(request: Request) {
     const detail = customerDetailById.get(row.customerId);
     const latestWooOrder = latestOrders.get(normalizedEmail(detail?.normalizedEmail || detail?.email || row.email));
     const resolverInput = detail && latestWooOrder ? { ...detail, latestWooOrder } : detail;
-    const businessInfo = resolveCustomerBusinessName(resolverInput);
-    const stateInfo = resolveCustomerState(resolverInput);
-    const businessName = businessInfo.businessName || row.businessName || "";
-    const stateCode = stateInfo.stateCode || row.stateCode || "";
+    const enrichment = enrichCustomerProfile(resolverInput);
+    const businessName = enrichment.businessName || row.businessName || "";
+    const stateCode = enrichment.stateCode || row.stateCode || "";
     return ({
     _id: row.customerId,
     name: row.name,
@@ -166,10 +163,13 @@ export async function GET(request: Request) {
     attemptedPipeline: row.attemptedPipeline,
     category: row.category,
     businessName,
-    businessNameSource: businessInfo.businessNameSource || row.businessNameSource || "",
+    businessNameSource: enrichment.businessNameSource || row.businessNameSource || "",
+    businessNameConfidence: enrichment.businessName ? enrichment.businessNameConfidence : row.businessNameConfidence || "",
     stateCode,
-    stateName: stateInfo.stateName || row.stateName || "",
-    stateSource: stateInfo.stateSource || row.stateSource || "",
+    stateName: enrichment.stateName || row.stateName || "",
+    stateSource: enrichment.stateSource || row.stateSource || "",
+    stateConfidence: enrichment.stateCode ? enrichment.stateConfidence : row.stateConfidence || "",
+    enrichmentSource: enrichment.enrichmentSource !== "unresolved" ? enrichment.enrichmentSource : row.enrichmentSource || "",
     tier: detail?.tier || "",
     paymentStatus: detail?.paymentStatus || "",
     riskLevel: detail?.riskLevel || "",

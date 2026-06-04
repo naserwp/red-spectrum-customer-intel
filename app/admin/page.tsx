@@ -12,9 +12,9 @@ type Customer = {
   lifetimeSpent?: number; periodSpent?: number; monthlySpent?: number; yearlySpent?: number; attemptedPipeline?: number;
   lifetimeValue?: number; rankingPaidTotal?: number; paidOrderCount?: number; gatewayPaidCount?: number; attemptedOrderCount?: number; paidMonths?: number;
   firstPaidDate?: string; latestPaidDate?: string; subscriptionStartDate?: string; stayWithUsMonths?: number; activeSubscriptionCount?: number; estimatedMRR?: number; category?: string; leadStatus?: string; paymentStatus?: string; lastPaidDate?: string; lastAttemptDate?: string;
-  businessName?: string; businessNameSource?: string; stateCode?: string; stateName?: string; stateSource?: string;
+  businessName?: string; businessNameSource?: string; businessNameConfidence?: string; stateCode?: string; stateName?: string; stateSource?: string; stateConfidence?: string; enrichmentSource?: string;
   activeSubscriptions: number; failedPayments: number; chargebacks: number; estimatedCreditLimit: number; actualCreditLimit?: number | null; tier: string; riskLevel: string;
-  businessProfile?: { approvedCredits?: number; availableCredit?: number; potentialCreditLimit?: number; creditLimit?: number; creditMetaVerified?: boolean; creditMetaSource?: string; creditFallbackReason?: string };
+  businessProfile?: { approvedCredits?: number; availableCredit?: number; potentialCreditLimit?: number; creditLimit?: number; creditMetaVerified?: boolean; creditMetaSource?: string; creditFallbackReason?: string; company?: string; state?: string; stateCode?: string };
   sourceCoverage?: { creditMetaVerified?: boolean; creditMetaSource?: string; creditFallbackReason?: string };
   factiivProfile?: { factiivMatched?: boolean; factiivScore?: number; factiivMatchConfidence?: string };
   publicEnrichment?: { publicBusinessDataFound?: boolean; socialProfilesFound?: number };
@@ -71,11 +71,27 @@ type GatewayCustomerMetric = {
   provider: string; customerName: string; email: string; paidRevenue: number; attemptedPipeline: number; orderCount: number; lastOrderDate: string;
 };
 
+type GatewayTransactionRow = {
+  sourceGateway: GatewayProvider;
+  transactionId: string;
+  invoiceNumber: string;
+  amount: number;
+  status: string;
+  submittedAt: string;
+  settledAt: string;
+  cardLast4: string;
+  customerProfileId: string;
+  paymentProfileId: string;
+  matchedCustomer: string;
+};
+
 type GatewayAnalytics = {
   summary: GatewaySummaryMetric;
   byProvider: GatewayProviderMetric[];
   timeline: GatewayTimelineMetric[];
   topCustomersByGateway: GatewayCustomerMetric[];
+  recentTransactions?: GatewayTransactionRow[];
+  historyNote?: string;
 };
 
 type SyncRunResult = {
@@ -157,12 +173,37 @@ type SyncStepResult = {
   authorizeNetPaymentsReconciled?: number;
   nmiTransactionsImported?: number;
   nmiPaymentsReconciled?: number;
+  missingProfilesEnriched?: number;
   warnings?: string[];
 };
 
 type SyncStatus = {
   lastSyncAt?: string;
   dataFreshness?: string;
+  freshnessWarning?: string;
+  lastWooCommerceOrderSync?: string;
+  latestWooCommerceOrderImportedDate?: string;
+  latestWooCommerceOrderId?: number;
+  latestWooCommerceApiOrderId?: number;
+  missingRecentWooOrdersCount?: number;
+  autoSyncStatus?: string;
+  lastSyncError?: string;
+  liveSyncStatus?: {
+    wooCommerce?: string;
+    authorizeNet?: string;
+    nmi?: string;
+    stripe?: string;
+    lastSuccessfulSync?: string;
+    recommendedAction?: string;
+  };
+  latestAuthorizeNetTransactionId?: string;
+  latestAuthorizeNetTransactionDate?: string;
+  lastSubscriptionSync?: string;
+  lastAuthorizeNetSync?: string;
+  lastNmiSync?: string;
+  lastStripeSync?: string;
+  lastEnrichmentRun?: string;
+  lastAnalyticsCacheRebuild?: string;
   counts?: { customers?: number; wooOrders?: number; wooSubscriptions?: number; authorizeNetTransactions?: number; nmiQuickPayTransactions?: number };
 };
 
@@ -212,6 +253,16 @@ type DashboardRequestInit = RequestInit & {
 const tabs = ["Overview", "Customers", "Subscriptions", "Upcoming Bills", "High Value", "Hot Leads", "Risk Review", "Gateway Analytics", "5-Year Sales", "Sync Center"] as const;
 const pageSizes = [25, 50, 100] as const;
 const highValuePeriods = ["all", "yearly", "monthly"] as const;
+const sortOptions = [
+  ["lifetimeValue", "Highest Lifetime Value"],
+  ["monthlyValue", "Highest Monthly Value"],
+  ["yearlyValue", "Highest Yearly Value"],
+  ["lastPaid", "Last Paid newest"],
+  ["latestOrder", "Newest Orders first"],
+  ["oldestOrder", "Oldest Orders first"],
+  ["newestCustomer", "Newest Customers first"],
+  ["oldestCustomer", "Oldest Customers first"],
+] as const;
 const rebuildBatchSize = 50;
 const highValueThreshold = 2000;
 const money = (n: number) => `$${n.toFixed(2)}`;
@@ -219,6 +270,7 @@ const paidAmount = (c: Customer) => Number(c.lifetimeSpent ?? c.lifetimeValue ??
 const attemptedAmount = (c: Customer) => Number(c.attemptedPipeline ?? c.attemptedTotal ?? 0);
 const customerDetailHref = (c: Customer) => `/admin/customers/${encodeURIComponent(c.email || c._id)}`;
 const displayStatus = (value?: string) => value ? value.replaceAll("_", " ") : "-";
+const EstimatedBadge = () => <span className="ml-2 inline-flex rounded border border-amber-500/30 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-amber-200">estimated</span>;
 const displayDate = (value?: string) => {
   if (!value) return "-";
   const date = new Date(value);
@@ -404,6 +456,10 @@ function LoadingSkeleton() {
   </div>;
 }
 
+function ScrollHint() {
+  return <p className="rounded-t-xl border border-b-0 border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-zinc-400">Scroll sideways to view more columns.</p>;
+}
+
 function WordPressCreditMetaPanel({ result }: { result: WordPressMetaDebugResult | null }) {
   if (!result) return null;
   const rows = [
@@ -462,29 +518,18 @@ function Pager({ start, end, total, page, maxPage, setPage }: { start: number; e
 
 function CustomerTable({ rows, exportCustomerPdf }: { rows: Customer[]; exportCustomerPdf: (c: Customer) => void }) {
   if (rows.length === 0) return <p className="rounded-xl border border-zinc-800 bg-zinc-900 p-4 text-zinc-400">No customer profiles found. Go to Sync Center and run Import WooCommerce Orders, then Update Customer Profiles.</p>;
-  return <div className="overflow-x-auto rounded-xl border border-zinc-800">
-    <table className="min-w-[1700px] table-fixed text-sm">
-      <thead className="sticky top-0 bg-zinc-950"><tr>{["Customer", "Category", "Tier", "Actual Paid", "Credit Limit", "Paid Orders", "Attempted Orders", "Start", "Tenure", "Payment Status", "Lead Status", "Last Paid", "Last Attempt", "Risk", "Score", "Preview", "Actions"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
+  return <div className="rounded-xl border border-zinc-800">
+    <table className="w-full text-sm">
+      <thead className="sticky top-0 bg-zinc-950"><tr>{["Customer", "Business", "State", "Lifetime Spent", "Score/Category", "Last Paid", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
       <tbody>{rows.map((c) => {
         const cat = getCustomerCategory(c);
-        const creditLimit = verifiedCreditLimit(c);
         return <tr key={c._id} className={`border-t border-zinc-800 ${cat === "vip_paid" ? "bg-amber-500/5" : cat.includes("hot") ? "bg-orange-500/5" : ""}`}>
-          <td className="w-56 px-3 py-3"><p className="truncate font-semibold">{c.name}</p><p className="truncate text-xs text-zinc-400">{c.email}</p></td>
-          <td className="px-3 py-3"><span className={`inline-flex rounded border px-2 py-1 text-xs ${badgeClass[cat]}`}>{categoryLabel[cat]}</span></td>
-          <td className="px-3 py-3">{paidAmount(c) > 0 ? c.tier : "Lead"}</td>
+          <td className="px-3 py-3"><p className="font-semibold">{c.name}</p><p className="text-xs text-zinc-400">{c.email}</p></td>
+          <td className="px-3 py-3" title={c.businessNameSource || ""}>{c.businessName || c.businessProfile?.company || "-"}</td>
+          <td className="px-3 py-3 font-semibold" title={c.stateSource || c.stateName || ""}>{c.stateCode || c.businessProfile?.stateCode || c.businessProfile?.state || "-"}</td>
           <td className="px-3 py-3 font-semibold">{money(paidAmount(c))}</td>
-          <td className="px-3 py-3">{hasVerifiedCreditMeta(c) ? (creditLimit > 0 ? money(creditLimit) : "-") : "WP credit meta not verified"}</td>
-          <td className="px-3 py-3">{c.paidOrderCount ?? 0}</td>
-          <td className="px-3 py-3">{c.attemptedOrderCount ?? 0}</td>
-          <td className="px-3 py-3">{displayDate(customerStartDate(c))}</td>
-          <td className="px-3 py-3">{customerStayMonths(c)} mo</td>
-          <td className="px-3 py-3">{displayStatus(c.paymentStatus)}</td>
-          <td className="px-3 py-3">{displayStatus(c.leadStatus)}</td>
-          <td className="px-3 py-3">{displayDate(c.lastPaidDate)}</td>
-          <td className="px-3 py-3">{displayDate(c.lastAttemptDate)}</td>
-          <td className="px-3 py-3">{c.riskLevel}</td>
-          <td className="px-3 py-3">{c.score}/{c.stars}</td>
-          <td className="truncate px-3 py-3">{c.aiSummaryPreview}</td>
+          <td className="px-3 py-3"><span className={`inline-flex rounded border px-2 py-1 text-xs ${badgeClass[cat]}`}>{c.score ?? 0} / {categoryLabel[cat]}</span></td>
+          <td className="px-3 py-3">{displayDate(c.lastPaidDate || c.latestPaidDate || c.lastOrderDate)}</td>
           <td className="px-3 py-3"><div className="flex gap-2"><Link className="rounded bg-zinc-700 px-2 py-1" href={customerDetailHref(c)}>View</Link><button onClick={() => exportCustomerPdf(c)} className="rounded bg-red-700 px-2 py-1">PDF</button></div></td>
         </tr>;
       })}</tbody>
@@ -530,7 +575,7 @@ function RecurringCandidatesTable({ rows }: { rows: RecurringCandidate[] }) {
 
 function SubscriptionTable({ rows }: { rows: Subscription[] }) {
   if (rows.length === 0) return <p className="rounded-xl border border-zinc-800 bg-zinc-900 p-4 text-zinc-400">No subscription records found.</p>;
-  return <div className="overflow-x-auto rounded-xl border border-zinc-800">
+  return <><ScrollHint /><div className="overflow-x-auto rounded-b-xl border border-zinc-800">
     <table className="min-w-[1200px] text-sm">
       <thead className="sticky top-0 bg-zinc-950"><tr>{["Customer", "Source", "Product/Plan", "Status", "Amount", "MRR", "Start Date", "Next Payment", "Last Payment", "Payment Method", "Churn Risk", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
       <tbody>{rows.map((s) => {
@@ -550,21 +595,21 @@ function SubscriptionTable({ rows }: { rows: Subscription[] }) {
         </tr>;
       })}</tbody>
     </table>
-  </div>;
+  </div></>;
 }
 
 function ValueIndex({ rows, rankOffset = 0 }: { rows: Customer[]; rankOffset?: number }) {
-  return <div className="overflow-x-auto rounded-xl border border-zinc-800">
-    <table className="min-w-[1650px] text-sm">
+  return <><ScrollHint /><div className="overflow-x-auto rounded-b-xl border border-zinc-800">
+    <table className="min-w-[1250px] text-sm">
       <thead className="sticky top-0 bg-zinc-950"><tr>{["Rank", "Customer", "Business Name", "State", "Lifetime Spent", "Tier", "Payment Status", "Risk", "Score", "Credit Limit", "Paid Months", "Latest Paid", "Category", "Action"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
       <tbody>{rows.map((c, index) => {
         const cat = getCustomerCategory(c);
         const creditLimit = verifiedCreditLimit(c);
         return <tr key={c._id} className="border-t border-zinc-800">
-          <td className="px-3 py-3 font-semibold">#{c.rank ?? rankOffset + index + 1}</td>
-          <td className="px-3 py-3"><p className="font-semibold">{c.name}</p><p className="text-xs text-zinc-400">{c.email}</p></td>
-          <td className="px-3 py-3" title={c.businessNameSource || ""}>{c.businessName || "-"}</td>
-          <td className="px-3 py-3 font-semibold" title={c.stateSource || c.stateName || ""}>{c.stateCode || "-"}</td>
+          <td className="sticky left-0 bg-zinc-950 px-3 py-3 font-semibold">#{c.rank ?? rankOffset + index + 1}</td>
+          <td className="sticky left-14 bg-zinc-950 px-3 py-3"><p className="font-semibold">{c.name}</p><p className="text-xs text-zinc-400">{c.email}</p></td>
+          <td className="px-3 py-3" title={c.businessNameSource || ""}>{c.businessName || "-"}{c.businessNameConfidence === "low" && <EstimatedBadge />}</td>
+          <td className="px-3 py-3 font-semibold" title={c.stateSource || c.stateName || ""}>{c.stateCode || "-"}{c.stateConfidence === "low" && <EstimatedBadge />}</td>
           <td className="px-3 py-3 font-semibold">{money(paidAmount(c))}</td>
           <td className="px-3 py-3">{paidAmount(c) > 0 ? c.tier : "Lead"}</td>
           <td className="px-3 py-3">{displayStatus(c.paymentStatus)}</td>
@@ -578,7 +623,7 @@ function ValueIndex({ rows, rankOffset = 0 }: { rows: Customer[]; rankOffset?: n
         </tr>;
       })}</tbody>
     </table>
-  </div>;
+  </div></>;
 }
 
 function SalesHistoryTable({ rows }: { rows: SalesMetric[] }) {
@@ -759,6 +804,30 @@ function GatewayAnalyticsView({
     </section>
 
     <section className="space-y-2">
+      <h2 className="text-xl font-semibold text-zinc-100">Stored Gateway Transactions</h2>
+      {data?.historyNote && <p className="rounded border border-amber-700/40 bg-amber-950/30 p-3 text-sm text-amber-100">{data.historyNote}</p>}
+      <ScrollHint />
+      <div className="overflow-x-auto rounded-b-xl border border-zinc-800">
+        <table className="min-w-[1450px] text-sm">
+          <thead className="sticky top-0 bg-zinc-950"><tr>{["Gateway", "Transaction ID", "Invoice", "Amount", "Status", "Submitted", "Settled", "Card", "Customer Profile", "Payment Profile", "Matched Customer"].map((h) => <th key={h} className="px-3 py-3 text-left text-xs uppercase text-zinc-300">{h}</th>)}</tr></thead>
+          <tbody>{(data?.recentTransactions ?? []).map((row) => <tr key={`${row.sourceGateway}-${row.transactionId}`} className="border-t border-zinc-800">
+            <td className="px-3 py-3">{gatewayProviderLabel[row.sourceGateway] ?? row.sourceGateway}</td>
+            <td className="px-3 py-3 font-mono text-xs">{row.transactionId}</td>
+            <td className="px-3 py-3">{row.invoiceNumber || "-"}</td>
+            <td className="px-3 py-3">{money(row.amount)}</td>
+            <td className="px-3 py-3">{displayStatus(row.status)}</td>
+            <td className="px-3 py-3">{displayDate(row.submittedAt)}</td>
+            <td className="px-3 py-3">{displayDate(row.settledAt)}</td>
+            <td className="px-3 py-3">{row.cardLast4 ? `•••• ${row.cardLast4}` : "-"}</td>
+            <td className="px-3 py-3">{row.customerProfileId || "-"}</td>
+            <td className="px-3 py-3">{row.paymentProfileId || "-"}</td>
+            <td className="px-3 py-3">{row.matchedCustomer || "-"}</td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+    </section>
+
+    <section className="space-y-2">
       <h2 className="text-xl font-semibold text-zinc-100">Top Customers by Gateway</h2>
       <div className="overflow-x-auto rounded-xl border border-zinc-800">
         <table className="min-w-[1100px] text-sm">
@@ -801,6 +870,11 @@ export default function AdminPage() {
   const [highValueSegment, setHighValueSegment] = useState<HighValueSegment>("all");
   const [highValueState, setHighValueState] = useState("");
   const [highValueStateOptions, setHighValueStateOptions] = useState<Array<{ code: string; name: string; count: number }>>([]);
+  const [customerState, setCustomerState] = useState("");
+  const [customerStateOptions, setCustomerStateOptions] = useState<Array<{ code: string; name: string; count: number }>>([]);
+  const [subscriptionState, setSubscriptionState] = useState("");
+  const [subscriptionStateOptions, setSubscriptionStateOptions] = useState<Array<{ code: string; name: string; count: number }>>([]);
+  const [sortBy, setSortBy] = useState<(typeof sortOptions)[number][0]>("lifetimeValue");
   const [upcomingMeta, setUpcomingMeta] = useState<Record<string, unknown>>({});
   const [riskMeta, setRiskMeta] = useState<Record<string, unknown>>({});
   const [error, setError] = useState("");
@@ -877,18 +951,20 @@ export default function AdminPage() {
     appliedSearchRef.current = appliedSearch;
   }, [appliedSearch]);
 
-  const loadCustomers = useCallback(async (nextPage = 1, query = appliedSearchRef.current, nextPageSize = pageSize) => {
-    const params = new URLSearchParams({ page: String(nextPage), limit: String(nextPageSize) });
+  const loadCustomers = useCallback(async (nextPage = 1, query = appliedSearchRef.current, nextPageSize = pageSize, selectedState = customerState) => {
+    const params = new URLSearchParams({ page: String(nextPage), limit: String(nextPageSize), sortBy });
     if (query.trim()) params.set("q", query.trim());
+    if (selectedState) params.set("state", selectedState);
     const data = await fetchJson("customers-table", `/api/customers/table?${params.toString()}`);
     if (!data) return;
     setCustomers(data.rows || []);
+    setCustomerStateOptions(data.stateOptions || []);
     setTotal(data.total || 0);
     setPage(data.page || nextPage);
-  }, [fetchJson, pageSize]);
+  }, [customerState, fetchJson, pageSize, sortBy]);
 
   const loadHighValue = useCallback(async (nextPage = 1, nextPageSize = pageSize, period = highValuePeriod, selectedState = highValueState) => {
-    const params = new URLSearchParams({ page: String(nextPage), limit: String(nextPageSize), period });
+    const params = new URLSearchParams({ page: String(nextPage), limit: String(nextPageSize), period, sortBy });
     if (selectedState) params.set("state", selectedState);
     const data = await fetchJson("high-value", `/api/analytics/high-value?${params.toString()}`);
     if (!data) return;
@@ -896,7 +972,7 @@ export default function AdminPage() {
     setHighValueStateOptions(data.stateOptions || []);
     setTotal(data.total || 0);
     setPage(data.page || nextPage);
-  }, [fetchJson, highValuePeriod, highValueState, pageSize]);
+  }, [fetchJson, highValuePeriod, highValueState, pageSize, sortBy]);
 
   const loadHotLeads = useCallback(async (query = appliedSearchRef.current) => {
     const params = new URLSearchParams({ kind: "hot-leads", limit: "100" });
@@ -907,12 +983,29 @@ export default function AdminPage() {
   }, [fetchJson]);
 
   const loadSummary = useCallback(async () => {
-    const [summaryData, revenueData] = await Promise.all([
+    const [summaryData, revenueData, historicalData, enrichmentData] = await Promise.all([
       fetchJson("summary", "/api/customers/summary"),
       fetchJson("revenue-overview", "/api/analytics/revenue-overview"),
+      fetchJson("historical-coverage", "/api/analytics/historical-coverage", { timeoutMs: 20000 }),
+      fetchJson("enrichment-audit", "/api/customers/enrichment-audit", { timeoutMs: 20000 }),
     ]);
     if (!summaryData) return;
-    setSummary({ ...(summaryData || {}), ...(revenueData || {}) });
+    setSummary({
+      ...(summaryData || {}),
+      ...(revenueData || {}),
+      historicalCoverageWarning: historicalData?.warning || "",
+      historicalCoverageYears: Array.isArray(historicalData?.byYear) ? historicalData.byYear.length : 0,
+      historicalFinalLifetimeValueRevenue: Number(historicalData?.totals?.totalFinalLifetimeValueRevenue ?? 0),
+      historicalGatewayOnlyRevenue: Number(historicalData?.totals?.gatewayOnlyRevenue ?? 0),
+      historicalLatestWooPaymentDate: historicalData?.latestPaymentDate?.woocommerce || "",
+      historicalLatestAuthorizeNetPaymentDate: historicalData?.latestPaymentDate?.authorizeNet || "",
+      historicalLatestNmiPaymentDate: historicalData?.latestPaymentDate?.nmi || "",
+      enrichmentTotalCustomers: Number(enrichmentData?.totalCustomers ?? enrichmentData?.sampledCustomers ?? 0),
+      enrichmentBusinessMissing: Number(enrichmentData?.businessNameMissing ?? enrichmentData?.totalMissingBusiness ?? 0),
+      enrichmentStateMissing: Number(enrichmentData?.stateMissing ?? enrichmentData?.totalMissingState ?? 0),
+      enrichmentResolved: Number(enrichmentData?.resolvedThisRun ?? enrichmentData?.totalResolved ?? 0),
+      enrichmentUnresolved: Number(enrichmentData?.failedToResolve ?? enrichmentData?.totalUnresolved ?? 0),
+    });
     if (summaryData.lastSyncAt) setSyncStatus({ lastSyncAt: String(summaryData.lastSyncAt), dataFreshness: "Fresh" });
   }, [fetchJson]);
 
@@ -922,13 +1015,16 @@ export default function AdminPage() {
     setSyncStatus(statusData);
   }, [fetchJson]);
 
-  const loadSubscriptions = useCallback(async () => {
-    const subscriptionData = await fetchJson("subscriptions-dashboard", "/api/subscriptions?dashboard=1&limit=100");
+  const loadSubscriptions = useCallback(async (selectedState = subscriptionState) => {
+    const params = new URLSearchParams({ dashboard: "1", limit: "100" });
+    if (selectedState) params.set("state", selectedState);
+    const subscriptionData = await fetchJson("subscriptions-dashboard", `/api/subscriptions?${params.toString()}`);
     if (!subscriptionData) return;
     setSubscriptions(subscriptionData.rows || []);
     setSubscriptionCandidates(subscriptionData.candidateRows || []);
+    setSubscriptionStateOptions(subscriptionData.stateOptions || []);
     setSummary((current) => ({ ...current, ...(subscriptionData.summary ?? {}) }));
-  }, [fetchJson]);
+  }, [fetchJson, subscriptionState]);
 
   const loadUpcomingBills = useCallback(async () => {
     const upcomingData = await fetchJson("upcoming-bills", "/api/upcoming-bills");
@@ -1065,9 +1161,28 @@ export default function AdminPage() {
     setSyncRunning(true);
     stopSyncRef.current = false;
     let cursor: Record<string, unknown> | undefined;
-    const totals = { ordersImported: 0, customersUpdated: 0, subscriptionsImported: 0, authorizeNetTransactionsImported: 0, authorizeNetPaymentsReconciled: 0, nmiTransactionsImported: 0, nmiPaymentsReconciled: 0 };
+    const totals = { ordersImported: 0, customersUpdated: 0, subscriptionsImported: 0, authorizeNetTransactionsImported: 0, authorizeNetPaymentsReconciled: 0, nmiTransactionsImported: 0, nmiPaymentsReconciled: 0, missingProfilesEnriched: 0 };
     const warnings: string[] = [];
     try {
+      const recentWoo = await fetchJson("sync-recent-woocommerce", "/api/sync/recent-woocommerce", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hours: 72, maxPages: 5 }),
+        timeoutMs: 45000,
+      }) as { importedOrderIds?: number[]; customersUpdated?: number; rankingsUpdated?: number; warning?: string } | null;
+      totals.ordersImported += Number(recentWoo?.importedOrderIds?.length ?? 0);
+      totals.customersUpdated += Number(recentWoo?.customersUpdated ?? 0);
+      if (recentWoo?.warning) warnings.push(recentWoo.warning);
+      const recentAuthorizeNet = await fetchJson("sync-recent-authorize-net", "/api/sync/recent-authorize-net", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hours: 72, dryRun: false }),
+        timeoutMs: 45000,
+      }) as { fetched?: number; inserted?: number; updated?: number; matchedCustomers?: number; gatewayOnlyCreatedCustomers?: number; warnings?: string[] } | null;
+      totals.authorizeNetTransactionsImported += Number(recentAuthorizeNet?.inserted ?? 0) + Number(recentAuthorizeNet?.updated ?? 0);
+      totals.authorizeNetPaymentsReconciled += Number(recentAuthorizeNet?.matchedCustomers ?? 0);
+      totals.customersUpdated += Number(recentAuthorizeNet?.gatewayOnlyCreatedCustomers ?? 0);
+      warnings.push(...(recentAuthorizeNet?.warnings ?? []).filter(Boolean));
       for (let step = 0; step < 250; step += 1) {
         if (stopSyncRef.current) {
           setMessage("Sync stopped.");
@@ -1090,11 +1205,12 @@ export default function AdminPage() {
         totals.authorizeNetPaymentsReconciled += Number(data.authorizeNetPaymentsReconciled ?? 0);
         totals.nmiTransactionsImported += Number(data.nmiTransactionsImported ?? 0);
         totals.nmiPaymentsReconciled += Number(data.nmiPaymentsReconciled ?? 0);
+        totals.missingProfilesEnriched += Number(data.missingProfilesEnriched ?? 0);
         warnings.push(...(data.warnings ?? []).filter(Boolean));
         cursor = data.nextCursor;
         setMessage(data.progressLabel || "Sync step complete.");
         if (!data.hasMore) {
-          setMessage(`Sync complete. Orders: ${totals.ordersImported}. Customers updated: ${totals.customersUpdated}. Subscriptions: ${totals.subscriptionsImported}. Authorize.net transactions: ${totals.authorizeNetTransactionsImported}. NMI Quick Pay transactions: ${totals.nmiTransactionsImported}.`);
+          setMessage(`Sync complete. Orders: ${totals.ordersImported}. Customers updated: ${totals.customersUpdated}. Subscriptions: ${totals.subscriptionsImported}. Authorize.net transactions: ${totals.authorizeNetTransactionsImported}. NMI Quick Pay transactions: ${totals.nmiTransactionsImported}. Enriched profiles: ${totals.missingProfilesEnriched}.`);
           break;
         }
         await new Promise((resolve) => window.setTimeout(resolve, 300));
@@ -1593,12 +1709,21 @@ export default function AdminPage() {
   const candidatePage = usePagedRows(subscriptionCandidates, pageSize);
   const upcomingPage = usePagedRows(upcomingBills, pageSize);
   const salesPage = usePagedRows(salesHistory, pageSize);
+  const liveSync = syncStatus?.liveSyncStatus;
+  const providerStatusClass = (status?: string) => status === "Fresh"
+    ? "text-emerald-200"
+    : status === "Needs Sync"
+      ? "text-amber-200"
+      : "text-zinc-400";
 
   return <AdminLayout header={<AdminHeader
     title="Customer Intelligence"
     description="Paid revenue, subscription status, checkout pipeline, and customer risk."
     meta={syncStatus?.lastSyncAt ? `Last synced: ${displayDateTime(syncStatus.lastSyncAt)}` : syncStatus?.dataFreshness || "Data sync needed"}
-    actions={<Link href="/admin/funding-ready" className="rounded-lg border border-red-800/70 bg-zinc-900 px-5 py-3 font-semibold text-zinc-200 transition hover:border-red-500 hover:bg-zinc-800">Funding Ready</Link>}
+    actions={<div className="flex flex-wrap gap-2">
+      <Link href="/api/customers/export-top-110?format=csv&limit=110&useAIIndustry=true&state=all" className="rounded-lg border border-emerald-800/70 bg-zinc-900 px-5 py-3 font-semibold text-zinc-200 transition hover:border-emerald-500 hover:bg-zinc-800">Export Top 110 Customers</Link>
+      <Link href="/admin/funding-ready" className="rounded-lg border border-red-800/70 bg-zinc-900 px-5 py-3 font-semibold text-zinc-200 transition hover:border-red-500 hover:bg-zinc-800">Funding Ready</Link>
+    </div>}
     showDashboardActions
     onOpenSyncCenter={() => handleTabChange("Sync Center")}
   />}>
@@ -1606,8 +1731,44 @@ export default function AdminPage() {
       <div className="flex flex-wrap items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-950/80 p-3">
         <input value={search} onChange={(e) => handleSearchChange(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") handleApplySearch(); }} className="min-w-64 rounded bg-zinc-950 px-3 py-2 text-sm outline-none ring-1 ring-zinc-800" placeholder="Search customers by name, email, phone" />
         <select value={pageSize} onChange={(e) => { setPageSize(Number(e.target.value) as (typeof pageSizes)[number]); setPage(1); }} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">{pageSizes.map((size) => <option key={size} value={size}>{size} rows</option>)}</select>
+        <select value={sortBy} onChange={(e) => { setSortBy(e.target.value as (typeof sortOptions)[number][0]); setPage(1); }} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">{sortOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
         <button onClick={handleApplySearch} className="rounded bg-zinc-700 px-4 py-2 text-sm font-semibold">Apply</button>
       </div>
+      <section className="grid gap-2 rounded-xl border border-zinc-800 bg-zinc-950/80 p-3 text-xs text-zinc-400 md:grid-cols-3">
+        <p className={syncStatus?.freshnessWarning ? "font-semibold text-amber-200" : "text-emerald-200"}>{syncStatus?.freshnessWarning || syncStatus?.dataFreshness || "Freshness checking..."}</p>
+        <p>Woo orders: {displayDateTime(syncStatus?.lastWooCommerceOrderSync)}</p>
+        <p>Latest imported Woo order: #{syncStatus?.latestWooCommerceOrderId || "-"} {syncStatus?.latestWooCommerceOrderImportedDate ? `(${displayDateTime(syncStatus.latestWooCommerceOrderImportedDate)})` : ""}</p>
+        <p>Latest Woo API order: #{syncStatus?.latestWooCommerceApiOrderId || "-"}</p>
+        <p>Missing recent Woo orders: {Number(syncStatus?.missingRecentWooOrdersCount ?? 0)}</p>
+        <p>Auto sync: {syncStatus?.autoSyncStatus || "Manual only"}</p>
+        <p>Subscriptions: {displayDateTime(syncStatus?.lastSubscriptionSync)}</p>
+        <p>Authorize.net: {displayDateTime(syncStatus?.lastAuthorizeNetSync)}</p>
+        <p>Latest Authorize.net transaction: {syncStatus?.latestAuthorizeNetTransactionId || "-"} {syncStatus?.latestAuthorizeNetTransactionDate ? `(${displayDateTime(syncStatus.latestAuthorizeNetTransactionDate)})` : ""}</p>
+        <p>NMI/US Payment: {displayDateTime(syncStatus?.lastNmiSync)}</p>
+        <p>Stripe: {displayDateTime(syncStatus?.lastStripeSync)}</p>
+        <p>Enrichment: {displayDateTime(syncStatus?.lastEnrichmentRun)}</p>
+        <p>Analytics cache: {displayDateTime(syncStatus?.lastAnalyticsCacheRebuild)}</p>
+      </section>
+      <section className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-semibold text-zinc-100">Live Sync Status</h2>
+            <p className="mt-1 text-xs text-zinc-500">Recent gateway and WooCommerce import readiness.</p>
+          </div>
+          <p className="rounded bg-zinc-900 px-3 py-1 text-xs text-zinc-300">{syncStatus?.autoSyncStatus || "Manual only"}</p>
+        </div>
+        <div className="mt-3 grid gap-2 text-sm sm:grid-cols-2 lg:grid-cols-4">
+          <p className="rounded border border-zinc-800 bg-zinc-900/70 p-3">WooCommerce<br /><span className={providerStatusClass(liveSync?.wooCommerce)}>{liveSync?.wooCommerce || "Checking..."}</span></p>
+          <p className="rounded border border-zinc-800 bg-zinc-900/70 p-3">Authorize.net<br /><span className={providerStatusClass(liveSync?.authorizeNet)}>{liveSync?.authorizeNet || "Checking..."}</span></p>
+          <p className="rounded border border-zinc-800 bg-zinc-900/70 p-3">NMI<br /><span className={providerStatusClass(liveSync?.nmi)}>{liveSync?.nmi || "Checking..."}</span></p>
+          <p className="rounded border border-zinc-800 bg-zinc-900/70 p-3">Stripe<br /><span className={providerStatusClass(liveSync?.stripe)}>{liveSync?.stripe || "Checking..."}</span></p>
+        </div>
+        <div className="mt-3 grid gap-2 text-xs text-zinc-400 md:grid-cols-2">
+          <p>Last successful sync: {displayDateTime(liveSync?.lastSuccessfulSync || syncStatus?.lastSyncAt)}</p>
+          <p>Recommended action: {liveSync?.recommendedAction || "Run Sync Now if data looks stale."}</p>
+          {syncStatus?.lastSyncError ? <p className="text-amber-200">Last sync error: {syncStatus.lastSyncError}</p> : <p>Last sync error: none reported</p>}
+        </div>
+      </section>
       {error && <p className="rounded border border-red-800 bg-red-950/50 p-3">{error}</p>}
       {requestWarning && <p className="rounded border border-amber-700 bg-amber-950/50 p-3 text-amber-100">{requestWarning}</p>}
       {tabLoading[tab] && <LoadingSkeleton />}
@@ -1622,9 +1783,26 @@ export default function AdminPage() {
         </section>
         <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <Card label="New Customers This Month" value={Number(summary.newCustomersThisMonth ?? 0)} />
+          <Card label="New Customers Last 30D" value={Number(summary.newCustomersLast30Days ?? 0)} />
+          <Card label="New Paid Orders Today" value={Number(summary.newPaidOrdersToday ?? 0)} />
+          <Card label="New Paid Orders This Month" value={Number(summary.newPaidOrdersThisMonth ?? 0)} />
+        </section>
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <Card label="Today Revenue" value={money(Number(summary.todayRevenue ?? 0))} helper={`${Number(summary.todayNewOrders ?? 0)} paid orders / ${Number(summary.todayNewCustomers ?? 0)} new customers`} />
+          <Card label="Yesterday Revenue" value={money(Number(summary.yesterdayRevenue ?? 0))} helper={`${Number(summary.yesterdayNewOrders ?? 0)} paid orders / ${Number(summary.yesterdayNewCustomers ?? 0)} new customers`} />
+          <Card label="This Week Revenue" value={money(Number(summary.weekRevenue ?? 0))} helper={`${Number(summary.weekNewOrders ?? 0)} paid orders / ${Number(summary.weekNewCustomers ?? 0)} new customers`} />
+          <Card label="This Month Revenue" value={money(Number(summary.monthRevenue ?? summary.paidRevenueThisMonth ?? 0))} helper={`${Number(summary.monthNewOrders ?? 0)} paid orders / ${Number(summary.monthNewCustomers ?? 0)} new customers`} />
+        </section>
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <Card label="New Paid Customers This Month" value={Number(summary.newPaidCustomersThisMonth ?? 0)} />
           <Card label="New Hot Leads This Month" value={Number(summary.newHotLeadsThisMonth ?? 0)} helper="Customers who attempted checkout but did not complete payment" />
           <Card label="High Value This Month" value={Number(summary.highValueCustomersThisMonth ?? 0)} helper={`Paid customers at or above ${money(highValueThreshold)}`} />
+        </section>
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <Card label="Historical Coverage" value={`${Number(summary.historicalCoverageYears ?? 0)} years`} helper={String(summary.historicalCoverageWarning || "Stored gateway history is preserved")} />
+          <Card label="Historical LTV Revenue" value={money(Number(summary.historicalFinalLifetimeValueRevenue ?? 0))} helper={`Gateway-only ${money(Number(summary.historicalGatewayOnlyRevenue ?? 0))}`} />
+          <Card label="Enrichment Missing Business" value={Number(summary.enrichmentBusinessMissing ?? 0)} helper={`${Number(summary.enrichmentResolved ?? 0)} resolvable in current audit sample`} />
+          <Card label="Enrichment Missing State" value={Number(summary.enrichmentStateMissing ?? 0)} helper={`${Number(summary.enrichmentUnresolved ?? 0)} unresolved in current audit sample`} />
         </section>
         <section className="space-y-3">
           <h2 className="text-xl font-semibold text-zinc-100">High-To-Low Customer Value</h2>
@@ -1633,7 +1811,16 @@ export default function AdminPage() {
         </section>
       </>}
 
-      {tab === "Customers" && <><CustomerTable rows={customers} exportCustomerPdf={exportCustomerPdf} /><Pager start={customerStart} end={customerEnd} total={total} page={page} maxPage={customerMaxPage} setPage={loadCustomers} /></>}
+      {tab === "Customers" && <>
+        <div className="flex flex-wrap items-center gap-3">
+          <select value={customerState} onChange={(e) => { const next = e.target.value; setCustomerState(next); loadCustomers(1, appliedSearch, pageSize, next); }} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">
+            <option value="">All States</option>
+            {customerStateOptions.map((state) => <option key={state.code} value={state.code}>{state.code} - {state.name} ({state.count})</option>)}
+          </select>
+        </div>
+        <CustomerTable rows={customers} exportCustomerPdf={exportCustomerPdf} />
+        <Pager start={customerStart} end={customerEnd} total={total} page={page} maxPage={customerMaxPage} setPage={loadCustomers} />
+      </>}
 
       {tab === "Subscriptions" && <>
         <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -1642,6 +1829,12 @@ export default function AdminPage() {
           <Card label="MRR" value={money(Number(summary.monthlyRecurringRevenue ?? 0))} helper="Active WooCommerce recurring totals plus Authorize.net recurring estimates" />
           <button onClick={() => setSubscriptionView("candidates")} className="text-left"><Card label="Subscription Candidates" value={Number(summary.subscriptionCandidates ?? 0)} helper="Recurring-like customers not currently active" /></button>
         </section>
+        <div className="flex flex-wrap items-center gap-3">
+          <select value={subscriptionState} onChange={(e) => { const next = e.target.value; setSubscriptionState(next); loadSubscriptions(next); }} className="rounded bg-zinc-950 px-3 py-2 text-sm ring-1 ring-zinc-800">
+            <option value="">All States</option>
+            {subscriptionStateOptions.map((state) => <option key={state.code} value={state.code}>{state.code} - {state.name} ({state.count})</option>)}
+          </select>
+        </div>
         {Number(summary.activeWooSubscriptionsDbCount ?? summary.activeWooSubscriptions ?? 0) !== Number(summary.activeWooSubscriptions ?? 0) && <p className="rounded border border-amber-800 bg-amber-950/30 p-3 text-sm text-amber-100">WooCommerce active count check: database count {Number(summary.activeWooSubscriptionsDbCount ?? 0)}, cached count {Number(summary.activeWooSubscriptions ?? 0)}. Run Sync Now if these differ.</p>}
         {subscriptionView === "active" ? <><h2 className="text-xl font-semibold text-zinc-100">Active Subscriptions</h2><SubscriptionTable rows={subPage.rows} /><Pager {...subPage} /></> : <>
           <div>

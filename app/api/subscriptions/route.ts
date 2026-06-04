@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
 import { cachedJson } from "@/lib/apiCache";
+import { buildStateOptions } from "@/lib/customerBusinessResolver";
 import { readAnalyticsSnapshot } from "@/lib/analyticsCache";
+import { enrichCustomerProfile } from "@/lib/customerEnrichment";
+import { normalizedStateParam } from "@/lib/customerTableQuery";
+import { resolveBusinessName } from "@/lib/customerBusiness";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { Subscription } from "@/models/Subscription";
@@ -16,6 +20,8 @@ function activeWooQuery(search: string) {
 }
 
 function gatewaySubscriptionRow(customer: LeanCustomer) {
+  const businessInfo = resolveBusinessName(customer);
+  const enrichment = enrichCustomerProfile(customer);
   return {
     _id: String(customer._id),
     subscriptionId: `authorize-net-${String(customer._id)}`,
@@ -23,6 +29,10 @@ function gatewaySubscriptionRow(customer: LeanCustomer) {
     source: "authorize_net",
     customerEmail: customer.email,
     customerName: customer.name,
+    businessName: businessInfo.businessName,
+    stateCode: enrichment.stateCode,
+    stateName: enrichment.stateName,
+    stateSource: enrichment.stateSource,
     customerPhone: customer.phone,
     status: "active",
     amount: Number(customer.recurringAmount ?? 0),
@@ -41,12 +51,18 @@ function gatewaySubscriptionRow(customer: LeanCustomer) {
 }
 
 function candidateRow(customer: LeanCustomer) {
+  const businessInfo = resolveBusinessName(customer);
+  const enrichment = enrichCustomerProfile(customer);
   return {
     _id: String(customer._id),
     subscriptionId: `candidate-${String(customer._id)}`,
     source: "candidate",
     customerEmail: customer.email,
     customerName: customer.name,
+    businessName: businessInfo.businessName,
+    stateCode: enrichment.stateCode,
+    stateName: enrichment.stateName,
+    stateSource: enrichment.stateSource,
     customerPhone: customer.phone,
     status: "candidate",
     amount: Number(customer.averageOrderValue ?? 0),
@@ -74,8 +90,9 @@ export async function GET(request: Request) {
   const kind = searchParams.get("kind") ?? "real";
   const search = (searchParams.get("q") ?? "").trim();
   const dashboard = searchParams.get("dashboard") === "1";
+  const state = normalizedStateParam(searchParams.get("state"));
   if (dashboard) {
-    return cachedJson(`subscriptions-dashboard:${page}:${limit}:${search}`, async () => {
+    return cachedJson(`subscriptions-dashboard:${page}:${limit}:${search}:${state || "all"}`, async () => {
       const [total, activeWooSubscriptions, activeWooMrr, snapshot, records, gatewayRecurring, candidateRows] = await Promise.all([
         WooCommerceSubscriptionRecord.countDocuments({}),
         WooCommerceSubscriptionRecord.countDocuments({ status: "active" }),
@@ -85,16 +102,22 @@ export async function GET(request: Request) {
         ]),
         readAnalyticsSnapshot<Record<string, unknown>>("dashboard_analytics", {}),
         WooCommerceSubscriptionRecord.find(activeWooQuery(search)).sort({ nextPaymentDate: 1 }).skip((page - 1) * limit).limit(limit).lean<LeanWooSubscription[]>(),
-        Customer.find({ isGatewayRecurring: true }, { name: 1, email: 1, phone: 1, recurringAmount: 1, recurringFrequencyEstimate: 1, recurringNextEstimatedPayment: 1, recurringLastPayment: 1, firstPaidDate: 1, firstOrderDate: 1, riskLevel: 1 }).sort({ recurringNextEstimatedPayment: 1 }).limit(limit).lean<LeanCustomer[]>(),
-        Customer.find({ isGatewayRecurring: { $ne: true }, activeSubscriptions: { $lte: 0 }, paidOrderCount: { $gte: 2 }, paidTotal: { $gt: 0 } }, { name: 1, email: 1, phone: 1, averageOrderValue: 1, lastPaidDate: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaymentMethod: 1, paidProducts: 1, riskLevel: 1 }).sort({ paidTotal: -1 }).limit(limit).lean<LeanCustomer[]>(),
+        Customer.find({ isGatewayRecurring: true }, { name: 1, email: 1, phone: 1, recurringAmount: 1, recurringFrequencyEstimate: 1, recurringNextEstimatedPayment: 1, recurringLastPayment: 1, firstPaidDate: 1, firstOrderDate: 1, riskLevel: 1, businessProfile: 1, orders: 1 }).sort({ recurringNextEstimatedPayment: 1 }).limit(limit).lean<LeanCustomer[]>(),
+        Customer.find({ isGatewayRecurring: { $ne: true }, activeSubscriptions: { $lte: 0 }, paidOrderCount: { $gte: 2 }, paidTotal: { $gt: 0 } }, { name: 1, email: 1, phone: 1, averageOrderValue: 1, lastPaidDate: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaymentMethod: 1, paidProducts: 1, riskLevel: 1, businessProfile: 1, orders: 1 }).sort({ paidTotal: -1 }).limit(limit).lean<LeanCustomer[]>(),
       ]);
+      const customerByEmail = new Map((await Customer.find({ normalizedEmail: { $in: records.map((record) => record.customerEmail?.trim().toLowerCase()).filter(Boolean) } }, { normalizedEmail: 1, email: 1, businessProfile: 1, orders: 1, factiivProfile: 1, publicEnrichment: 1 }).lean<LeanCustomer[]>()).map((customer) => [(customer.normalizedEmail || customer.email || "").toLowerCase(), customer]));
       const rows = records.map((record) => ({
+        customerProfile: customerByEmail.get(record.customerEmail?.trim().toLowerCase() || ""),
         _id: String(record._id),
         subscriptionId: String(record.wooSubscriptionId),
         subscriptionNumber: record.subscriptionNumber,
         source: "woocommerce",
         customerEmail: record.customerEmail,
         customerName: record.customerName,
+        businessName: resolveBusinessName(customerByEmail.get(record.customerEmail?.trim().toLowerCase() || "")).businessName,
+        stateCode: enrichCustomerProfile(customerByEmail.get(record.customerEmail?.trim().toLowerCase() || "")).stateCode,
+        stateName: enrichCustomerProfile(customerByEmail.get(record.customerEmail?.trim().toLowerCase() || "")).stateName,
+        stateSource: enrichCustomerProfile(customerByEmail.get(record.customerEmail?.trim().toLowerCase() || "")).stateSource,
         customerPhone: record.customerPhone,
         status: record.status,
         amount: record.recurringTotal || record.amount,
@@ -108,12 +131,16 @@ export async function GET(request: Request) {
         sourceStatus: "real",
         recordType: "subscription",
       }));
+      const allRows = [...rows, ...gatewayRecurring.map(gatewaySubscriptionRow)];
+      const filteredRows = state ? allRows.filter((row) => row.stateCode === state) : allRows;
       return {
         page,
         limit,
-        total,
-        rows: [...rows, ...gatewayRecurring.map(gatewaySubscriptionRow)].slice(0, limit),
+        total: state ? filteredRows.length : total,
+        rows: filteredRows.slice(0, limit),
         candidateRows: candidateRows.map(candidateRow),
+        state,
+        stateOptions: buildStateOptions(allRows),
         summary: {
           totalSubscriptions: Number(snapshot.totalSubscriptions ?? total),
           activeWooSubscriptions: Number(snapshot.activeWooSubscriptions ?? activeWooSubscriptions),
@@ -141,6 +168,7 @@ export async function GET(request: Request) {
       WooCommerceSubscriptionRecord.countDocuments(wooQuery),
       WooCommerceSubscriptionRecord.find(wooQuery).sort({ nextPaymentDate: 1 }).skip((page - 1) * limit).limit(limit).lean<LeanWooSubscription[]>(),
     ]);
+    const customerByEmail = new Map((await Customer.find({ normalizedEmail: { $in: records.map((record) => record.customerEmail?.trim().toLowerCase()).filter(Boolean) } }, { normalizedEmail: 1, email: 1, businessProfile: 1, orders: 1, factiivProfile: 1, publicEnrichment: 1 }).lean<LeanCustomer[]>()).map((customer) => [(customer.normalizedEmail || customer.email || "").toLowerCase(), customer]));
     const rows = records.map((record) => ({
       _id: String(record._id),
       subscriptionId: String(record.wooSubscriptionId),
@@ -148,6 +176,10 @@ export async function GET(request: Request) {
       source: "woocommerce",
       customerEmail: record.customerEmail,
       customerName: record.customerName,
+      businessName: resolveBusinessName(customerByEmail.get(record.customerEmail?.trim().toLowerCase() || "")).businessName,
+      stateCode: enrichCustomerProfile(customerByEmail.get(record.customerEmail?.trim().toLowerCase() || "")).stateCode,
+      stateName: enrichCustomerProfile(customerByEmail.get(record.customerEmail?.trim().toLowerCase() || "")).stateName,
+      stateSource: enrichCustomerProfile(customerByEmail.get(record.customerEmail?.trim().toLowerCase() || "")).stateSource,
       customerPhone: record.customerPhone,
       status: record.status,
       amount: record.recurringTotal || record.amount,
@@ -161,9 +193,10 @@ export async function GET(request: Request) {
       sourceStatus: "real",
       recordType: "subscription",
     }));
-    return NextResponse.json({ page, limit, total, rows });
+    const filteredRows = state ? rows.filter((row) => row.stateCode === state) : rows;
+    return NextResponse.json({ page, limit, total: state ? filteredRows.length : total, rows: filteredRows, state, stateOptions: buildStateOptions(rows) });
   } else if (kind === "candidates") {
-    const candidateCustomers = await Customer.find({ isGatewayRecurring: { $ne: true }, activeSubscriptions: { $lte: 0 }, paidOrderCount: { $gte: 2 }, paidTotal: { $gt: 0 } }, { name: 1, email: 1, phone: 1, averageOrderValue: 1, lastPaidDate: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaymentMethod: 1, paidProducts: 1, riskLevel: 1 }).sort({ paidTotal: -1 }).skip((page - 1) * limit).limit(limit).lean<LeanCustomer[]>();
+    const candidateCustomers = await Customer.find({ isGatewayRecurring: { $ne: true }, activeSubscriptions: { $lte: 0 }, paidOrderCount: { $gte: 2 }, paidTotal: { $gt: 0 } }, { name: 1, email: 1, phone: 1, averageOrderValue: 1, lastPaidDate: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaymentMethod: 1, paidProducts: 1, riskLevel: 1, businessProfile: 1, orders: 1 }).sort({ paidTotal: -1 }).skip((page - 1) * limit).limit(limit).lean<LeanCustomer[]>();
     return NextResponse.json({ page, limit, total: candidateCustomers.length, rows: candidateCustomers.map(candidateRow) });
   } else if (kind === "all-real-data") {
     const wooQuery: Record<string, unknown> = {};
@@ -172,6 +205,7 @@ export async function GET(request: Request) {
       WooCommerceSubscriptionRecord.countDocuments(wooQuery),
       WooCommerceSubscriptionRecord.find(wooQuery).sort({ status: 1, nextPaymentDate: 1 }).skip((page - 1) * limit).limit(limit).lean<LeanWooSubscription[]>(),
     ]);
+    const customerByEmail = new Map((await Customer.find({ normalizedEmail: { $in: records.map((record) => record.customerEmail?.trim().toLowerCase()).filter(Boolean) } }, { normalizedEmail: 1, email: 1, businessProfile: 1, orders: 1 }).lean<LeanCustomer[]>()).map((customer) => [(customer.normalizedEmail || customer.email || "").toLowerCase(), customer]));
     const rows = records.map((record) => ({
       _id: String(record._id),
       subscriptionId: String(record.wooSubscriptionId),
@@ -179,6 +213,7 @@ export async function GET(request: Request) {
       source: "woocommerce",
       customerEmail: record.customerEmail,
       customerName: record.customerName,
+      businessName: resolveBusinessName(customerByEmail.get(record.customerEmail?.trim().toLowerCase() || "")).businessName,
       customerPhone: record.customerPhone,
       status: record.status,
       amount: record.recurringTotal || record.amount,
