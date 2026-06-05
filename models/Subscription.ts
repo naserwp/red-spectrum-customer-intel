@@ -21,6 +21,8 @@ export interface SubscriptionDocument {
   billingInterval: string;
   nextBillingDate: string;
   lastBillingDate: string;
+  scheduleNeedsReview?: boolean;
+  scheduleSource?: string;
   failedPaymentCount: number;
   lastPaymentStatus: string;
   approvedCredits: number;
@@ -52,6 +54,8 @@ const subscriptionSchema = new Schema<SubscriptionDocument>(
     billingInterval: { type: String, default: "monthly" },
     nextBillingDate: { type: String, default: "" , index: true},
     lastBillingDate: { type: String, default: "" },
+    scheduleNeedsReview: { type: Boolean, default: false, index: true },
+    scheduleSource: { type: String, default: "" },
     failedPaymentCount: { type: Number, default: 0 },
     lastPaymentStatus: { type: String, default: "unknown" },
     approvedCredits: { type: Number, default: 0, index: true },

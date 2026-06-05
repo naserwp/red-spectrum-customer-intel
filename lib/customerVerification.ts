@@ -5,6 +5,7 @@ import type { AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTrans
 import type { CustomerDocument, CustomerFactiivProfile } from "@/models/Customer";
 import type { CustomerRankingDocument } from "@/models/CustomerRanking";
 import type { NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
+import type { StripeTransactionDocument } from "@/models/StripeTransaction";
 import type { WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 import type { WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
 
@@ -16,6 +17,7 @@ export type VerificationInput = {
   wooOrders?: Partial<WooCommerceOrderDocument>[];
   authorizeNetTransactions?: Partial<AuthorizeNetTransactionDocument>[];
   nmiTransactions?: Partial<NmiQuickPayTransactionDocument>[];
+  stripeTransactions?: Partial<StripeTransactionDocument>[];
   subscriptions?: Partial<WooCommerceSubscriptionDocument>[];
   duplicateEmailCount?: number;
 };
@@ -144,6 +146,7 @@ export function verifyCustomer(input: VerificationInput): VerificationResult {
     wooOrders: input.wooOrders,
     authorizeNetTransactions: input.authorizeNetTransactions,
     nmiTransactions: input.nmiTransactions,
+    stripeTransactions: input.stripeTransactions,
     subscriptions: input.subscriptions,
   });
   const factiiv = factiivValues(customer, ranking);
@@ -176,6 +179,7 @@ export function verifyCustomer(input: VerificationInput): VerificationResult {
   setNumberIfChanged(set, changedFields, customer, "wooPaidTotal", revenueMetrics.wooPaidTotal);
   setNumberIfChanged(set, changedFields, customer, "authorizeNetPaidTotal", revenueMetrics.authorizeNetPaidTotal);
   setNumberIfChanged(set, changedFields, customer, "nmiQuickPayPaidTotal", revenueMetrics.nmiQuickPayPaidTotal);
+  setNumberIfChanged(set, changedFields, customer, "stripePaidTotal", revenueMetrics.stripePaidTotal);
   setNumberIfChanged(set, changedFields, customer, "gatewayOnlyPaidTotal", revenueMetrics.gatewayOnlyPaidTotal);
   setNumberIfChanged(set, changedFields, customer, "attemptedTotal", revenueMetrics.attemptedTotal);
   setIfBetter(set, changedFields, customer, "firstPaidDate", revenueMetrics.firstPaidDate);
@@ -191,7 +195,7 @@ export function verifyCustomer(input: VerificationInput): VerificationResult {
   set["sourceCoverage.lastCustomerVerificationAt"] = now;
   set["sourceCoverage.customerVerificationSources"] = {
     contact: contact.fieldSources,
-    revenue: "stored WooCommerce/Authorize.net/NMI/subscription records",
+    revenue: "stored WooCommerce/Authorize.net/NMI/Stripe/subscription records",
     subscription: "stored WooCommerce subscriptions and gateway recurring fields",
     factiiv: factiiv.profileId ? "stored customer.factiivProfile or ranking cache" : "",
   };

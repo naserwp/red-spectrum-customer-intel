@@ -7,6 +7,7 @@ import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@
 import { Customer } from "@/models/Customer";
 import { findBestCustomerByIdOrEmail } from "@/lib/customerLookup";
 import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
+import { StripeTransaction, type StripeTransactionDocument } from "@/models/StripeTransaction";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
 
@@ -138,6 +139,25 @@ function nmiGatewayPaymentFromTransaction(transaction: NmiQuickPayTransactionDoc
   };
 }
 
+function stripeGatewayPaymentFromTransaction(transaction: StripeTransactionDocument) {
+  const source = transaction.wooOrderNumberMatched || transaction.wooOrderIdMatched ? "stripe_reconciled" : "stripe_only";
+  return {
+    date: transaction.paidAt || transaction.stripeCreatedAt,
+    provider: "stripe",
+    transactionId: transaction.transactionId || transaction.chargeId,
+    invoiceNumber: transaction.invoiceNumber,
+    status: transaction.status,
+    amount: transaction.amount,
+    cardLast4: transaction.cardLast4,
+    cardType: transaction.cardBrand,
+    matchedBy: transaction.matchedBy || "candidate_lookup",
+    matchConfidence: transaction.matchConfidence || "medium",
+    source,
+    customerProfileId: transaction.stripeCustomerId,
+    customerPaymentProfileId: "",
+  };
+}
+
 export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
   await connectToDatabase();
   const { id } = await params;
@@ -183,10 +203,24 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     customerName: 1, billingFirstName: 1, billingLastName: 1, billingCompany: 1, billingPhone: 1, normalizedPhone: 1, cardType: 1, cardLast4: 1, customerVaultId: 1,
     customerPaymentProfileId: 1, matchedBy: 1, matchConfidence: 1, wooOrderNumberMatched: 1, wooOrderIdMatched: 1,
   }).sort({ submittedAt: -1 }).limit(100).lean<NmiQuickPayTransactionDocument[]>() : [];
+  const stripeConditions = [
+    ...(email ? [{ normalizedEmail: email }, { emailNormalized: email }, { email }] : []),
+    { matchedCustomerId: String(customer._id) },
+    ...(phone.length >= 7 ? [{ normalizedPhone: phone }, { phone: { $regex: phone.slice(-7), $options: "i" } }] : []),
+    ...(orderNumbers.length ? [{ invoiceNumber: { $in: orderNumbers } }] : []),
+    ...(profileIds.length ? [{ stripeCustomerId: { $in: profileIds } }] : []),
+    ...(nameParts.length >= 2 ? [{ name: { $regex: `^${nameParts.map(escapeRegex).join("\\s+")}`, $options: "i" } }] : []),
+  ];
+  const stripeCandidates = stripeConditions.length ? await StripeTransaction.find({ $or: stripeConditions }, {
+    transactionId: 1, chargeId: 1, stripePaymentIntentId: 1, status: 1, stripeStatus: 1, invoiceNumber: 1, description: 1, amount: 1, amountRefunded: 1, currency: 1,
+    stripeCreatedAt: 1, paidAt: 1, email: 1, normalizedEmail: 1, phone: 1, normalizedPhone: 1, name: 1, cardBrand: 1, cardLast4: 1, stripeCustomerId: 1,
+    matchedBy: 1, matchConfidence: 1, wooOrderNumberMatched: 1, wooOrderIdMatched: 1,
+  }).sort({ stripeCreatedAt: -1 }).limit(100).lean<StripeTransactionDocument[]>() : [];
   const knownInvoiceNumbers = uniqueStrings([
     ...orderNumbers,
     ...gatewayCandidates.map((transaction) => transaction.invoiceNumber),
     ...nmiCandidates.map((transaction) => transaction.invoiceNumber),
+    ...stripeCandidates.map((transaction) => transaction.invoiceNumber),
   ]);
   const normalizedCustomerName = normalizeName(customer.name ?? "");
   const wooConditions = [
@@ -254,6 +288,9 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     ...nmiCandidates
       .filter((transaction) => !existingGatewayKeys.has(transaction.transactionId))
       .map(nmiGatewayPaymentFromTransaction),
+    ...stripeCandidates
+      .filter((transaction) => !existingGatewayKeys.has(transaction.transactionId || transaction.chargeId))
+      .map(stripeGatewayPaymentFromTransaction),
   ];
   const normalizedOrders = (customer.orders ?? []).map((order) => {
     const gatewayStatus = order.gatewayVerification?.transactionStatus || order.status;
@@ -447,7 +484,7 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     lastBillDate: String(customer.creditProfile?.lastBillDate || resolvedLastBillDate.value || customer.businessProfile?.lastBillDate || ""),
     nextBillingDate: String(customer.creditProfile?.nextBillingDate || resolvedNextBillingDate.value || customer.businessProfile?.nextBillingDate || ""),
   };
-  const metrics = calculateCustomerValueMetrics({ customer: { ...customer, orders: normalizedOrders, gatewayPayments: mergedGatewayPayments, productJourney: normalizedProductJourney }, authorizeNetTransactions: gatewayCandidates, nmiTransactions: nmiCandidates });
+  const metrics = calculateCustomerValueMetrics({ customer: { ...customer, orders: normalizedOrders, gatewayPayments: mergedGatewayPayments, productJourney: normalizedProductJourney }, authorizeNetTransactions: gatewayCandidates, nmiTransactions: nmiCandidates, stripeTransactions: stripeCandidates });
   const unifiedPaymentLedger = buildUnifiedPaymentLedger({
     customer: { ...customer, orders: normalizedOrders, gatewayPayments: mergedGatewayPayments },
     authorizeNetTransactions: gatewayCandidates,
@@ -489,7 +526,8 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     ...(customer.sourceCoverage ?? {}),
     authorizeNetTransactionsFound: Math.max(customer.sourceCoverage?.authorizeNetTransactionsFound ?? 0, gatewayCandidates.length),
     nmiQuickPayTransactionsFound: Math.max(customer.sourceCoverage?.nmiQuickPayTransactionsFound ?? 0, nmiCandidates.length),
-    gatewayOnlyPaymentsAttached: Math.max(customer.sourceCoverage?.gatewayOnlyPaymentsAttached ?? 0, (customer.orders ?? []).filter((order) => order.source === "authorize_net_only" || order.source === "nmi_quick_pay_only").length),
+    stripeTransactionsFound: Math.max(customer.sourceCoverage?.stripeTransactionsFound ?? 0, stripeCandidates.length),
+    gatewayOnlyPaymentsAttached: Math.max(customer.sourceCoverage?.gatewayOnlyPaymentsAttached ?? 0, (customer.orders ?? []).filter((order) => order.source === "authorize_net_only" || order.source === "nmi_quick_pay_only" || order.source === "stripe_only").length),
     reconciledRecords: Math.max(customer.sourceCoverage?.reconciledRecords ?? 0, mergedGatewayPayments.length),
     wooProfileMatched: wooOrderCandidates.length > 0 || /wordpress|woocommerce/i.test(String(customer.businessProfile?.sourcePlatform || customer.businessProfile?.source || "")),
     wooOrdersUsedForEnrichment: wooOrderCandidates.length,
@@ -522,6 +560,7 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
       authorizeNetPaidTotal: metrics.authorizeNetPaidTotal,
       gatewayOnlyPaidTotal: metrics.gatewayOnlyPaidTotal,
       nmiQuickPayPaidTotal: metrics.nmiQuickPayPaidTotal,
+      stripePaidTotal: metrics.stripePaidTotal,
       subscriptionPaidTotal: metrics.subscriptionPaidTotal,
       businessName: String(resolvedBusinessName.value || customer.businessProfile?.businessName || customer.businessProfile?.company || ""),
       businessNameSource: resolvedBusinessName.source || "",

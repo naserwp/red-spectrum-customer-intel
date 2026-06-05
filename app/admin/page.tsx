@@ -198,13 +198,16 @@ type SyncStatus = {
   };
   latestAuthorizeNetTransactionId?: string;
   latestAuthorizeNetTransactionDate?: string;
+  latestStripeTransactionId?: string;
+  latestStripeTransactionDate?: string;
+  latestStripeTransactionStatus?: string;
   lastSubscriptionSync?: string;
   lastAuthorizeNetSync?: string;
   lastNmiSync?: string;
   lastStripeSync?: string;
   lastEnrichmentRun?: string;
   lastAnalyticsCacheRebuild?: string;
-  counts?: { customers?: number; wooOrders?: number; wooSubscriptions?: number; authorizeNetTransactions?: number; nmiQuickPayTransactions?: number };
+  counts?: { customers?: number; wooOrders?: number; wooSubscriptions?: number; authorizeNetTransactions?: number; nmiQuickPayTransactions?: number; stripeTransactions?: number };
 };
 
 type WordPressMetaDebugEntry = {
@@ -1006,7 +1009,11 @@ export default function AdminPage() {
       enrichmentResolved: Number(enrichmentData?.resolvedThisRun ?? enrichmentData?.totalResolved ?? 0),
       enrichmentUnresolved: Number(enrichmentData?.failedToResolve ?? enrichmentData?.totalUnresolved ?? 0),
     });
-    if (summaryData.lastSyncAt) setSyncStatus({ lastSyncAt: String(summaryData.lastSyncAt), dataFreshness: "Fresh" });
+    if (summaryData.lastSyncAt) setSyncStatus((current) => ({
+      ...(current ?? {}),
+      lastSyncAt: String(summaryData.lastSyncAt),
+      dataFreshness: current?.dataFreshness || "Fresh",
+    }));
   }, [fetchJson]);
 
   const loadSyncStatus = useCallback(async () => {
@@ -1095,7 +1102,7 @@ export default function AdminPage() {
     setTabLoading((current) => ({ ...current, [activeTab]: true }));
     try {
       if (activeTab === "Overview") {
-        await loadSummary();
+        await Promise.all([loadSummary(), loadSyncStatus()]);
         await loadHighValue(nextPage, nextPageSize);
       }
       else if (activeTab === "Customers") await loadCustomers(nextPage, query, nextPageSize);
@@ -1109,7 +1116,7 @@ export default function AdminPage() {
     } finally {
       setTabLoading((current) => ({ ...current, [activeTab]: false }));
     }
-  }, [loadCustomers, loadGatewayData, loadHighValue, loadHotLeads, loadRiskRows, loadSalesHistory, loadSubscriptions, loadSummary, loadUpcomingBills, pageSize]);
+  }, [loadCustomers, loadGatewayData, loadHighValue, loadHotLeads, loadRiskRows, loadSalesHistory, loadSubscriptions, loadSummary, loadSyncStatus, loadUpcomingBills, pageSize]);
 
   useEffect(() => {
     loadActiveTabRef.current = loadActiveTab;
@@ -1161,7 +1168,7 @@ export default function AdminPage() {
     setSyncRunning(true);
     stopSyncRef.current = false;
     let cursor: Record<string, unknown> | undefined;
-    const totals = { ordersImported: 0, customersUpdated: 0, subscriptionsImported: 0, authorizeNetTransactionsImported: 0, authorizeNetPaymentsReconciled: 0, nmiTransactionsImported: 0, nmiPaymentsReconciled: 0, missingProfilesEnriched: 0 };
+    const totals = { ordersImported: 0, customersUpdated: 0, subscriptionsImported: 0, authorizeNetSubscriptionsImported: 0, authorizeNetTransactionsImported: 0, authorizeNetPaymentsReconciled: 0, stripeTransactionsImported: 0, stripePaymentsReconciled: 0, nmiTransactionsImported: 0, nmiPaymentsReconciled: 0, missingProfilesEnriched: 0 };
     const warnings: string[] = [];
     try {
       const recentWoo = await fetchJson("sync-recent-woocommerce", "/api/sync/recent-woocommerce", {
@@ -1183,6 +1190,37 @@ export default function AdminPage() {
       totals.authorizeNetPaymentsReconciled += Number(recentAuthorizeNet?.matchedCustomers ?? 0);
       totals.customersUpdated += Number(recentAuthorizeNet?.gatewayOnlyCreatedCustomers ?? 0);
       warnings.push(...(recentAuthorizeNet?.warnings ?? []).filter(Boolean));
+      const recentStripe = await fetchJson("sync-recent-stripe", "/api/sync/recent-stripe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hours: 72, dryRun: false }),
+        timeoutMs: 45000,
+      }) as { fetched?: number; inserted?: number; updated?: number; matchedCustomers?: number; gatewayOnlyCreatedCustomers?: number; warnings?: string[] } | null;
+      totals.stripeTransactionsImported += Number(recentStripe?.inserted ?? 0) + Number(recentStripe?.updated ?? 0);
+      totals.stripePaymentsReconciled += Number(recentStripe?.matchedCustomers ?? 0);
+      totals.customersUpdated += Number(recentStripe?.gatewayOnlyCreatedCustomers ?? 0);
+      warnings.push(...(recentStripe?.warnings ?? []).filter(Boolean));
+      const subscriptionRefresh = await fetchJson("sync-subscriptions-full-refresh", "/api/sync/subscriptions/full-refresh", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source: "all", dryRun: false }),
+        timeoutMs: 120000,
+      }) as { wooInserted?: number; wooUpdated?: number; authorizeNetInserted?: number; authorizeNetUpdated?: number; warnings?: string[] } | null;
+      totals.subscriptionsImported += Number(subscriptionRefresh?.wooInserted ?? 0) + Number(subscriptionRefresh?.wooUpdated ?? 0);
+      totals.authorizeNetSubscriptionsImported += Number(subscriptionRefresh?.authorizeNetInserted ?? 0) + Number(subscriptionRefresh?.authorizeNetUpdated ?? 0);
+      warnings.push(...(subscriptionRefresh?.warnings ?? []).filter(Boolean));
+      let scheduleCursor: string | null = null;
+      for (let schedulePage = 0; schedulePage < 12; schedulePage += 1) {
+        const scheduleRepair = await fetchJson("repair-subscription-schedules", "/api/sync/subscriptions/repair-schedules", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ dryRun: false, limit: 500, cursor: scheduleCursor }),
+          timeoutMs: 60000,
+        }) as { cursor?: string | null; hasMore?: boolean; unableToCompute?: number } | null;
+        if (Number(scheduleRepair?.unableToCompute ?? 0) > 0) warnings.push(`${scheduleRepair?.unableToCompute} subscription schedules need review.`);
+        scheduleCursor = scheduleRepair?.cursor ?? null;
+        if (!scheduleRepair?.hasMore) break;
+      }
       for (let step = 0; step < 250; step += 1) {
         if (stopSyncRef.current) {
           setMessage("Sync stopped.");
@@ -1210,7 +1248,7 @@ export default function AdminPage() {
         cursor = data.nextCursor;
         setMessage(data.progressLabel || "Sync step complete.");
         if (!data.hasMore) {
-          setMessage(`Sync complete. Orders: ${totals.ordersImported}. Customers updated: ${totals.customersUpdated}. Subscriptions: ${totals.subscriptionsImported}. Authorize.net transactions: ${totals.authorizeNetTransactionsImported}. NMI Quick Pay transactions: ${totals.nmiTransactionsImported}. Enriched profiles: ${totals.missingProfilesEnriched}.`);
+          setMessage(`Sync complete. Orders: ${totals.ordersImported}. Customers updated: ${totals.customersUpdated}. Woo subscriptions: ${totals.subscriptionsImported}. Authorize.net subscriptions: ${totals.authorizeNetSubscriptionsImported}. Authorize.net transactions: ${totals.authorizeNetTransactionsImported}. Stripe transactions: ${totals.stripeTransactionsImported}. NMI Quick Pay transactions: ${totals.nmiTransactionsImported}. Enriched profiles: ${totals.missingProfilesEnriched}.`);
           break;
         }
         await new Promise((resolve) => window.setTimeout(resolve, 300));
@@ -1220,7 +1258,7 @@ export default function AdminPage() {
         status: warnings.length ? "Completed with warnings" : "Completed",
         ordersImported: totals.ordersImported,
         subscriptionsImported: totals.subscriptionsImported,
-        gatewayTransactionsImported: totals.authorizeNetTransactionsImported + totals.nmiTransactionsImported,
+        gatewayTransactionsImported: totals.authorizeNetTransactionsImported + totals.stripeTransactionsImported + totals.nmiTransactionsImported,
         customersUpdated: totals.customersUpdated,
         warnings,
         lastRunTime: new Date().toLocaleString(),
@@ -1746,6 +1784,7 @@ export default function AdminPage() {
         <p>Latest Authorize.net transaction: {syncStatus?.latestAuthorizeNetTransactionId || "-"} {syncStatus?.latestAuthorizeNetTransactionDate ? `(${displayDateTime(syncStatus.latestAuthorizeNetTransactionDate)})` : ""}</p>
         <p>NMI/US Payment: {displayDateTime(syncStatus?.lastNmiSync)}</p>
         <p>Stripe: {displayDateTime(syncStatus?.lastStripeSync)}</p>
+        <p>Latest Stripe transaction: {syncStatus?.latestStripeTransactionId || "-"} {syncStatus?.latestStripeTransactionDate ? `(${displayDateTime(syncStatus.latestStripeTransactionDate)} ${syncStatus.latestStripeTransactionStatus || ""})` : ""}</p>
         <p>Enrichment: {displayDateTime(syncStatus?.lastEnrichmentRun)}</p>
         <p>Analytics cache: {displayDateTime(syncStatus?.lastAnalyticsCacheRebuild)}</p>
       </section>
@@ -1824,9 +1863,9 @@ export default function AdminPage() {
 
       {tab === "Subscriptions" && <>
         <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <Card label="Total Subscriptions" value={Number(summary.totalSubscriptions ?? 0)} helper="All imported WooCommerce subscriptions" />
-          <button onClick={() => setSubscriptionView("active")} className="text-left"><Card label="Active Subscriptions" value={Number(summary.activeSubscriptions ?? 0)} helper={`${Number(summary.activeWooSubscriptions ?? 0)} WooCommerce + ${Number(summary.activeGatewayRecurringCustomers ?? 0)} Authorize.net recurring`} /></button>
-          <Card label="MRR" value={money(Number(summary.monthlyRecurringRevenue ?? 0))} helper="Active WooCommerce recurring totals plus Authorize.net recurring estimates" />
+          <Card label="Total Subscriptions" value={Number(summary.totalSubscriptions ?? 0)} helper={`${Number(summary.wooTotalSubscriptions ?? 0)} WooCommerce + ${Number(summary.authorizeNetTotalSubscriptions ?? 0)} Authorize.net`} />
+          <button onClick={() => setSubscriptionView("active")} className="text-left"><Card label="Active Subscriptions" value={Number(summary.activeSubscriptions ?? 0)} helper={`${Number(summary.activeWooSubscriptions ?? 0)} WooCommerce + ${Number(summary.activeAuthorizeNetSubscriptions ?? summary.activeGatewayRecurringCustomers ?? 0)} Authorize.net`} /></button>
+          <Card label="MRR" value={money(Number(summary.monthlyRecurringRevenue ?? 0))} helper="Active WooCommerce recurring totals plus active Authorize.net ARB" />
           <button onClick={() => setSubscriptionView("candidates")} className="text-left"><Card label="Subscription Candidates" value={Number(summary.subscriptionCandidates ?? 0)} helper="Recurring-like customers not currently active" /></button>
         </section>
         <div className="flex flex-wrap items-center gap-3">

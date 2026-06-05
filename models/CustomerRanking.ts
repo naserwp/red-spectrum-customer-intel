@@ -30,6 +30,9 @@ export interface CustomerRankingDocument {
   latestPaidDate: string;
   activeSubscriptionCount: number;
   estimatedMRR: number;
+  subscriptionNextPaymentDate?: string;
+  subscriptionLastPaymentDate?: string;
+  scheduleNeedsReview?: boolean;
   stayWithUsMonths: number;
   attemptedPipeline: number;
   category: string;
@@ -89,6 +92,9 @@ const customerRankingSchema = new Schema<CustomerRankingDocument>(
     latestPaidDate: { type: String, default: "" },
     activeSubscriptionCount: { type: Number, default: 0 },
     estimatedMRR: { type: Number, default: 0 },
+    subscriptionNextPaymentDate: { type: String, default: "", index: true },
+    subscriptionLastPaymentDate: { type: String, default: "" },
+    scheduleNeedsReview: { type: Boolean, default: false, index: true },
     stayWithUsMonths: { type: Number, default: 0 },
     attemptedPipeline: { type: Number, default: 0 },
     category: { type: String, default: "" },

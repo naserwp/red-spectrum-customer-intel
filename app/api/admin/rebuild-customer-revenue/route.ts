@@ -4,6 +4,7 @@ import { connectToDatabase } from "@/lib/mongodb";
 import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
+import { StripeTransaction, type StripeTransactionDocument } from "@/models/StripeTransaction";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
 import { calculateCustomerValueMetrics } from "@/lib/customerValue";
@@ -13,10 +14,12 @@ interface RebuildStats {
   email: string;
   authorizeNetTransactionsMatched: number;
   nmiTransactionsMatched: number;
+  stripeTransactionsMatched: number;
   totalGatewayPaymentsFound: number;
   wooPaidTotal: number;
   authorizeNetPaidTotal: number;
   nmiQuickPayPaidTotal: number;
+  stripePaidTotal: number;
   gatewayOnlyPaidTotal: number;
   subscriptionPaidTotal: number;
   rankingTotal: number;
@@ -95,6 +98,21 @@ export async function POST(request: Request) {
             .lean<NmiQuickPayTransactionDocument[]>()
         : [];
 
+      const stripeConditions = [
+        ...(email ? [{ normalizedEmail: email }, { emailNormalized: email }, { email }] : []),
+        { matchedCustomerId: customerId },
+        ...(phone.length >= 7 ? [{ normalizedPhone: phone }] : []),
+        ...(orderNumbers.length ? [{ invoiceNumber: { $in: orderNumbers } }] : []),
+        ...(profileIds.length ? [{ stripeCustomerId: { $in: profileIds } }] : []),
+        ...(nameParts.length >= 2 ? [{ name: { $regex: `^${nameParts.map(escapeRegex).join("\\s+")}`, $options: "i" } }] : []),
+      ];
+
+      const stripeTransactions = stripeConditions.length
+        ? await StripeTransaction.find({ $or: stripeConditions })
+            .select({ transactionId: 1, chargeId: 1, status: 1, amount: 1, amountRefunded: 1, stripeCreatedAt: 1, paidAt: 1, invoiceNumber: 1, cardLast4: 1 })
+            .lean<StripeTransactionDocument[]>()
+        : [];
+
       // Load other payment sources for metrics calculation
       const wooOrders = await WooCommerceOrderRecord.find({ wooCentral: customerId, isPaid: true })
         .select({ orderNumber: 1, total: 1, paidAmount: 1, dateCreated: 1 })
@@ -110,12 +128,14 @@ export async function POST(request: Request) {
         wooOrders,
         authorizeNetTransactions: authNetTransactions,
         nmiTransactions: nmiTransactions,
+        stripeTransactions,
         subscriptions,
       });
 
       const matchedTransactionIds = [
         ...authNetTransactions.filter((t) => isSettledSuccessful(t.transactionStatus ?? "")).map((t) => t.transactionId),
         ...nmiTransactions.filter((t) => t.transactionStatus === "success").map((t) => t.transactionId),
+        ...stripeTransactions.filter((t) => /succeeded|paid|captured/i.test(t.status ?? "")).map((t) => t.transactionId || t.chargeId),
       ];
 
       const stat: RebuildStats = {
@@ -123,10 +143,12 @@ export async function POST(request: Request) {
         email: customer.email || "",
         authorizeNetTransactionsMatched: authNetTransactions.length,
         nmiTransactionsMatched: nmiTransactions.length,
+        stripeTransactionsMatched: stripeTransactions.length,
         totalGatewayPaymentsFound: matchedTransactionIds.length,
         wooPaidTotal: metrics.wooPaidTotal,
         authorizeNetPaidTotal: metrics.authorizeNetPaidTotal,
         nmiQuickPayPaidTotal: metrics.nmiQuickPayPaidTotal,
+        stripePaidTotal: metrics.stripePaidTotal,
         gatewayOnlyPaidTotal: metrics.gatewayOnlyPaidTotal,
         subscriptionPaidTotal: metrics.subscriptionPaidTotal,
         rankingTotal: metrics.rankingTotal,
@@ -150,6 +172,7 @@ export async function POST(request: Request) {
               wooPaidTotal: metrics.wooPaidTotal,
               authorizeNetPaidTotal: metrics.authorizeNetPaidTotal,
               nmiQuickPayPaidTotal: metrics.nmiQuickPayPaidTotal,
+              stripePaidTotal: metrics.stripePaidTotal,
               gatewayOnlyPaidTotal: metrics.gatewayOnlyPaidTotal,
               subscriptionPaidTotal: metrics.subscriptionPaidTotal,
               attemptedTotal: metrics.attemptedTotal,

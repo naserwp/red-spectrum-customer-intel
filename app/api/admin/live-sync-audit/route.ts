@@ -9,10 +9,12 @@ import {
 } from "@/lib/authorizeNet";
 import { fetchWooCommerceOrderById, fetchWooCommerceOrders, isWooCommerceConfigured } from "@/lib/woocommerce";
 import { connectToDatabase } from "@/lib/mongodb";
+import { fetchRecentStripeTransactions, isStripeConfigured } from "@/lib/stripeSync";
 import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking, type CustomerRankingDocument } from "@/models/CustomerRanking";
 import { SyncJob, type SyncJobDocument } from "@/models/SyncJob";
+import { StripeTransaction, type StripeTransactionDocument } from "@/models/StripeTransaction";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 
 export const dynamic = "force-dynamic";
@@ -63,6 +65,26 @@ function transactionInfo(transaction: Partial<AuthorizeNetTransactionDocument> |
   };
 }
 
+function stripeTime(transaction: Partial<StripeTransactionDocument>) {
+  const raw = String(transaction.paidAt || transaction.stripeCreatedAt || "");
+  const time = raw ? new Date(raw).getTime() : 0;
+  return Number.isFinite(time) ? time : 0;
+}
+
+function stripeInfo(transaction: Partial<StripeTransactionDocument> | null) {
+  if (!transaction) return null;
+  return {
+    transactionId: transaction.transactionId || transaction.chargeId || "",
+    paymentIntentId: transaction.stripePaymentIntentId || "",
+    status: transaction.status || "",
+    amount: Number(transaction.amount ?? 0),
+    createdAt: transaction.stripeCreatedAt || "",
+    paidAt: transaction.paidAt || "",
+    email: transaction.normalizedEmail || transaction.email || "",
+    name: transaction.name || "",
+  };
+}
+
 async function latestAuthorizeNetApiTransaction() {
   if (!isAuthorizeNetConfigured()) return { transaction: null, error: "", checkedIds: 0 };
   const ids = new Set<string>();
@@ -97,6 +119,17 @@ async function latestAuthorizeNetApiTransaction() {
   }
   transactions.sort((a, b) => transactionTime(b) - transactionTime(a));
   return { transaction: transactions[0] ?? null, error: errors[0] ?? "", checkedIds: ids.size };
+}
+
+async function latestStripeApiTransaction() {
+  if (!isStripeConfigured()) return { transaction: null, error: "" };
+  try {
+    const result = await fetchRecentStripeTransactions(24);
+    const transactions = result.transactions.sort((a, b) => stripeTime(b) - stripeTime(a));
+    return { transaction: transactions[0] ?? null, error: "" };
+  } catch (error) {
+    return { transaction: null, error: error instanceof Error ? error.message : "Stripe lookup failed" };
+  }
 }
 
 async function tableSearch(email: string, name: string) {
@@ -139,13 +172,16 @@ export async function GET() {
   await connectToDatabase();
   const wooConfigured = isWooCommerceConfigured();
   const authorizeNetConfigured = isAuthorizeNetConfigured();
+  const stripeConfigured = isStripeConfigured();
   const latestWooResult = wooConfigured ? await fetchWooCommerceOrders({ statuses: ["completed", "processing", "pending", "on-hold"], perPage: 1, maxPages: 1 }) : null;
   const latestAuthorizeNetApi = await latestAuthorizeNetApiTransaction();
+  const latestStripeApi = await latestStripeApiTransaction();
   const latestWoo = latestWooResult?.items[0] ?? null;
   const latestWooDate = latestWoo?.date_created ?? "";
   const [
     latestStoredWoo,
     latestStoredAuthorizeNet,
+    latestStoredStripe,
     latestCustomerPaid,
     latestRankingPaid,
     recentMissingCount,
@@ -158,6 +194,7 @@ export async function GET() {
   ] = await Promise.all([
     WooCommerceOrderRecord.findOne({}).sort({ dateCreated: -1 }).lean<WooCommerceOrderDocument | null>(),
     AuthorizeNetTransaction.findOne({}).sort({ submittedAt: -1, settledAt: -1, importedAt: -1 }).lean<AuthorizeNetTransactionDocument | null>(),
+    StripeTransaction.findOne({}).sort({ stripeCreatedAt: -1, importedAt: -1 }).lean<StripeTransactionDocument | null>(),
     Customer.findOne({ lastPaidDate: { $ne: "" } }, { name: 1, email: 1, lastPaidDate: 1 }).sort({ lastPaidDate: -1 }).lean<(Partial<CustomerDocument> & { _id: unknown }) | null>(),
     CustomerRanking.findOne({ latestPaidDate: { $ne: "" } }, { email: 1, latestPaidDate: 1 }).sort({ latestPaidDate: -1 }).lean<CustomerRankingDocument | null>(),
     latestWooDate ? WooCommerceOrderRecord.countDocuments({ dateCreated: { $gte: latestWooDate } }) : Promise.resolve(0),
@@ -176,24 +213,35 @@ export async function GET() {
     : 0;
   const latestStoredDate = clean(latestStoredWoo?.dateCreated);
   const latestStoredAuthorizeNetDate = clean(latestStoredAuthorizeNet?.submittedAt || latestStoredAuthorizeNet?.settledAt || latestStoredAuthorizeNet?.importedAt);
+  const latestStripeApiId = String(latestStripeApi.transaction?.transactionId || latestStripeApi.transaction?.chargeId || "");
+  const latestStoredStripeId = String(latestStoredStripe?.transactionId || latestStoredStripe?.chargeId || "");
+  const missingRecentStripeTransactions = latestStripeApiId && latestStripeApiId !== latestStoredStripeId
+    ? Number(await StripeTransaction.countDocuments({ transactionId: latestStripeApiId }) === 0)
+    : 0;
+  const latestStoredStripeDate = clean(latestStoredStripe?.paidAt || latestStoredStripe?.stripeCreatedAt || latestStoredStripe?.importedAt);
   const lastSuccessfulSyncTime = [
     latestSyncJob?.status === "completed" ? latestSyncJob.finishedAt : "",
     latestStoredWoo?.importedAt,
     latestStoredAuthorizeNet?.importedAt,
+    latestStoredStripe?.importedAt,
   ].map(clean).filter(Boolean).sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] ?? "";
   const missingRecentCustomersCount = [jameson, jean].filter((row) => row.existsInWooApi && !row.existsInCustomerCollection).length;
   return NextResponse.json({
     success: true,
     wooCommerceConfigured: wooConfigured,
     authorizeNetConfigured,
+    stripeConfigured,
     latestWooCommerceOrderInApi: orderInfo(latestWoo),
     latestStoredWooCommerceOrder: latestStoredWoo ? { orderId: latestStoredWoo.wooOrderId, orderNumber: latestStoredWoo.orderNumber, status: latestStoredWoo.status, dateCreated: latestStoredWoo.dateCreated, importedAt: latestStoredWoo.importedAt } : null,
     latestAuthorizeNetTransactionInApi: transactionInfo(latestAuthorizeNetApi.transaction),
     latestStoredAuthorizeNetTransaction: transactionInfo(latestStoredAuthorizeNet),
+    latestStripeTransactionInApi: stripeInfo(latestStripeApi.transaction),
+    latestStoredStripeTransaction: stripeInfo(latestStoredStripe),
     latestCustomerLastPaidDate: latestCustomerPaid ? { customerId: String(latestCustomerPaid._id), name: latestCustomerPaid.name, email: latestCustomerPaid.email, lastPaidDate: latestCustomerPaid.lastPaidDate } : null,
     latestCustomerRankingLastPaidDate: latestRankingPaid ? { email: latestRankingPaid.email, latestPaidDate: latestRankingPaid.latestPaidDate } : null,
     missingRecentWooOrdersCount,
     missingRecentAuthorizeNetTransactions,
+    missingRecentStripeTransactions,
     missingRecentCustomersCount,
     missingRecentWooOrdersSinceLatestApiCount: latestWooDate ? Math.max(0, 1 - Number(recentMissingCount)) : 0,
     webhookExists: webhookFileSignal,
@@ -202,7 +250,7 @@ export async function GET() {
     autoSyncStatus: webhookFileSignal ? "Webhook ready" : cronFileSignal ? "Cron ready" : "Manual only",
     syncMode: webhookFileSignal ? "Webhook ready; external webhook setup still required" : cronFileSignal ? "Cron ready; external schedule setup still required" : "Manual only",
     lastSuccessfulSyncTime,
-    lastSyncError: latestAuthorizeNetApi.error || (failedSyncJob?.errors?.[0] ?? ""),
+    lastSyncError: latestAuthorizeNetApi.error || latestStripeApi.error || (failedSyncJob?.errors?.[0] ?? ""),
     latestSyncJob: latestSyncJob ? { status: latestSyncJob.status, finishedAt: latestSyncJob.finishedAt, lastCursor: latestSyncJob.lastCursor } : null,
     freshness: {
       latestWooOrderId: latestWoo ? Number(latestWoo.id) : 0,
@@ -212,6 +260,10 @@ export async function GET() {
       latestAuthorizeNetTransactionDate: clean(latestAuthorizeNetApi.transaction?.submittedAt || latestAuthorizeNetApi.transaction?.settledAt),
       latestStoredAuthorizeNetTransactionId: latestStoredAuthorizeNetId,
       latestStoredAuthorizeNetTransactionDate: latestStoredAuthorizeNetDate,
+      latestStripeTransactionId: latestStripeApiId,
+      latestStripeTransactionDate: clean(latestStripeApi.transaction?.paidAt || latestStripeApi.transaction?.stripeCreatedAt),
+      latestStoredStripeTransactionId: latestStoredStripeId,
+      latestStoredStripeTransactionDate: latestStoredStripeDate,
       status: latestWooDate && latestStoredDate && new Date(latestStoredDate).getTime() >= new Date(latestWooDate).getTime() ? "Fresh" : "Data sync recommended",
     },
     testedCustomers: {

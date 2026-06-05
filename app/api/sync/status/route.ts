@@ -9,7 +9,8 @@ import { WooCommerceSubscriptionRecord } from "@/models/WooCommerceSubscription"
 import { AnalyticsSnapshot } from "@/models/AnalyticsSnapshot";
 import { fetchWooCommerceOrders, isWooCommerceConfigured } from "@/lib/woocommerce";
 import { isNmiConfigured } from "@/lib/nmiQuickPay";
-import { PaymentEvent } from "@/models/PaymentEvent";
+import { StripeTransaction } from "@/models/StripeTransaction";
+import { Subscription } from "@/models/Subscription";
 
 export const dynamic = "force-dynamic";
 
@@ -36,7 +37,7 @@ function latestDate(value?: string | Date) {
 
 export async function GET() {
   await connectToDatabase();
-  const [lastJob, failedJob, customers, wooOrders, wooSubscriptions, authorizeNetTransactions, nmiQuickPayTransactions, latestWooOrder, latestWooByDate, latestSubscription, latestAuthorizeNet, latestNmi, latestStripeEvent, latestEnrichedCustomer, analyticsSnapshot] = await Promise.all([
+  const [lastJob, failedJob, customers, wooOrders, wooSubscriptions, authorizeNetTransactions, nmiQuickPayTransactions, stripeTransactions, latestWooOrder, latestWooByDate, latestSubscription, latestAuthorizeNetSubscription, latestAuthorizeNet, latestNmi, latestStripeTransaction, latestEnrichedCustomer, analyticsSnapshot] = await Promise.all([
     SyncJob.findOne({}).sort({ finishedAt: -1, updatedAt: -1 }).lean<LeanSyncJob | null>(),
     SyncJob.findOne({ status: "failed" }).sort({ finishedAt: -1, updatedAt: -1 }).lean<{ errors?: string[]; finishedAt?: string; updatedAt?: Date | string } | null>(),
     Customer.countDocuments({}),
@@ -44,12 +45,14 @@ export async function GET() {
     WooCommerceSubscriptionRecord.countDocuments({}),
     AuthorizeNetTransaction.countDocuments({}),
     NmiQuickPayTransaction.countDocuments({}),
+    StripeTransaction.countDocuments({}),
     WooCommerceOrderRecord.findOne({}).sort({ importedAt: -1, updatedAt: -1 }).lean<{ importedAt?: string; updatedAt?: Date | string; wooOrderId?: number; dateCreated?: string } | null>(),
     WooCommerceOrderRecord.findOne({}).sort({ dateCreated: -1 }).lean<{ importedAt?: string; updatedAt?: Date | string; wooOrderId?: number; dateCreated?: string } | null>(),
     WooCommerceSubscriptionRecord.findOne({}).sort({ importedAt: -1, updatedAt: -1 }).lean<{ importedAt?: string; updatedAt?: Date | string } | null>(),
+    Subscription.findOne({ source: "authorize_net" }).sort({ lastSyncedAt: -1, updatedAt: -1 }).lean<{ lastSyncedAt?: string; updatedAt?: Date | string } | null>(),
     AuthorizeNetTransaction.findOne({}).sort({ importedAt: -1, updatedAt: -1 }).lean<{ importedAt?: string; updatedAt?: Date | string; transactionId?: string; submittedAt?: string; settledAt?: string } | null>(),
     NmiQuickPayTransaction.findOne({}).sort({ importedAt: -1, updatedAt: -1 }).lean<{ importedAt?: string; updatedAt?: Date | string } | null>(),
-    PaymentEvent.findOne({ provider: "stripe" }).sort({ receivedAt: -1, updatedAt: -1 }).lean<{ receivedAt?: string; updatedAt?: Date | string } | null>(),
+    StripeTransaction.findOne({}).sort({ stripeCreatedAt: -1, importedAt: -1, updatedAt: -1 }).lean<{ importedAt?: string; updatedAt?: Date | string; transactionId?: string; chargeId?: string; status?: string; stripeCreatedAt?: string; paidAt?: string } | null>(),
     Customer.findOne({ "sourceCoverage.lastEnrichmentRun": { $ne: "" } }).sort({ "sourceCoverage.lastEnrichmentRun": -1 }).lean<{ sourceCoverage?: { lastEnrichmentRun?: string } } | null>(),
     AnalyticsSnapshot.findOne({ key: "dashboard_analytics" }).lean<{ generatedAt?: string } | null>(),
   ]);
@@ -58,7 +61,7 @@ export async function GET() {
   const missingRecentOrdersCount = latestWooApiOrder && Number(latestWooByDate?.wooOrderId ?? 0) !== Number(latestWooApiOrder.id) ? 1 : 0;
   const authorizeNetLastSync = latestDate(latestAuthorizeNet?.importedAt || latestAuthorizeNet?.updatedAt);
   const nmiLastSync = latestDate(latestNmi?.importedAt || latestNmi?.updatedAt);
-  const stripeLastSync = latestDate(latestStripeEvent?.receivedAt || latestStripeEvent?.updatedAt);
+  const stripeLastSync = latestDate(latestStripeTransaction?.importedAt || latestStripeTransaction?.updatedAt);
   const wooLastSync = latestDate(latestWooOrder?.importedAt || latestWooOrder?.updatedAt);
   const autoSyncStatus = "Webhook ready";
   const lastSyncAt = [
@@ -68,7 +71,7 @@ export async function GET() {
     nmiLastSync,
     stripeLastSync,
   ].filter(Boolean).sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] ?? "";
-  const counts = { customers, wooOrders, wooSubscriptions, authorizeNetTransactions, nmiQuickPayTransactions };
+  const counts = { customers, wooOrders, wooSubscriptions, authorizeNetTransactions, nmiQuickPayTransactions, stripeTransactions };
   const wooStatus = providerFreshness(isWooCommerceConfigured(), wooLastSync, missingRecentOrdersCount);
   const authorizeNetStatus = providerFreshness(Boolean(process.env.AUTHORIZE_NET_API_LOGIN_ID && process.env.AUTHORIZE_NET_TRANSACTION_KEY), authorizeNetLastSync, 0);
   const nmiStatus = providerFreshness(isNmiConfigured(), nmiLastSync, 0);
@@ -102,7 +105,10 @@ export async function GET() {
     },
     latestAuthorizeNetTransactionId: String(latestAuthorizeNet?.transactionId || ""),
     latestAuthorizeNetTransactionDate: String(latestAuthorizeNet?.submittedAt || latestAuthorizeNet?.settledAt || ""),
-    lastSubscriptionSync: String(latestSubscription?.importedAt || latestSubscription?.updatedAt || ""),
+    latestStripeTransactionId: String(latestStripeTransaction?.transactionId || latestStripeTransaction?.chargeId || ""),
+    latestStripeTransactionDate: String(latestStripeTransaction?.paidAt || latestStripeTransaction?.stripeCreatedAt || ""),
+    latestStripeTransactionStatus: String(latestStripeTransaction?.status || ""),
+    lastSubscriptionSync: [String(latestSubscription?.importedAt || latestSubscription?.updatedAt || ""), String(latestAuthorizeNetSubscription?.lastSyncedAt || latestAuthorizeNetSubscription?.updatedAt || "")].filter(Boolean).sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] ?? "",
     lastAuthorizeNetSync: authorizeNetLastSync,
     lastNmiSync: nmiLastSync,
     lastStripeSync: stripeLastSync,

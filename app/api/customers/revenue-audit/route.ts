@@ -6,6 +6,7 @@ import { connectToDatabase } from "@/lib/mongodb";
 import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@/models/AuthorizeNetTransaction";
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
+import { StripeTransaction, type StripeTransactionDocument } from "@/models/StripeTransaction";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
 
@@ -27,9 +28,9 @@ function lastDate(values: string[]) {
   return values.filter(Boolean).sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] ?? "";
 }
 
-function auditBadge(metrics: ReturnType<typeof calculateCustomerValueMetrics>, auth: AuthorizeNetTransactionDocument[], nmi: NmiQuickPayTransactionDocument[]) {
+function auditBadge(metrics: ReturnType<typeof calculateCustomerValueMetrics>, auth: AuthorizeNetTransactionDocument[], nmi: NmiQuickPayTransactionDocument[], stripe: StripeTransactionDocument[]) {
   if (metrics.rankingTotal <= 0) return "No Paid History";
-  if (!auth.length && !nmi.length && metrics.gatewayOnlyPaidTotal <= 0) return "Missing Gateway History";
+  if (!auth.length && !nmi.length && !stripe.length && metrics.gatewayOnlyPaidTotal <= 0) return "Missing Gateway History";
   if (metrics.duplicateSkipped > 0) return "Possible Duplicate";
   if (metrics.refundsAndChargebacksDetected) return "Needs Review";
   return "Verified";
@@ -50,10 +51,11 @@ export async function GET(request: Request) {
   const emails = customers.map((customer) => normalizeEmail(customer.normalizedEmail || customer.email)).filter(Boolean);
   const ids = customers.map((customer) => String(customer._id));
   const orderNumbers = customers.flatMap((customer) => (customer.orders ?? []).map((order) => order.orderNumber).filter(Boolean));
-  const [wooOrders, authTransactions, nmiTransactions, subscriptions] = await Promise.all([
+  const [wooOrders, authTransactions, nmiTransactions, stripeTransactions, subscriptions] = await Promise.all([
     emails.length || orderNumbers.length ? WooCommerceOrderRecord.find({ $or: [{ normalizedEmail: { $in: emails } }, ...(orderNumbers.length ? [{ orderNumber: { $in: orderNumbers } }] : [])] }).lean<WooCommerceOrderDocument[]>() : [],
     emails.length || ids.length || orderNumbers.length ? AuthorizeNetTransaction.find({ $or: [{ normalizedEmail: { $in: emails } }, { emailNormalized: { $in: emails } }, { customerEmail: { $in: emails } }, { matchedCustomerId: { $in: ids } }, ...(orderNumbers.length ? [{ invoiceNumber: { $in: orderNumbers } }] : [])] }).lean<AuthorizeNetTransactionDocument[]>() : [],
     emails.length || ids.length || orderNumbers.length ? NmiQuickPayTransaction.find({ $or: [{ normalizedEmail: { $in: emails } }, { emailNormalized: { $in: emails } }, { customerEmail: { $in: emails } }, { matchedCustomerId: { $in: ids } }, ...(orderNumbers.length ? [{ invoiceNumber: { $in: orderNumbers } }] : [])] }).lean<NmiQuickPayTransactionDocument[]>() : [],
+    emails.length || ids.length || orderNumbers.length ? StripeTransaction.find({ $or: [{ normalizedEmail: { $in: emails } }, { emailNormalized: { $in: emails } }, { email: { $in: emails } }, { matchedCustomerId: { $in: ids } }, ...(orderNumbers.length ? [{ invoiceNumber: { $in: orderNumbers } }] : [])] }).lean<StripeTransactionDocument[]>() : [],
     emails.length ? WooCommerceSubscriptionRecord.find({ normalizedEmail: { $in: emails } }).lean<WooCommerceSubscriptionDocument[]>() : [],
   ]);
   const rows = customers.map((customer) => {
@@ -63,10 +65,12 @@ export async function GET(request: Request) {
     const woo = wooOrders.filter((order) => normalizeEmail(order.normalizedEmail) === customerEmail || customerOrderNumbers.has(order.orderNumber));
     const auth = authTransactions.filter((tx) => [tx.normalizedEmail, tx.emailNormalized, tx.customerEmail].map(normalizeEmail).includes(customerEmail) || tx.matchedCustomerId === customerId || customerOrderNumbers.has(tx.invoiceNumber));
     const nmi = nmiTransactions.filter((tx) => [tx.normalizedEmail, tx.emailNormalized, tx.customerEmail].map(normalizeEmail).includes(customerEmail) || tx.matchedCustomerId === customerId || customerOrderNumbers.has(tx.invoiceNumber));
+    const stripe = stripeTransactions.filter((tx) => [tx.normalizedEmail, tx.emailNormalized, tx.email].map(normalizeEmail).includes(customerEmail) || tx.matchedCustomerId === customerId || customerOrderNumbers.has(tx.invoiceNumber));
     const subs = subscriptions.filter((sub) => normalizeEmail(sub.normalizedEmail || sub.customerEmail) === customerEmail);
-    const metrics = calculateCustomerValueMetrics({ customer, wooOrders: woo, authorizeNetTransactions: auth, nmiTransactions: nmi, subscriptions: subs });
+    const metrics = calculateCustomerValueMetrics({ customer, wooOrders: woo, authorizeNetTransactions: auth, nmiTransactions: nmi, stripeTransactions: stripe, subscriptions: subs });
     const refundTotal = Math.abs(auth.filter((tx) => isRefundedOrChargeback(tx.transactionStatus)).reduce((sum, tx) => sum + Number(tx.amount ?? 0), 0))
-      + Math.abs(nmi.filter((tx) => isNmiRefundOrChargeback(tx.transactionStatus)).reduce((sum, tx) => sum + Number(tx.amount ?? 0), 0));
+      + Math.abs(nmi.filter((tx) => isNmiRefundOrChargeback(tx.transactionStatus)).reduce((sum, tx) => sum + Number(tx.amount ?? 0), 0))
+      + Math.abs(stripe.filter((tx) => /refund|dispute|chargeback/i.test(tx.status ?? "")).reduce((sum, tx) => sum + Number(tx.amountRefunded || tx.amount || 0), 0));
     const failedDates = [
       ...auth.filter(failedAuth).map((tx) => tx.submittedAt),
       ...nmi.filter(failedNmi).map((tx) => tx.submittedAt),
@@ -79,17 +83,18 @@ export async function GET(request: Request) {
       wooCommerceTotal: metrics.wooPaidTotal,
       authorizeNetTotal: metrics.authorizeNetPaidTotal,
       nmiTotal: metrics.nmiQuickPayPaidTotal,
+      stripeTotal: metrics.stripePaidTotal,
       gatewayOnlyTotal: metrics.gatewayOnlyPaidTotal,
       subscriptionTotal: metrics.subscriptionPaidTotal,
       refundTotal,
       chargebackTotal: Math.max(0, Number(customer.chargebacks ?? 0)),
       finalLifetimeValue: metrics.rankingTotal,
-      paymentCount: Number(customer.paidOrderCount ?? 0) + auth.length + nmi.length,
-      failedPaymentCount: Number(customer.failedPayments ?? 0) + auth.filter(failedAuth).length + nmi.filter(failedNmi).length,
+      paymentCount: Number(customer.paidOrderCount ?? 0) + auth.length + nmi.length + stripe.length,
+      failedPaymentCount: Number(customer.failedPayments ?? 0) + auth.filter(failedAuth).length + nmi.filter(failedNmi).length + stripe.filter((tx) => /failed|declined|canceled/i.test(tx.status ?? "")).length,
       lastSuccessfulPaymentDate: metrics.lastPaidDate,
       lastFailedPaymentDate: lastDate(failedDates),
       duplicateSkipped: metrics.duplicateSkipped,
-      dataConfidenceStatus: auditBadge(metrics, auth, nmi),
+      dataConfidenceStatus: auditBadge(metrics, auth, nmi, stripe),
     };
   });
   return NextResponse.json({ page, limit, total, rows, totalMs: Date.now() - started });

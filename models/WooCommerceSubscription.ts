@@ -20,6 +20,8 @@ export interface WooCommerceSubscriptionDocument {
   nextPaymentDate: string;
   lastPaymentDate: string;
   endDate: string;
+  scheduleNeedsReview?: boolean;
+  scheduleSource?: string;
   paymentMethod: string;
   paymentMethodTitle: string;
   relatedOrderIds: number[];
@@ -48,6 +50,8 @@ const wooCommerceSubscriptionSchema = new Schema<WooCommerceSubscriptionDocument
     nextPaymentDate: { type: String, default: "", index: true },
     lastPaymentDate: { type: String, default: "" },
     endDate: { type: String, default: "" },
+    scheduleNeedsReview: { type: Boolean, default: false, index: true },
+    scheduleSource: { type: String, default: "" },
     paymentMethod: { type: String, default: "" },
     paymentMethodTitle: { type: String, default: "" },
     relatedOrderIds: { type: [Number], default: [] },

@@ -21,6 +21,23 @@ export type AuthorizeNetCustomerProfileSummary = {
   customerPaymentProfileIds: string[];
 };
 
+export type AuthorizeNetSubscriptionSummary = {
+  subscriptionId: string;
+  name: string;
+  status: string;
+  amount: number;
+  currency: string;
+  customerEmail: string;
+  customerName: string;
+  customerPhone: string;
+  customerProfileId: string;
+  customerPaymentProfileId: string;
+  invoiceNumber: string;
+  paymentMethod: string;
+  accountNumber: string;
+  createdAt: string;
+};
+
 function merchantAuthentication() {
   return { name: apiLoginId, transactionKey };
 }
@@ -231,6 +248,48 @@ export async function fetchCustomerProfile(customerProfileId: string, signal?: A
     phone: normalizedPhone(primaryBillTo.phoneNumber || primaryBillTo.phone),
     cardLast4s: Array.from(new Set(cardLast4s)),
     customerPaymentProfileIds: paymentProfiles.map((paymentProfile) => asString(paymentProfile.customerPaymentProfileId || paymentProfile.paymentProfileId)).filter(Boolean),
+  };
+}
+
+export async function fetchAuthorizeNetSubscriptionList(searchType: "subscriptionActive" | "subscriptionInactive" = "subscriptionActive", limit = 100, offset = 1, signal?: AbortSignal) {
+  const data = await authorizeNetRequest<{
+    ARBGetSubscriptionListResponse?: { subscriptionDetails?: { subscriptionDetail?: unknown } | unknown; totalNumInResultSet?: unknown };
+    subscriptionDetails?: { subscriptionDetail?: unknown } | unknown;
+    totalNumInResultSet?: unknown;
+  }>({
+    ARBGetSubscriptionListRequest: {
+      merchantAuthentication: merchantAuthentication(),
+      searchType,
+      sorting: {
+        orderBy: "id",
+        orderDescending: true,
+      },
+      paging: {
+        limit,
+        offset,
+      },
+    },
+  }, signal);
+  const root = data.ARBGetSubscriptionListResponse ?? data;
+  const details = asArray(asRecord(root.subscriptionDetails).subscriptionDetail || root.subscriptionDetails);
+  return {
+    total: asNumber(root.totalNumInResultSet),
+    subscriptions: details.map((detail) => ({
+      subscriptionId: asString(detail.id || detail.subscriptionId),
+      name: asString(detail.name),
+      status: asString(detail.status || searchType.replace(/^subscription/i, "").toLowerCase()),
+      amount: asNumber(detail.amount),
+      currency: asString(detail.currencyCode || "USD"),
+      customerEmail: normalizedEmail(detail.customerEmail || detail.email),
+      customerName: normalizedName(detail.firstName, detail.lastName) || asString(detail.name),
+      customerPhone: normalizedPhone(detail.phone || detail.phoneNumber),
+      customerProfileId: asString(detail.customerProfileId),
+      customerPaymentProfileId: asString(detail.customerPaymentProfileId),
+      invoiceNumber: asString(detail.invoice),
+      paymentMethod: asString(detail.paymentMethod),
+      accountNumber: asString(detail.accountNumber),
+      createdAt: asString(detail.createTimeStampUTC || detail.createTimeStampLocal),
+    } satisfies AuthorizeNetSubscriptionSummary)).filter((subscription) => subscription.subscriptionId),
   };
 }
 

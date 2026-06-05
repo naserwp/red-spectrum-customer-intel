@@ -10,6 +10,7 @@ import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking, type CustomerRankingDocument } from "@/models/CustomerRanking";
 import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
+import { StripeTransaction, type StripeTransactionDocument } from "@/models/StripeTransaction";
 import { SyncJob } from "@/models/SyncJob";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
@@ -159,12 +160,13 @@ function buildCustomerSet(group: { key: string; type: string; orders: WooCommerc
 
 async function rankingSetFor(customer: LeanCustomer, ranking: CustomerRankingDocument | null, orders: WooCommerceOrderDocument[], contact: ReturnType<typeof extractBestBusinessContactFields>, rebuildAt: string) {
   const email = normalizeEmail(customer.normalizedEmail || customer.email);
-  const [subscriptions, authTransactions, nmiTransactions] = await Promise.all([
+  const [subscriptions, authTransactions, nmiTransactions, stripeTransactions] = await Promise.all([
     WooCommerceSubscriptionRecord.find({ normalizedEmail: email }).lean<WooCommerceSubscriptionDocument[]>(),
     AuthorizeNetTransaction.find({ $or: [{ normalizedEmail: email }, { emailNormalized: email }, { customerEmail: email }, { matchedCustomerId: String(customer._id) }] }).lean<AuthorizeNetTransactionDocument[]>(),
     NmiQuickPayTransaction.find({ $or: [{ normalizedEmail: email }, { emailNormalized: email }, { customerEmail: email }, { matchedCustomerId: String(customer._id) }] }).lean<NmiQuickPayTransactionDocument[]>(),
+    StripeTransaction.find({ $or: [{ normalizedEmail: email }, { emailNormalized: email }, { email }, { matchedCustomerId: String(customer._id) }] }).lean<StripeTransactionDocument[]>(),
   ]);
-  const metrics = calculateCustomerValueMetrics({ customer, wooOrders: orders, authorizeNetTransactions: authTransactions, nmiTransactions, subscriptions });
+  const metrics = calculateCustomerValueMetrics({ customer, wooOrders: orders, authorizeNetTransactions: authTransactions, nmiTransactions, stripeTransactions, subscriptions });
   const enrichment = enrichCustomerProfile({ ...customer, latestWooOrder: orders[0] });
   const funding = computeFundingIntelligence(customer, ranking);
   return {
@@ -194,6 +196,7 @@ async function rankingSetFor(customer: LeanCustomer, ranking: CustomerRankingDoc
     wooPaidTotal: metrics.wooPaidTotal,
     authorizeNetPaidTotal: metrics.authorizeNetPaidTotal,
     nmiQuickPayPaidTotal: metrics.nmiQuickPayPaidTotal,
+    stripePaidTotal: metrics.stripePaidTotal,
     gatewayOnlyPaidTotal: metrics.gatewayOnlyPaidTotal,
     paidMonths: metrics.paidMonths,
     firstPaidDate: metrics.firstPaidDate || customer.firstPaidDate || "",

@@ -13,6 +13,7 @@ import { CustomerRanking, type CustomerRankingDocument } from "@/models/Customer
 import { computeVipTier } from "@/lib/fundingIntelligence";
 import { isNmiDeclined, isNmiRefundOrChargeback, isNmiSuccessful } from "@/lib/nmiQuickPay";
 import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
+import { StripeTransaction, type StripeTransactionDocument } from "@/models/StripeTransaction";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
 
@@ -68,6 +69,7 @@ type ExportRow = {
   wooCommerceTotal: number;
   authorizeNetTotal: number;
   nmiTotal: number;
+  stripeTotal: number;
   gatewayOnlyTotal: number;
   successfulPaymentCount: number;
   lastPaidDate: string;
@@ -128,6 +130,7 @@ const exportColumns: Array<keyof ExportRow> = [
   "wooCommerceTotal",
   "authorizeNetTotal",
   "nmiTotal",
+  "stripeTotal",
   "gatewayOnlyTotal",
   "successfulPaymentCount",
   "lastPaidDate",
@@ -272,15 +275,15 @@ function storedIndustryClassification(customer: LeanCustomer): BusinessIndustryC
   };
 }
 
-function auditBadge(metrics: CustomerValueMetrics, auth: AuthorizeNetTransactionDocument[], nmi: NmiQuickPayTransactionDocument[]) {
+function auditBadge(metrics: CustomerValueMetrics, auth: AuthorizeNetTransactionDocument[], nmi: NmiQuickPayTransactionDocument[], stripe: StripeTransactionDocument[]) {
   if (metrics.rankingTotal <= 0) return "No Paid History";
-  if (!auth.length && !nmi.length && metrics.gatewayOnlyPaidTotal <= 0) return "Missing Gateway History";
+  if (!auth.length && !nmi.length && !stripe.length && metrics.gatewayOnlyPaidTotal <= 0) return "Missing Gateway History";
   if (metrics.duplicateSkipped > 0) return "Possible Duplicate";
   if (metrics.refundsAndChargebacksDetected) return "Needs Review";
   return "Verified";
 }
 
-function successfulPaymentCount(customer: LeanCustomer, woo: WooCommerceOrderDocument[], auth: AuthorizeNetTransactionDocument[], nmi: NmiQuickPayTransactionDocument[]) {
+function successfulPaymentCount(customer: LeanCustomer, woo: WooCommerceOrderDocument[], auth: AuthorizeNetTransactionDocument[], nmi: NmiQuickPayTransactionDocument[], stripe: StripeTransactionDocument[]) {
   const orderNumbers = new Set([
     ...woo.map((order) => order.orderNumber).filter(Boolean),
     ...(customer.orders ?? []).map((order) => order.orderNumber).filter(Boolean),
@@ -295,6 +298,10 @@ function successfulPaymentCount(customer: LeanCustomer, woo: WooCommerceOrderDoc
   nmi.filter((tx) => isNmiSuccessful(tx.transactionStatus)).forEach((tx) => {
     if (tx.wooOrderNumberMatched || tx.wooOrderIdMatched || orderNumbers.has(tx.invoiceNumber)) return;
     uniquePayments.add(`nmi:${tx.transactionId}`);
+  });
+  stripe.filter((tx) => /succeeded|paid|settled|captured/i.test(tx.status ?? "")).forEach((tx) => {
+    if (tx.wooOrderNumberMatched || tx.wooOrderIdMatched || orderNumbers.has(tx.invoiceNumber)) return;
+    uniquePayments.add(`stripe:${tx.transactionId || tx.chargeId}`);
   });
   return uniquePayments.size;
 }
@@ -381,10 +388,11 @@ export async function GET(request: Request) {
   const ids = selectedCustomers.map((customer) => String(customer._id));
   const orderNumbers = Array.from(new Set(selectedCustomers.flatMap((customer) => (customer.orders ?? []).map((order) => order.orderNumber).filter(Boolean))));
 
-  const [wooOrders, authTransactions, nmiTransactions, subscriptions] = await Promise.all([
+  const [wooOrders, authTransactions, nmiTransactions, stripeTransactions, subscriptions] = await Promise.all([
     emails.length || orderNumbers.length ? WooCommerceOrderRecord.find({ $or: [{ normalizedEmail: { $in: emails } }, ...(orderNumbers.length ? [{ orderNumber: { $in: orderNumbers } }] : [])] }).lean<WooCommerceOrderDocument[]>() : [],
     emails.length || ids.length || orderNumbers.length ? AuthorizeNetTransaction.find({ $or: [{ normalizedEmail: { $in: emails } }, { emailNormalized: { $in: emails } }, { customerEmail: { $in: emails } }, { matchedCustomerId: { $in: ids } }, ...(orderNumbers.length ? [{ invoiceNumber: { $in: orderNumbers } }] : [])] }).lean<AuthorizeNetTransactionDocument[]>() : [],
     emails.length || ids.length || orderNumbers.length ? NmiQuickPayTransaction.find({ $or: [{ normalizedEmail: { $in: emails } }, { emailNormalized: { $in: emails } }, { customerEmail: { $in: emails } }, { matchedCustomerId: { $in: ids } }, ...(orderNumbers.length ? [{ invoiceNumber: { $in: orderNumbers } }] : [])] }).lean<NmiQuickPayTransactionDocument[]>() : [],
+    emails.length || ids.length || orderNumbers.length ? StripeTransaction.find({ $or: [{ normalizedEmail: { $in: emails } }, { emailNormalized: { $in: emails } }, { email: { $in: emails } }, { matchedCustomerId: { $in: ids } }, ...(orderNumbers.length ? [{ invoiceNumber: { $in: orderNumbers } }] : [])] }).lean<StripeTransactionDocument[]>() : [],
     emails.length ? WooCommerceSubscriptionRecord.find({ normalizedEmail: { $in: emails } }).lean<WooCommerceSubscriptionDocument[]>() : [],
   ]);
 
@@ -424,18 +432,19 @@ export async function GET(request: Request) {
     const woo = wooOrders.filter((order) => normalizeEmail(order.normalizedEmail) === customerEmail || customerOrderNumbers.has(order.orderNumber));
     const auth = authTransactions.filter((tx) => [tx.normalizedEmail, tx.emailNormalized, tx.customerEmail].map(normalizeEmail).includes(customerEmail) || tx.matchedCustomerId === customerId || customerOrderNumbers.has(tx.invoiceNumber));
     const nmi = nmiTransactions.filter((tx) => [tx.normalizedEmail, tx.emailNormalized, tx.customerEmail].map(normalizeEmail).includes(customerEmail) || tx.matchedCustomerId === customerId || customerOrderNumbers.has(tx.invoiceNumber));
+    const stripe = stripeTransactions.filter((tx) => [tx.normalizedEmail, tx.emailNormalized, tx.email].map(normalizeEmail).includes(customerEmail) || tx.matchedCustomerId === customerId || customerOrderNumbers.has(tx.invoiceNumber));
     const subs = subscriptions.filter((sub) => normalizeEmail(sub.normalizedEmail || sub.customerEmail) === customerEmail);
     const activeSubscriptionMrr = subs
       .filter((sub) => String(sub.status ?? "").toLowerCase() === "active")
       .reduce((sum, sub) => sum + money(readPath(sub, ["monthlyRecurringRevenue"]) ?? sub.amount), 0);
     const detailMrr = activeSubscriptionMrr + (customer.isGatewayRecurring ? money(customer.recurringAmount) : 0);
-    const metrics = calculateCustomerValueMetrics({ customer, wooOrders: woo, authorizeNetTransactions: auth, nmiTransactions: nmi, subscriptions: subs });
+    const metrics = calculateCustomerValueMetrics({ customer, wooOrders: woo, authorizeNetTransactions: auth, nmiTransactions: nmi, stripeTransactions: stripe, subscriptions: subs });
     const contact = extractBestBusinessContactFields(customer, ranking, woo);
     const industry = industryById[customerId] ?? storedIndustryClassification(customer);
     const fundingScore = Number(customer.businessProfile?.fundingScore ?? ranking?.fundingScore ?? 0);
     const totalValue = money(metrics.rankingTotal || ranking?.lifetimeSpent || customer.lifetimeValue || customer.rankingPaidTotal || customer.paidTotal || customer.totalPaid);
-    const chargebackOrRefund = auth.some((tx) => isRefundedOrChargeback(tx.transactionStatus) || failedAuth(tx)) || nmi.some((tx) => isNmiRefundOrChargeback(tx.transactionStatus) || failedNmi(tx));
-    const dataConfidenceStatus = chargebackOrRefund ? "Needs Review" : auditBadge(metrics, auth, nmi);
+    const chargebackOrRefund = auth.some((tx) => isRefundedOrChargeback(tx.transactionStatus) || failedAuth(tx)) || nmi.some((tx) => isNmiRefundOrChargeback(tx.transactionStatus) || failedNmi(tx)) || stripe.some((tx) => /refund|dispute|chargeback|failed/i.test(tx.status ?? ""));
+    const dataConfidenceStatus = chargebackOrRefund ? "Needs Review" : auditBadge(metrics, auth, nmi, stripe);
     const factiiv = extractFactiivExportFields(customer, ranking, detailMrr);
     console.log("[factiiv-score-export]", customer.email, factiiv.factiivScoreSourceField || "Missing", factiiv.factiivScore);
     const debugFields = debugFactiiv ? {
@@ -491,8 +500,9 @@ export async function GET(request: Request) {
       wooCommerceTotal: money(metrics.wooPaidTotal),
       authorizeNetTotal: money(metrics.authorizeNetPaidTotal),
       nmiTotal: money(metrics.nmiQuickPayPaidTotal),
+      stripeTotal: money(metrics.stripePaidTotal),
       gatewayOnlyTotal: money(metrics.gatewayOnlyPaidTotal),
-      successfulPaymentCount: successfulPaymentCount(customer, woo, auth, nmi),
+      successfulPaymentCount: successfulPaymentCount(customer, woo, auth, nmi, stripe),
       lastPaidDate: dateOnly(metrics.lastPaidDate || ranking?.latestPaidDate || customer.lastPaidDate),
       fundingScore: fundingScore > 0 ? fundingScore : "Missing",
       fundingCategory: missing(customer.businessProfile?.fundingCategory || ranking?.fundingCategory),

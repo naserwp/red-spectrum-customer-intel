@@ -7,12 +7,15 @@ import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking } from "@/models/CustomerRanking";
 import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
+import { StripeTransaction, type StripeTransactionDocument } from "@/models/StripeTransaction";
+import { Subscription } from "@/models/Subscription";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
 
 type LeanWooSubscription = WooCommerceSubscriptionDocument & { _id: unknown };
 type LeanAuthorizeNetTransaction = AuthorizeNetTransactionDocument & { _id: unknown };
 type LeanNmiQuickPayTransaction = NmiQuickPayTransactionDocument & { _id: unknown };
+type LeanStripeTransaction = StripeTransactionDocument & { _id: unknown };
 
 function category(lifetimeSpent: number, attemptedPipeline: number) {
   if (lifetimeSpent >= 2000) return "VIP Paid Customer";
@@ -27,6 +30,17 @@ function paidValue(customer: Partial<CustomerDocument>) {
 
 function normalizedEmail(value: unknown) {
   return String(value ?? "").trim().toLowerCase();
+}
+
+function startOfDay(date = new Date()) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function validUpcomingDate(value: string, from: Date, to?: Date) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return false;
+  const time = date.getTime();
+  return time >= startOfDay(from).getTime() && (!to || time <= to.getTime());
 }
 
 async function latestWooOrdersByEmail(customers: Array<Partial<CustomerDocument> & { email?: string; normalizedEmail?: string }>) {
@@ -64,7 +78,7 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
   const currentYearStart = new Date(now.getFullYear(), 0, 1);
   const safeLimit = Math.min(100, Math.max(1, Math.floor(limit)));
   const safeOffset = Math.max(0, Math.floor(offset));
-  const [customers, totalCustomers, subscriptions, summaryAgg] = await Promise.all([
+  const [customers, totalCustomers, subscriptions, summaryAgg, authSubscriptionAgg] = await Promise.all([
     Customer.find({}, {
       name: 1, email: 1, normalizedEmail: 1, phone: 1, attemptedTotal: 1, attemptedOrderCount: 1, firstPaidDate: 1, firstOrderDate: 1, lastPaidDate: 1, lastOrderDate: 1,
       activeSubscriptions: 1, isGatewayRecurring: 1, recurringAmount: 1, recurringNextEstimatedPayment: 1, recurringLastPayment: 1, paidMonths: 1, stayWithUsMonths: 1, riskLevel: 1,
@@ -84,8 +98,13 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
         },
       },
     ]),
+    Subscription.aggregate<{ _id: null; total: number; active: number; mrr: number }>([
+      { $match: { source: "authorize_net", recordType: "subscription", sourceStatus: "real" } },
+      { $group: { _id: null, total: { $sum: 1 }, active: { $sum: { $cond: [{ $eq: ["$status", "active"] }, 1, 0] } }, mrr: { $sum: { $cond: [{ $eq: ["$status", "active"] }, { $ifNull: ["$monthlyRecurringRevenue", "$amount"] }, 0] } } } },
+    ]),
   ]);
   const summary = summaryAgg[0];
+  const authSubscriptionSummary = authSubscriptionAgg[0] ?? { total: 0, active: 0, mrr: 0 };
   const batchEmails = Array.from(new Set(customers.map((customer) => customer.normalizedEmail || customer.email?.trim().toLowerCase()).filter(Boolean)));
   const batchIds = customers.map((customer) => String(customer._id));
   const authConditions = [
@@ -118,6 +137,21 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
     const email = transaction.normalizedEmail || transaction.emailNormalized || transaction.customerEmail;
     if (email) nmiByEmail.set(email, [...(nmiByEmail.get(email) ?? []), transaction]);
   }
+  const stripeConditions = [
+    ...(batchEmails.length ? [{ normalizedEmail: { $in: batchEmails } }, { emailNormalized: { $in: batchEmails } }, { email: { $in: batchEmails } }] : []),
+    ...(batchIds.length ? [{ matchedCustomerId: { $in: batchIds } }] : []),
+  ];
+  const stripeTransactions = stripeConditions.length ? await StripeTransaction.find({ $or: stripeConditions }, {
+    transactionId: 1, chargeId: 1, stripePaymentIntentId: 1, status: 1, invoiceNumber: 1, amount: 1, amountRefunded: 1, paidAt: 1, stripeCreatedAt: 1,
+    normalizedEmail: 1, emailNormalized: 1, email: 1, matchedCustomerId: 1, wooOrderNumberMatched: 1, wooOrderIdMatched: 1, name: 1,
+  }).limit(Math.max(100, customers.length * 25)).lean<LeanStripeTransaction[]>() : [];
+  const stripeByCustomerId = new Map<string, LeanStripeTransaction[]>();
+  const stripeByEmail = new Map<string, LeanStripeTransaction[]>();
+  for (const transaction of stripeTransactions) {
+    if (transaction.matchedCustomerId) stripeByCustomerId.set(transaction.matchedCustomerId, [...(stripeByCustomerId.get(transaction.matchedCustomerId) ?? []), transaction]);
+    const email = transaction.normalizedEmail || transaction.emailNormalized || transaction.email;
+    if (email) stripeByEmail.set(email, [...(stripeByEmail.get(email) ?? []), transaction]);
+  }
   const latestOrders = await latestWooOrdersByEmail(customers);
   const rankingRows = [];
   const customerMetricUpdates = [];
@@ -132,7 +166,11 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
       ...(nmiByCustomerId.get(String(customer._id)) ?? []),
       ...(customerEmail ? nmiByEmail.get(customerEmail) ?? [] : []),
     ].filter((transaction, index, rows) => rows.findIndex((row) => row.transactionId === transaction.transactionId) === index);
-    const metrics = calculateCustomerValueMetrics({ customer, authorizeNetTransactions: customerAuthTransactions, nmiTransactions: customerNmiTransactions, subscriptions: subscriptions.filter((sub) => sub.normalizedEmail === customerEmail) });
+    const customerStripeTransactions = [
+      ...(stripeByCustomerId.get(String(customer._id)) ?? []),
+      ...(customerEmail ? stripeByEmail.get(customerEmail) ?? [] : []),
+    ].filter((transaction, index, rows) => rows.findIndex((row) => row.transactionId === transaction.transactionId) === index);
+    const metrics = calculateCustomerValueMetrics({ customer, authorizeNetTransactions: customerAuthTransactions, nmiTransactions: customerNmiTransactions, stripeTransactions: customerStripeTransactions, subscriptions: subscriptions.filter((sub) => sub.normalizedEmail === customerEmail) });
     const lifetimeSpent = metrics.rankingTotal || paidValue(customer);
     const latestWooOrder = latestOrders.get(customerEmail);
     const resolverInput = latestWooOrder ? { ...customer, latestWooOrder } : customer;
@@ -150,6 +188,7 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
       authorizeNetPaidTotal: metrics.authorizeNetPaidTotal,
       gatewayOnlyPaidTotal: metrics.gatewayOnlyPaidTotal,
       nmiQuickPayPaidTotal: metrics.nmiQuickPayPaidTotal,
+      stripePaidTotal: metrics.stripePaidTotal,
       subscriptionPaidTotal: metrics.subscriptionPaidTotal,
       attemptedTotal: attemptedPipeline,
       paidMonths: metrics.paidMonths,
@@ -221,7 +260,7 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
 
   const activeWooSubscriptions = subscriptions.filter((subscription) => subscription.status === "active");
   const gatewayRecurringCustomers = customers.filter((customer) => customer.isGatewayRecurring);
-  const upcomingWooRows = activeWooSubscriptions.filter((subscription) => dateInRange(subscription.nextPaymentDate ?? "", currentMonthStart, currentMonthEnd)).map((record) => ({
+  const upcomingWooRows = activeWooSubscriptions.filter((subscription) => subscription.scheduleNeedsReview !== true && validUpcomingDate(subscription.nextPaymentDate ?? "", now, currentMonthEnd)).map((record) => ({
     _id: String(record._id),
     subscriptionId: String(record.wooSubscriptionId),
     subscriptionNumber: record.subscriptionNumber,
@@ -244,7 +283,7 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
     churnRisk: "low",
     action: "Review subscription renewal",
   }));
-  const upcomingGatewayRows = gatewayRecurringCustomers.filter((customer) => dateInRange(customer.recurringNextEstimatedPayment ?? "", currentMonthStart, currentMonthEnd)).map((customer) => ({
+  const upcomingGatewayRows = gatewayRecurringCustomers.filter((customer) => validUpcomingDate(customer.recurringNextEstimatedPayment ?? "", now, currentMonthEnd)).map((customer) => ({
     _id: String(customer._id),
     subscriptionId: `authorize-net-${String(customer._id)}`,
     subscriptionNumber: "",
@@ -268,7 +307,7 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
     action: "Review Authorize.net recurring payment",
   }));
   const upcomingRows = [...upcomingWooRows, ...upcomingGatewayRows].sort((a, b) => String(a.nextBillingDate ?? "").localeCompare(String(b.nextBillingDate ?? "")));
-  const activeMRR = wooSubscriptionMrr(subscriptions) + Number(summary?.gatewayMrr ?? 0);
+  const activeMRR = wooSubscriptionMrr(subscriptions) + Number(authSubscriptionSummary.mrr ?? summary?.gatewayMrr ?? 0);
   const payload = {
     currentMonthRevenue: rankingRows.reduce((sum, row) => sum + Number(row.monthlySpent ?? 0), 0),
     previousMonthRevenue: 0,
@@ -279,17 +318,21 @@ export async function rebuildAnalyticsCacheBatch({ limit = 100, offset = 0, maxR
     activeMRR,
     monthlyRecurringRevenue: activeMRR,
     totalMonthlyRecurringRevenue: activeMRR,
-    totalSubscriptions: subscriptions.length,
+    totalSubscriptions: subscriptions.length + Number(authSubscriptionSummary.total ?? 0),
+    wooTotalSubscriptions: subscriptions.length,
+    authorizeNetTotalSubscriptions: Number(authSubscriptionSummary.total ?? 0),
     activeWooSubscriptions: activeWooSubscriptions.length,
-    activeGatewayRecurringCustomers: Number(summary?.activeGatewayRecurringCustomers ?? 0),
-    totalActiveRecurringCustomers: activeWooSubscriptions.length + Number(summary?.activeGatewayRecurringCustomers ?? 0),
-    activeSubscriptions: activeWooSubscriptions.length + Number(summary?.activeGatewayRecurringCustomers ?? 0),
+    activeAuthorizeNetSubscriptions: Number(authSubscriptionSummary.active ?? 0),
+    activeGatewayRecurringCustomers: Number(authSubscriptionSummary.active ?? 0),
+    totalActiveRecurringCustomers: activeWooSubscriptions.length + Number(authSubscriptionSummary.active ?? 0),
+    activeSubscriptions: activeWooSubscriptions.length + Number(authSubscriptionSummary.active ?? 0),
+    subscriptionNote: `${activeWooSubscriptions.length} WooCommerce active + ${Number(authSubscriptionSummary.active ?? 0)} Authorize.net active ARB`,
     totalUpcomingThisMonth: upcomingRows.length,
     totalUpcomingAmountThisMonth: upcomingRows.reduce((sum, row) => sum + Number(row.amount ?? 0), 0),
     upcomingRevenueThisMonth: upcomingRows.reduce((sum, row) => sum + Number(row.amount ?? 0), 0),
     upcomingCustomerCountThisMonth: upcomingRows.length,
     upcomingToday: upcomingRows.filter((row) => String(row.nextBillingDate ?? "").slice(0, 10) === now.toISOString().slice(0, 10)).length,
-    upcomingNext7Days: upcomingRows.filter((row) => dateInRange(String(row.nextBillingDate ?? ""), now, new Date(now.getTime() + 7 * 86400000))).length,
+    upcomingNext7Days: upcomingRows.filter((row) => validUpcomingDate(String(row.nextBillingDate ?? ""), now, new Date(now.getTime() + 7 * 86400000))).length,
     upcomingRows,
     highValueCustomers: Number(summary?.highValueCustomers ?? 0),
     totalCustomers,

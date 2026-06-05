@@ -1,5 +1,7 @@
 import { highValueThreshold } from "@/lib/businessMetrics";
 import { readAnalyticsSnapshot } from "@/lib/analyticsCache";
+import { readSubscriptionDashboardMetrics } from "@/lib/subscriptionSync";
+import { buildUpcomingBillsSnapshot, validUpcomingDate } from "@/lib/subscriptionSchedules";
 import { connectToDatabase } from "@/lib/mongodb";
 import { Customer } from "@/models/Customer";
 import { CustomerRanking } from "@/models/CustomerRanking";
@@ -7,6 +9,13 @@ import { SyncJob } from "@/models/SyncJob";
 import { WooCommerceOrderRecord } from "@/models/WooCommerceOrder";
 
 export const dynamic = "force-dynamic";
+
+function displayableUpcomingRows(snapshot: Record<string, unknown>) {
+  const rows = Array.isArray(snapshot.upcomingRows) ? snapshot.upcomingRows as Array<Record<string, unknown>> : [];
+  return rows
+    .filter((row) => String(row.status ?? "") === "active" || String(row.status ?? "") === "estimated_recurring")
+    .filter((row) => validUpcomingDate(row.nextBillingDate));
+}
 
 export async function GET() {
   const started = Date.now();
@@ -37,6 +46,8 @@ export async function GET() {
     highValueCustomers,
     lastJob,
     snapshot,
+    subscriptionMetrics,
+    upcomingMetrics,
     fallbackAgg,
     newCustomersThisMonth,
     newCustomersLast30Days,
@@ -54,6 +65,8 @@ export async function GET() {
     CustomerRanking.countDocuments({ lifetimeSpent: { $gte: highValueThreshold } }),
     SyncJob.findOne({}).sort({ finishedAt: -1, updatedAt: -1 }).lean<{ finishedAt?: string; updatedAt?: Date | string } | null>(),
     readAnalyticsSnapshot<Record<string, unknown>>("dashboard_analytics", {}),
+    readSubscriptionDashboardMetrics(),
+    buildUpcomingBillsSnapshot(),
     Customer.aggregate<{ _id: null; paidRevenue: number; attemptedRevenue: number; activeSubscriptions: number; activeGatewayRecurringCustomers: number; monthlyRecurringRevenue: number; highValueCustomers: number }>([
       {
         $group: {
@@ -86,24 +99,29 @@ export async function GET() {
   const fallback = fallbackAgg[0];
   const cacheReady = Boolean(snapshot.analyticsCacheReady);
   const fallbackPaidRevenue = Number(fallback?.paidRevenue ?? 0);
-  const fallbackActiveSubscriptions = Number(fallback?.activeSubscriptions ?? 0) + Number(fallback?.activeGatewayRecurringCustomers ?? 0);
-  const fallbackMrr = Number(fallback?.monthlyRecurringRevenue ?? 0);
+  const fallbackActiveSubscriptions = Number(subscriptionMetrics.activeSubscriptions ?? (Number(fallback?.activeSubscriptions ?? 0) + Number(fallback?.activeGatewayRecurringCustomers ?? 0)));
+  const fallbackMrr = Number(subscriptionMetrics.monthlyRecurringRevenue ?? fallback?.monthlyRecurringRevenue ?? 0);
+  const upcomingRows = displayableUpcomingRows(snapshot);
+  const upcomingRevenue = upcomingRows.reduce((sum, row) => sum + Number(row.amount ?? 0), 0);
   const payload = {
     customerCount,
     totalRevenue: Number(snapshot.currentYearRevenue ?? fallbackPaidRevenue),
     paidRevenue: Number(snapshot.rolling12MonthRevenue ?? snapshot.currentYearRevenue ?? fallbackPaidRevenue),
     attemptedRevenue: Number(snapshot.attemptedRevenue ?? fallback?.attemptedRevenue ?? 0),
-    totalSubscriptions: Number(snapshot.totalSubscriptions ?? 0),
-    activeWooSubscriptions: Number(snapshot.activeWooSubscriptions ?? 0),
-    activeGatewayRecurringCustomers: Number(snapshot.activeGatewayRecurringCustomers ?? fallback?.activeGatewayRecurringCustomers ?? 0),
+    totalSubscriptions: Number(snapshot.totalSubscriptions ?? subscriptionMetrics.totalSubscriptions ?? 0),
+    activeWooSubscriptions: Number(snapshot.activeWooSubscriptions ?? subscriptionMetrics.activeWooSubscriptions ?? 0),
+    activeAuthorizeNetSubscriptions: Number(snapshot.activeAuthorizeNetSubscriptions ?? subscriptionMetrics.activeAuthorizeNetSubscriptions ?? 0),
+    activeGatewayRecurringCustomers: Number(snapshot.activeGatewayRecurringCustomers ?? subscriptionMetrics.activeAuthorizeNetSubscriptions ?? fallback?.activeGatewayRecurringCustomers ?? 0),
     totalActiveRecurringCustomers: Number(snapshot.totalActiveRecurringCustomers ?? fallbackActiveSubscriptions),
     activeSubscriptions: Number(snapshot.totalActiveRecurringCustomers ?? fallbackActiveSubscriptions),
+    wooTotalSubscriptions: Number(snapshot.wooTotalSubscriptions ?? subscriptionMetrics.wooTotalSubscriptions ?? 0),
+    authorizeNetTotalSubscriptions: Number(snapshot.authorizeNetTotalSubscriptions ?? subscriptionMetrics.authorizeNetTotalSubscriptions ?? 0),
     monthlyRecurringRevenue: Number(snapshot.totalMonthlyRecurringRevenue ?? snapshot.activeMRR ?? fallbackMrr),
     totalMonthlyRecurringRevenue: Number(snapshot.totalMonthlyRecurringRevenue ?? snapshot.activeMRR ?? fallbackMrr),
     subscriptionCandidates: 0,
-    subscriptionNote: cacheReady ? "Cached subscription analytics" : "Analytics cache is rebuilding...",
-    upcomingBills30d: Number(snapshot.totalUpcomingThisMonth ?? 0),
-    estimatedUpcomingRevenue30d: Number(snapshot.totalUpcomingAmountThisMonth ?? 0),
+    subscriptionNote: String(snapshot.subscriptionNote || subscriptionMetrics.sourceNotes || (cacheReady ? "Cached subscription analytics" : "Analytics cache is rebuilding...")),
+    upcomingBills30d: Number(upcomingMetrics.totalUpcomingThisMonth ?? upcomingRows.length ?? snapshot.totalUpcomingThisMonth ?? 0),
+    estimatedUpcomingRevenue30d: Number(upcomingMetrics.totalUpcomingAmountThisMonth ?? (upcomingRows.length ? upcomingRevenue : snapshot.totalUpcomingAmountThisMonth) ?? 0),
     paidRevenueThisMonth: Number(snapshot.currentMonthRevenue ?? 0),
     attemptedPipelineThisMonth: 0,
     checkoutAttemptsThisMonth: 0,
@@ -128,7 +146,7 @@ export async function GET() {
     monthRevenue: Number(monthOrderStats.revenue ?? 0),
     newPaidCustomersThisMonth: 0,
     newHotLeadsThisMonth: 0,
-    sourceBreakdown: { woocommerce: Number(snapshot.totalMonthlyRecurringRevenue ?? 0) },
+    sourceBreakdown: { woocommerce: Number(subscriptionMetrics.activeWooSubscriptions ?? 0), authorizeNet: Number(subscriptionMetrics.activeAuthorizeNetSubscriptions ?? 0) },
     salesHistoryUpdatedAt: String(snapshot.analyticsGeneratedAt ?? ""),
     lastSyncAt: String(lastJob?.finishedAt || lastJob?.updatedAt || snapshot.analyticsGeneratedAt || ""),
     analyticsCacheReady: cacheReady,

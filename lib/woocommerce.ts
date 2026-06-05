@@ -298,3 +298,34 @@ export function fetchWooCommerceOrders(options: WooCommerceFetchOptions = {}) {
 export function fetchWooCommerceSubscriptions(options: WooCommerceFetchOptions = {}) {
   return fetchWooCommerceCollection<WooCommerceSubscription>("subscriptions", options);
 }
+
+export async function fetchWooCommerceSubscriptionStatusTotals(statuses = wooCommerceSubscriptionStatuses) {
+  const config = getWooCommerceConfig();
+  if (!config) return { counts: {} as Record<string, number>, total: 0, failedRequests: [{ status: "all", page: 1, message: "WooCommerce is not configured." }] };
+  const auth = Buffer.from(`${config.consumerKey}:${config.consumerSecret}`).toString("base64");
+  const timeoutMs = getNumericEnv("WC_REQUEST_TIMEOUT_MS", 12000);
+  const counts: Record<string, number> = {};
+  const failedRequests: Array<{ status: string; page: number; message: string }> = [];
+  for (const status of statuses) {
+    const url = new URL(`${config.storeUrl}/wp-json/wc/v3/subscriptions`);
+    url.searchParams.set("per_page", "1");
+    url.searchParams.set("page", "1");
+    if (status) url.searchParams.set("status", status);
+    try {
+      const response = await fetchWithTimeout(url, {
+        Authorization: `Basic ${auth}`,
+        Accept: "application/json",
+      }, timeoutMs);
+      if (!response.ok) {
+        failedRequests.push({ status, page: 1, message: `${response.status} ${response.statusText}` });
+        counts[status] = 0;
+        continue;
+      }
+      counts[status] = Number(response.headers.get("x-wp-total") ?? 0);
+    } catch (error) {
+      failedRequests.push({ status, page: 1, message: error instanceof Error ? error.message : "request failed" });
+      counts[status] = 0;
+    }
+  }
+  return { counts, total: Object.values(counts).reduce((sum, count) => sum + Number(count ?? 0), 0), failedRequests };
+}

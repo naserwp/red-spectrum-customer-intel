@@ -301,6 +301,7 @@ export interface CustomerDocument {
   authorizeNetPaidTotal: number;
   gatewayOnlyPaidTotal: number;
   nmiQuickPayPaidTotal: number;
+  stripePaidTotal: number;
   subscriptionPaidTotal: number;
   attemptedTotal: number;
   orderCount: number;
@@ -402,6 +403,8 @@ export interface CustomerSourceCoverage {
   wooCommerceOrderRecordsFound: number;
   authorizeNetTransactionsFound: number;
   nmiQuickPayTransactionsFound: number;
+  stripeTransactionsFound: number;
+  lastStripeSyncAt?: string;
   gatewayOnlyPaymentsAttached: number;
   reconciledRecords: number;
   missingUnattachedRecords: number;
@@ -561,6 +564,8 @@ const customerSourceCoverageSchema = new Schema<CustomerSourceCoverage>(
     wooCommerceOrderRecordsFound: { type: Number, default: 0 },
     authorizeNetTransactionsFound: { type: Number, default: 0 },
     nmiQuickPayTransactionsFound: { type: Number, default: 0 },
+    stripeTransactionsFound: { type: Number, default: 0 },
+    lastStripeSyncAt: { type: String, default: "" },
     gatewayOnlyPaymentsAttached: { type: Number, default: 0 },
     reconciledRecords: { type: Number, default: 0 },
     missingUnattachedRecords: { type: Number, default: 0 },
@@ -834,6 +839,7 @@ const customerSchema = new Schema<CustomerDocument>(
     authorizeNetPaidTotal: { type: Number, default: 0 },
     gatewayOnlyPaidTotal: { type: Number, default: 0 },
     nmiQuickPayPaidTotal: { type: Number, default: 0 },
+    stripePaidTotal: { type: Number, default: 0 },
     subscriptionPaidTotal: { type: Number, default: 0 },
     attemptedTotal: { type: Number, required: true, default: 0 },
     orderCount: { type: Number, required: true },

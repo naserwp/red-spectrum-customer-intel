@@ -5,7 +5,7 @@ import type { CustomerDocument, CustomerGatewayPayment, CustomerOrderHistoryItem
 import type { NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
 import type { WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
 
-export type UnifiedPaymentSource = "woocommerce" | "authorize_net" | "nmi_quick_pay";
+export type UnifiedPaymentSource = "woocommerce" | "authorize_net" | "nmi_quick_pay" | "stripe";
 export type UnifiedPaymentOrigin =
   | "woocommerce_checkout"
   | "woocommerce_subscription_renewal"
@@ -121,7 +121,7 @@ function orderRevenueType(order: CustomerOrderHistoryItem): UnifiedPaymentLedger
 function authRevenueType(status?: string): UnifiedPaymentLedgerRow["revenueType"] {
   const value = status ?? "";
   if (isRefundedOrChargeback(value)) return "refund";
-  if (isSettledSuccessful(value)) return "paid";
+  if (isSettledSuccessful(value) || /succeeded|paid|captured/i.test(value)) return "paid";
   if (isDeclinedOrFailed(value)) return "attempted";
   return "pending";
 }
@@ -325,7 +325,7 @@ function classifyAuthorizeOrigin(params: {
 
 function gatewayRow(payment: CustomerGatewayPayment): UnifiedPaymentLedgerRow {
   const provider = payment.provider === "nmi" || payment.provider === "cliq" ? "nmi_quick_pay" : payment.provider || "authorize_net";
-  const source: UnifiedPaymentSource = provider === "nmi_quick_pay" ? "nmi_quick_pay" : provider === "stripe" ? "authorize_net" : "authorize_net";
+  const source: UnifiedPaymentSource = provider === "nmi_quick_pay" ? "nmi_quick_pay" : provider === "stripe" ? "stripe" : "authorize_net";
   const revenueType = source === "nmi_quick_pay" ? nmiRevenueType(payment.status) : authRevenueType(payment.status);
   const isNmi = source === "nmi_quick_pay";
   const origin = isNmi ? "nmi" : provider === "stripe" ? "stripe" : "unknown_gateway";
@@ -373,6 +373,8 @@ export function buildUnifiedPaymentLedger(input: LedgerInput) {
       ? "authorize_net"
       : provider === "nmi_quick_pay" || provider === "nmi"
         ? "nmi_quick_pay"
+        : provider === "stripe"
+          ? "stripe"
         : "woocommerce";
     const wooClassification = classifyWooOrigin(order, subscriptionLookup, recurringWooOrderIds);
     const gatewayStatus = order.gatewayVerification?.transactionStatus || order.status;
@@ -382,11 +384,13 @@ export function buildUnifiedPaymentLedger(input: LedgerInput) {
       date: order.paidDate || order.attemptedDate || order.dateCreated,
       source,
       provider,
-      origin: source === "woocommerce" ? wooClassification.origin : source === "nmi_quick_pay" ? "nmi" : order.source === "authorize_net_only" ? "authorize_net_manual" : "unknown_gateway",
+      origin: source === "woocommerce" ? wooClassification.origin : source === "nmi_quick_pay" ? "nmi" : source === "stripe" ? "stripe" : order.source === "authorize_net_only" ? "authorize_net_manual" : "unknown_gateway",
       originClassificationReason: source === "woocommerce"
         ? wooClassification.reason
         : source === "nmi_quick_pay"
           ? "stored_nmi_order"
+          : source === "stripe"
+            ? "stored_stripe_order"
           : order.source === "authorize_net_only"
             ? "authorize_net_only_order"
             : "stored_gateway_order",

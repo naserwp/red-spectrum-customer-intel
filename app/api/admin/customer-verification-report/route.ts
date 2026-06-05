@@ -5,6 +5,7 @@ import { AuthorizeNetTransaction, type AuthorizeNetTransactionDocument } from "@
 import { Customer, type CustomerDocument } from "@/models/Customer";
 import { CustomerRanking, type CustomerRankingDocument } from "@/models/CustomerRanking";
 import { NmiQuickPayTransaction, type NmiQuickPayTransactionDocument } from "@/models/NmiQuickPayTransaction";
+import { StripeTransaction, type StripeTransactionDocument } from "@/models/StripeTransaction";
 import { WooCommerceOrderRecord, type WooCommerceOrderDocument } from "@/models/WooCommerceOrder";
 import { WooCommerceSubscriptionRecord, type WooCommerceSubscriptionDocument } from "@/models/WooCommerceSubscription";
 
@@ -97,11 +98,12 @@ export async function GET() {
     cursor = String(customers[customers.length - 1]._id);
     const emails = Array.from(new Set(customers.map(emailOf).filter(Boolean)));
     const ids = customers.map((customer) => String(customer._id));
-    const [rankings, wooOrders, authTxs, nmiTxs, subs] = await Promise.all([
+    const [rankings, wooOrders, authTxs, nmiTxs, stripeTxs, subs] = await Promise.all([
       CustomerRanking.find({ $or: [{ customerId: { $in: ids } }, { email: { $in: emails } }] }).lean<CustomerRankingDocument[]>(),
       WooCommerceOrderRecord.find({ normalizedEmail: { $in: emails } }).lean<WooCommerceOrderDocument[]>(),
       AuthorizeNetTransaction.find({ $or: [{ normalizedEmail: { $in: emails } }, { emailNormalized: { $in: emails } }, { customerEmail: { $in: emails } }, { matchedCustomerId: { $in: ids } }] }).lean<AuthorizeNetTransactionDocument[]>(),
       NmiQuickPayTransaction.find({ $or: [{ normalizedEmail: { $in: emails } }, { emailNormalized: { $in: emails } }, { customerEmail: { $in: emails } }, { matchedCustomerId: { $in: ids } }] }).lean<NmiQuickPayTransactionDocument[]>(),
+      StripeTransaction.find({ $or: [{ normalizedEmail: { $in: emails } }, { emailNormalized: { $in: emails } }, { email: { $in: emails } }, { matchedCustomerId: { $in: ids } }] }).lean<StripeTransactionDocument[]>(),
       WooCommerceSubscriptionRecord.find({ normalizedEmail: { $in: emails } }).lean<WooCommerceSubscriptionDocument[]>(),
     ]);
     const rankingById = new Map(rankings.map((ranking) => [ranking.customerId, ranking]));
@@ -114,6 +116,7 @@ export async function GET() {
       const customerWoo = wooOrders.filter((order) => clean(order.normalizedEmail || order.billingEmail).toLowerCase() === email);
       const customerAuth = authTxs.filter((tx) => [tx.normalizedEmail, tx.emailNormalized, tx.customerEmail].map((value) => clean(value).toLowerCase()).includes(email) || tx.matchedCustomerId === id);
       const customerNmi = nmiTxs.filter((tx) => [tx.normalizedEmail, tx.emailNormalized, tx.customerEmail].map((value) => clean(value).toLowerCase()).includes(email) || tx.matchedCustomerId === id);
+      const customerStripe = stripeTxs.filter((tx) => [tx.normalizedEmail, tx.emailNormalized, tx.email].map((value) => clean(value).toLowerCase()).includes(email) || tx.matchedCustomerId === id);
       const customerSubs = subs.filter((sub) => clean(sub.normalizedEmail || sub.customerEmail).toLowerCase() === email);
       const result = verifyCustomer({
         customer,
@@ -121,6 +124,7 @@ export async function GET() {
         wooOrders: customerWoo,
         authorizeNetTransactions: customerAuth,
         nmiTransactions: customerNmi,
+        stripeTransactions: customerStripe,
         subscriptions: customerSubs,
         duplicateEmailCount: duplicateEmailCounts.get(email) ?? 0,
       });

@@ -1,13 +1,9 @@
 import { NextResponse } from "next/server";
 import { buildStateOptions } from "@/lib/customerBusinessResolver";
 import { readAnalyticsSnapshot } from "@/lib/analyticsCache";
-import { resolveBusinessName } from "@/lib/customerBusiness";
-import { enrichCustomerProfile } from "@/lib/customerEnrichment";
 import { normalizedStateParam, paging } from "@/lib/customerTableQuery";
 import { connectToDatabase } from "@/lib/mongodb";
-import { monthEnd, monthStart, dateInRange } from "@/lib/revenueAnalytics";
-import { Customer } from "@/models/Customer";
-import { WooCommerceSubscriptionRecord } from "@/models/WooCommerceSubscription";
+import { buildUpcomingBillsSnapshot, businessDateKey, enrichUpcomingRows, validUpcomingDate } from "@/lib/subscriptionSchedules";
 
 export async function GET(request: Request) {
   const started = Date.now();
@@ -24,66 +20,16 @@ export async function GET(request: Request) {
     upcomingToday: 0,
     upcomingNext7Days: 0,
   });
-  let rows = (Array.isArray(snapshot.upcomingRows) ? snapshot.upcomingRows : []) as Array<Record<string, unknown>>;
-  if (!snapshot.analyticsCacheReady) {
-    const now = new Date();
-    const start = monthStart(now);
-    const end = monthEnd(now);
-    const [wooRows, gatewayRows] = await Promise.all([
-      WooCommerceSubscriptionRecord.find({ status: "active", nextPaymentDate: { $ne: "" } }).sort({ nextPaymentDate: 1 }).limit(100).lean(),
-      Customer.find({ isGatewayRecurring: true, recurringNextEstimatedPayment: { $ne: "" } }, { name: 1, email: 1, phone: 1, recurringAmount: 1, recurringNextEstimatedPayment: 1, recurringLastPayment: 1, riskLevel: 1, businessProfile: 1, orders: 1 }).sort({ recurringNextEstimatedPayment: 1 }).limit(100).lean(),
-    ]);
-    rows = [
-      ...wooRows.filter((row) => dateInRange(String(row.nextPaymentDate ?? ""), start, end)).map((row) => ({
-        _id: String(row._id),
-        subscriptionId: String(row.wooSubscriptionId),
-        source: "woocommerce",
-        customerEmail: row.customerEmail,
-        customerName: row.customerName,
-        status: row.status,
-        amount: Number(row.recurringTotal ?? row.amount ?? 0),
-        nextBillingDate: row.nextPaymentDate,
-        lastBillingDate: row.lastPaymentDate,
-        paymentMethodTitle: row.paymentMethodTitle || row.paymentMethod,
-        productNames: row.productNames,
-        churnRisk: "low",
-        action: "Review subscription renewal",
-      })),
-      ...gatewayRows.filter((row) => dateInRange(String(row.recurringNextEstimatedPayment ?? ""), start, end)).map((row) => ({
-        _id: String(row._id),
-        subscriptionId: `authorize-net-${String(row._id)}`,
-        source: "authorize_net",
-        customerEmail: row.email,
-        customerName: row.name,
-        businessName: resolveBusinessName(row).businessName,
-        status: "estimated_recurring",
-        amount: Number(row.recurringAmount ?? 0),
-        nextBillingDate: row.recurringNextEstimatedPayment,
-        lastBillingDate: row.recurringLastPayment,
-        paymentMethodTitle: "Credit Card Payment",
-        productNames: ["Authorize.net Recurring Payment"],
-        churnRisk: row.riskLevel ?? "low",
-        action: "Review Authorize.net recurring payment",
-      })),
-    ];
-  }
-  const rowEmails = rows.map((row) => String(row.customerEmail ?? "").trim().toLowerCase()).filter(Boolean);
-  const customers = rowEmails.length ? await Customer.find({ normalizedEmail: { $in: rowEmails } }, { normalizedEmail: 1, email: 1, businessProfile: 1, orders: 1, factiivProfile: 1, publicEnrichment: 1 }).lean() : [];
-  const customerByEmail = new Map(customers.map((customer) => [String(customer.normalizedEmail || customer.email || "").toLowerCase(), customer]));
-  rows = rows.map((row) => {
-    const email = String(row.customerEmail ?? "").trim().toLowerCase();
-    const customer = customerByEmail.get(email);
-    const enrichment = enrichCustomerProfile(customer);
-    return {
-      ...row,
-      businessName: row.businessName || resolveBusinessName(customer).businessName,
-      stateCode: enrichment.stateCode,
-      stateName: enrichment.stateName,
-      stateSource: enrichment.stateSource,
-    };
-  });
+  const liveUpcoming = await buildUpcomingBillsSnapshot();
+  let rows = (liveUpcoming.upcomingRows as Array<Record<string, unknown>>)
+    .filter((row) => String(row.status ?? "") === "active" || String(row.status ?? "") === "estimated_recurring")
+    .filter((row) => validUpcomingDate(String(row.nextBillingDate ?? ""), new Date()));
+  rows = await enrichUpcomingRows(rows);
   const allRows = rows;
   rows = state ? allRows.filter((row) => row.stateCode === state) : allRows;
+  const todayKey = businessDateKey(new Date());
+  const next7 = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() + 7, 23, 59, 59, 999);
+  const revenueTotal = rows.reduce((sum, row) => sum + Number(row.amount ?? 0), 0);
   const payload = {
     page,
     limit,
@@ -93,11 +39,11 @@ export async function GET(request: Request) {
     stateOptions: buildStateOptions(allRows),
     recurringCandidates: Array.isArray(snapshot.recurringCandidates) ? snapshot.recurringCandidates : [],
     highRiskCount: rows.filter((row) => row.churnRisk === "high").length,
-    estimatedUpcomingRevenue: Number(snapshot.totalUpcomingAmountThisMonth ?? 0),
-    upcomingCustomerCountThisMonth: Number(snapshot.totalUpcomingThisMonth ?? rows.length),
-    upcomingRevenueThisMonth: Number(snapshot.upcomingRevenueThisMonth ?? snapshot.totalUpcomingAmountThisMonth ?? 0),
-    upcomingToday: Number(snapshot.upcomingToday ?? 0),
-    upcomingNext7Days: Number(snapshot.upcomingNext7Days ?? 0),
+    estimatedUpcomingRevenue: revenueTotal,
+    upcomingCustomerCountThisMonth: rows.length,
+    upcomingRevenueThisMonth: revenueTotal,
+    upcomingToday: rows.filter((row) => businessDateKey(row.nextBillingDate) === todayKey).length,
+    upcomingNext7Days: rows.filter((row) => validUpcomingDate(String(row.nextBillingDate ?? ""), new Date(), next7)).length,
     message: snapshot.analyticsCacheReady ? "" : "Analytics cache is rebuilding...",
   };
   if (process.env.NODE_ENV === "development") {
