@@ -45,6 +45,8 @@ type OpenAIResponse = {
   output?: Array<{ content?: Array<{ text?: string }> }>;
 };
 
+const industryClassificationCache = new Map<string, BusinessIndustryClassification>();
+
 function getOpenAiApiKey() {
   return process.env.OPENAI_API_KEY?.trim() ?? "";
 }
@@ -193,15 +195,27 @@ function parseIndustryBatch(text: string | undefined) {
   }
 }
 
+function industryCacheKey(input: BusinessIndustryInput) {
+  return JSON.stringify(input);
+}
+
 export async function generateBusinessIndustryClassifications(inputs: BusinessIndustryInput[]): Promise<Record<string, BusinessIndustryClassification>> {
   const fallbackEntries = inputs.map((input) => [input.id, fallbackIndustryClassification(input)] as const);
   const fallback = Object.fromEntries(fallbackEntries);
   if (!inputs.length || isBuildPhase()) return fallback;
 
+  const rows = { ...fallback };
+  const uncached = inputs.filter((input) => {
+    const cached = industryClassificationCache.get(industryCacheKey(input));
+    if (cached) rows[input.id] = cached;
+    return !cached;
+  });
+  if (!uncached.length) return rows;
+
   const apiKey = getOpenAiApiKey();
   if (!apiKey) {
     console.warn("[openai] OPENAI_API_KEY is missing. Using stored industry fallback.");
-    return fallback;
+    return rows;
   }
 
   try {
@@ -216,27 +230,29 @@ export async function generateBusinessIndustryClassifications(inputs: BusinessIn
             role: "system",
             content: "Return JSON array only. For each input id, classify the business with businessIndustry, industryCode, industryCodeType, industryDescription, confidence. Use NAICS unless SIC is clearly better. Do not invent identity, contact, address, EIN, payment, score, state, or city fields. If uncertain set confidence low, industryCodeType NAICS, and industryDescription Needs manual review.",
           },
-          { role: "user", content: JSON.stringify(inputs) },
+          { role: "user", content: JSON.stringify(uncached) },
         ],
-        max_output_tokens: Math.max(1200, Math.min(7000, inputs.length * 160)),
+        max_output_tokens: Math.max(1200, Math.min(7000, uncached.length * 160)),
       }),
     });
 
     if (!response.ok) {
       console.warn(`[openai] OpenAI industry request failed (${response.status} ${response.statusText}). Using stored industry fallback.`);
-      return fallback;
+      return rows;
     }
     const data = (await response.json()) as OpenAIResponse;
     const parsed = parseIndustryBatch(extractText(data));
-    const rows = { ...fallback };
+    const inputById = new Map(uncached.map((input) => [input.id, input]));
     for (const item of parsed) {
       if (!item.id || !rows[item.id]) continue;
       rows[item.id] = normalizeIndustryClassification(item, rows[item.id]);
+      const input = inputById.get(item.id);
+      if (input) industryClassificationCache.set(industryCacheKey(input), rows[item.id]);
     }
     return rows;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown OpenAI request error.";
     console.warn(`[openai] OpenAI industry request threw error. Using stored industry fallback. ${message}`);
-    return fallback;
+    return rows;
   }
 }

@@ -1759,6 +1759,7 @@ export default function AdminPage() {
     description="Paid revenue, subscription status, checkout pipeline, and customer risk."
     meta={syncStatus?.lastSyncAt ? `Last synced: ${displayDateTime(syncStatus.lastSyncAt)}` : syncStatus?.dataFreshness || "Data sync needed"}
     actions={<div className="flex flex-wrap gap-2">
+      <Link href="/admin/export" className="rounded-lg border border-red-800/70 bg-red-950/60 px-5 py-3 font-semibold text-zinc-100 transition hover:border-red-500 hover:bg-red-900/80">Export Center</Link>
       <Link href="/api/customers/export-top-110?format=csv&limit=110&useAIIndustry=true&state=all" className="rounded-lg border border-emerald-800/70 bg-zinc-900 px-5 py-3 font-semibold text-zinc-200 transition hover:border-emerald-500 hover:bg-zinc-800">Export Top 110 Customers</Link>
       <Link href="/admin/funding-ready" className="rounded-lg border border-red-800/70 bg-zinc-900 px-5 py-3 font-semibold text-zinc-200 transition hover:border-red-500 hover:bg-zinc-800">Funding Ready</Link>
     </div>}

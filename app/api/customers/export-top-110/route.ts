@@ -80,6 +80,10 @@ type ExportRow = {
   factiivDebugSourcesChecked?: string[];
   factiivDebugMatchedSource?: string;
   factiivDebugReason?: string;
+  factiivScoreResolvedFrom?: string;
+  factiivProfileExists?: boolean;
+  factiivPayloadExists?: boolean;
+  factiivScoreCandidates?: Array<{ path: string; value: number }>;
 };
 
 const exportColumns: Array<keyof ExportRow> = [
@@ -257,6 +261,10 @@ function extractFactiivExportFields(customer: LeanCustomer, ranking?: CustomerRa
     factiivDebugSourcesChecked: sourcesChecked,
     factiivDebugMatchedSource: matchedSource,
     factiivDebugReason: score.failureReason || `Resolved from ${matchedSource}`,
+    factiivScoreResolvedFrom: score.scoreFieldFound || (rankingScore > 0 ? "customerRanking.factiivScore" : "Missing"),
+    factiivProfileExists: score.factiivProfileFound,
+    factiivPayloadExists: Boolean(score.rawFactiivPayload),
+    factiivScoreCandidates: score.scoreCandidates,
   };
 }
 
@@ -336,18 +344,21 @@ export async function GET(request: Request) {
   await connectToDatabase();
   const { searchParams } = new URL(request.url);
   const format = searchParams.get("format") === "csv" ? "csv" : "json";
-  const limit = Math.min(500, Math.max(1, Number(searchParams.get("limit") ?? 110)));
+  const limitParam = searchParams.get("limit");
+  const limit = limitParam === "all" ? 10000 : Math.min(10000, Math.max(1, Number(limitParam ?? 110)));
   const useAIIndustry = searchParams.get("useAIIndustry") !== "false";
   const debugFactiiv = searchParams.get("debugFactiiv") === "true";
   const state = normalizeStateCode(searchParams.get("state")) || "";
   const stateParam = state || "all";
+  const search = text(searchParams.get("search")).toLowerCase();
+  const candidateLimit = limit >= 10000 || state || search ? 10000 : limit;
 
-  const rankings = await CustomerRanking.find({}).sort({ lifetimeSpent: -1 }).limit(5000).lean<CustomerRankingDocument[]>();
+  const rankings = await CustomerRanking.find({}).sort({ lifetimeSpent: -1 }).limit(candidateLimit).lean<CustomerRankingDocument[]>();
   const fallbackCustomers = rankings.length ? [] : await Customer.find({}, {
       name: 1, email: 1, normalizedEmail: 1, phone: 1, businessProfile: 1, profile: 1, publicEnrichment: 1, factiivProfile: 1, creditProfile: 1,
       lifetimeValue: 1, rankingPaidTotal: 1, paidTotal: 1, totalPaid: 1, paidOrderCount: 1, orders: 1, gatewayPayments: 1, lastPaidDate: 1,
       wooPaidTotal: 1, authorizeNetPaidTotal: 1, nmiQuickPayPaidTotal: 1, gatewayOnlyPaidTotal: 1,
-    }).limit(5000).lean<LeanCustomer[]>();
+    }).limit(candidateLimit).lean<LeanCustomer[]>();
 
   const rankingByCustomerId = new Map(rankings.map((ranking) => [ranking.customerId, ranking]));
   const rankingByEmail = new Map(rankings.map((ranking) => [normalizeEmail(ranking.email), ranking]));
@@ -380,6 +391,21 @@ export async function GET(request: Request) {
       return { customer, ranking, enrichment, preliminaryValue: money(ranking?.lifetimeSpent ?? customer.lifetimeValue ?? customer.rankingPaidTotal ?? customer.paidTotal ?? customer.totalPaid) };
     })
     .filter((row) => !state || row.enrichment.stateCode === state || row.ranking?.stateCode === state)
+    .filter((row) => {
+      if (!search) return true;
+      const haystack = [
+        row.customer.email,
+        row.customer.normalizedEmail,
+        row.customer.name,
+        row.customer.businessProfile?.businessName,
+        row.customer.businessProfile?.company,
+        row.customer.factiivProfile?.matchedBusinessName,
+        row.ranking?.email,
+        row.ranking?.name,
+        row.ranking?.businessName,
+      ].map((value) => text(value).toLowerCase()).join(" ");
+      return haystack.includes(search);
+    })
     .sort((a, b) => b.preliminaryValue - a.preliminaryValue)
     .slice(0, limit);
 
@@ -446,11 +472,14 @@ export async function GET(request: Request) {
     const chargebackOrRefund = auth.some((tx) => isRefundedOrChargeback(tx.transactionStatus) || failedAuth(tx)) || nmi.some((tx) => isNmiRefundOrChargeback(tx.transactionStatus) || failedNmi(tx)) || stripe.some((tx) => /refund|dispute|chargeback|failed/i.test(tx.status ?? ""));
     const dataConfidenceStatus = chargebackOrRefund ? "Needs Review" : auditBadge(metrics, auth, nmi, stripe);
     const factiiv = extractFactiivExportFields(customer, ranking, detailMrr);
-    console.log("[factiiv-score-export]", customer.email, factiiv.factiivScoreSourceField || "Missing", factiiv.factiivScore);
     const debugFields = debugFactiiv ? {
       factiivDebugSourcesChecked: factiiv.factiivDebugSourcesChecked,
       factiivDebugMatchedSource: factiiv.factiivDebugMatchedSource,
       factiivDebugReason: factiiv.factiivDebugReason,
+      factiivScoreResolvedFrom: factiiv.factiivScoreResolvedFrom,
+      factiivProfileExists: factiiv.factiivProfileExists,
+      factiivPayloadExists: factiiv.factiivPayloadExists,
+      factiivScoreCandidates: factiiv.factiivScoreCandidates,
     } : {};
     return {
       customerId,
